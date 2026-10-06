@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - *(appinfo)* skip hidden desktop entries when matching executables
+- *(packaging)* allow netlink in the systemd unit, so gpg requests name the application; replace the v0.1.0 unit
 
 ## [0.1.0](https://github.com/TheAifam5/touchcue/releases/tag/v0.1.0) - 2026-10-06
 
