@@ -9,12 +9,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.1.1](https://github.com/TheAifam5/touchcue/compare/v0.1.0...v0.1.1) - 2026-10-06
 
-### Fixed
-
-- *(appinfo)* skip hidden desktop entries when matching executables
-
-## [0.1.0](https://github.com/TheAifam5/touchcue/releases/tag/v0.1.0) - 2026-10-06
-
 ### Added
 
-- *(appinfo)* attribute devices and sockets to applications on Linux
+- *(hooks)* run commands on daemon events
