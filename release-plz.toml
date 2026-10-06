@@ -1,0 +1,20 @@
+# Only the touchcue package is versioned and tagged. Nothing is published to
+# a cargo registry, and release.yml creates the GitHub release from the tag.
+[workspace]
+git_only = true
+publish = false
+git_release_enable = false
+git_tag_enable = false
+release = false
+release_always = false
+semver_check = false
+pr_labels = ["release"]
+
+[[package]]
+name = "touchcue"
+release = true
+changelog_path = "CHANGELOG.md"
+git_tag_enable = true
+git_tag_name = "v{{ version }}"
+changelog_update = true
+changelog_include = ["touchcue-helper"]

@@ -1,0 +1,72 @@
+min_version = "2026.9.16"
+
+[settings]
+lockfile = true
+minimum_release_age = "7d"
+idiomatic_version_file_enable_tools = ["rust"]
+
+[tools]
+rust = { version = "1.99.0", components = "clippy,rustfmt", targets = "x86_64-pc-windows-msvc", mr_boxington = true }
+mr-boxington = { version = "1.22.0", os = ["linux", "macos/arm64", "windows"] }
+hk = { version = "2.5.0", os = ["linux", "macos/arm64", "windows"] }
+usage = "6.12.0"
+cargo-deny = "0.20.2"
+"aqua:nextest-rs/nextest/cargo-nextest" = "0.9.146"
+"github:rust-cross/cargo-xwin" = "0.23.1"
+actionlint = "1.7.12"
+typos = "1.50.3"
+taplo = "0.10.0"
+gitleaks = "8.30.1"
+zizmor = "1.30.1"
+node = "26.10.0"
+
+[tasks.build]
+description = "Build every workspace crate"
+run = "cargo build --workspace --locked"
+
+[tasks.test]
+description = "Run unit, integration and doc tests"
+run = [
+  "cargo nextest run --workspace --locked --no-tests=pass",
+  "cargo test --doc --workspace --locked",
+]
+
+[tasks.lint]
+description = "Run every hk check over the whole tree"
+run = "hk check --all"
+
+[tasks.fix]
+description = "Apply every hk fixer over the whole tree"
+run = "hk fix --all"
+
+[tasks.deny]
+description = "Check dependency licenses, advisories, bans and sources"
+run = "cargo deny check"
+
+[tasks.render]
+description = "Generate the usage spec, completions, man page and CLI reference"
+run = [
+  "cargo --locked xtask render",
+  "mkdir -p completions man docs/reference/cli",
+  "usage generate completion bash touchcue -f touchcue.usage.kdl > completions/touchcue.bash",
+  "usage generate completion zsh touchcue -f touchcue.usage.kdl > completions/touchcue.zsh",
+  "usage generate completion fish touchcue -f touchcue.usage.kdl > completions/touchcue.fish",
+  "usage generate completion nu touchcue -f touchcue.usage.kdl > completions/touchcue.nu",
+  "usage generate completion powershell touchcue -f touchcue.usage.kdl > completions/touchcue.ps1",
+  "usage generate manpage -f touchcue.usage.kdl -o man/touchcue.1",
+  "usage generate markdown -f touchcue.usage.kdl --multi --out-dir docs/reference/cli --url-prefix /reference/cli",
+]
+
+[tasks.xwin-check]
+description = "Type-check the workspace for Windows MSVC"
+run = "cargo xwin check --workspace --target x86_64-pc-windows-msvc"
+
+[tasks."docs:dev"]
+description = "Serve the documentation site locally"
+dir = "docs"
+run = "npm run dev"
+
+[tasks."docs:build"]
+description = "Build the documentation site into docs/.vitepress/dist"
+dir = "docs"
+run = ["npm ci", "npm run build"]

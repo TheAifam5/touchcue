@@ -1,0 +1,11 @@
+[extend]
+useDefault = true
+
+# `gitleaks dir .` ignores .gitignore, so skip build and documentation output.
+[[allowlists]]
+description = "Generated build and documentation output"
+paths = [
+  '''^docs/\.vitepress/dist/''',
+  '''^docs/\.vitepress/cache/''',
+  '''^target/''',
+]

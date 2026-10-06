@@ -1,0 +1,15 @@
+# Discarding a `Result` error is banned (AGENTS.md, Error handling): match it
+# where recovery is decided, or propagate it as a typed variant.
+disallowed-methods = [
+  { path = "core::result::Result::ok", reason = "handle the error: typed variant or explicit match" },
+  { path = "core::result::Result::err", reason = "match the Result instead of discarding the value" },
+  { path = "core::result::Result::is_ok", reason = "match the Result instead of discarding the error" },
+  { path = "core::result::Result::is_err", reason = "match the Result instead of discarding the error" },
+  { path = "core::result::Result::is_ok_and", reason = "match the Result instead of discarding the error" },
+  { path = "core::result::Result::is_err_and", reason = "match the Result instead of discarding the error" },
+  { path = "core::result::Result::unwrap_or", reason = "handle the error instead of a silent fallback" },
+  { path = "core::result::Result::unwrap_or_default", reason = "handle the error instead of a silent fallback" },
+  { path = "core::result::Result::unwrap_or_else", reason = "handle the error instead of a silent fallback" },
+  { path = "core::result::Result::map_or", reason = "match the Result instead of discarding the error" },
+  { path = "core::result::Result::map_or_else", reason = "match the Result instead of discarding the error" },
+]

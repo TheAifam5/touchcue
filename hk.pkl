@@ -1,0 +1,33 @@
+amends "package://github.com/jdx/hk/releases/download/v2.5.0/hk@2.5.0#/Config.pkl"
+import "package://github.com/jdx/hk/releases/download/v2.5.0/hk@2.5.0#/Builtins.pkl"
+
+// Output of `mise run render`; regenerate it instead of linting or fixing it.
+exclude = List("touchcue.usage.kdl", "completions", "man", "docs/reference/cli")
+
+steps {
+  ["cargo_fmt"] = Builtins.cargo_fmt
+  ["cargo_clippy"] = (Builtins.cargo_clippy) {
+    workspace_indicator = null
+    check = new CommandSpec {
+      command = "cargo clippy --workspace --all-targets --locked -- -D warnings"
+      effect = "write"
+    }
+    fix = new CommandSpec {
+      command = "cargo clippy --workspace --all-targets --locked --fix --allow-dirty --allow-staged -- -D warnings"
+      effect = "write"
+    }
+  }
+  ["taplo"] = Builtins.taplo
+  ["actionlint"] = Builtins.actionlint
+  ["typos"] = Builtins.typos
+  ["newlines"] = Builtins.newlines
+  ["trailing_whitespace"] = Builtins.trailing_whitespace
+  ["gitleaks"] = Builtins.gitleaks
+}
+
+hooks {
+  ["pre-commit"] {
+    fix = true
+    stash = "git"
+  }
+}

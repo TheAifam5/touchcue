@@ -1,0 +1,8 @@
+* text=auto eol=lf
+
+touchcue.usage.kdl linguist-generated=true
+docs/reference/cli/** linguist-generated=true
+completions/** linguist-generated=true
+man/** linguist-generated=true
+
+*.bin binary
