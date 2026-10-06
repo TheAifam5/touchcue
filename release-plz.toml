@@ -17,4 +17,11 @@ changelog_path = "CHANGELOG.md"
 git_tag_enable = true
 git_tag_name = "v{{ version }}"
 changelog_update = true
-changelog_include = ["touchcue-helper"]
+changelog_include = [
+  "touchcue-core",
+  "touchcue-detect",
+  "touchcue-appinfo",
+  "touchcue-ui",
+  "touchcue-ipc",
+  "touchcue-helper",
+]
