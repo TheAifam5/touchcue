@@ -1,0 +1,32 @@
+[package]
+name = "touchcue-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
+tokio-util.workspace = true
+touchcue-core.workspace = true
+tracing.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+fontdb.workspace = true
+resvg.workspace = true
+rustix.workspace = true
+skrifa.workspace = true
+smithay-client-toolkit.workspace = true
+tiny-skia.workspace = true
+tokio = { workspace = true, features = ["macros", "net"] }
+x11rb.workspace = true
+zbus.workspace = true
+
+[dev-dependencies]
+png.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
+
+[lints]
+workspace = true
