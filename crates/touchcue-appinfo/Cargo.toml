@@ -1,0 +1,23 @@
+[package]
+name = "touchcue-appinfo"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+touchcue-core.workspace = true
+tracing.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+freedesktop-desktop-entry.workspace = true
+freedesktop-icons.workspace = true
+rustix.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
