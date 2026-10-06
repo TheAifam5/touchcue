@@ -50,7 +50,7 @@ The published placeholders are the same as on the [event socket](./configuration
 
 A value that is not known is not set. Control and invisible characters in a value are replaced by spaces, runs of whitespace become one space, and a value is cut after 1024 characters. A value can start with `-`, so pass `--` before it to programs that parse options. Device events set only the `device.*` variables, and `daemon_started` and `daemon_stopping` set only `TOUCHCUE_EVENT`.
 
-Variables starting with `TOUCHCUE_` that touchcue itself inherited, such as `TOUCHCUE_LOG` or a `TOUCHCUE_CONFIG` from your shell, are not passed to hooks: every `TOUCHCUE_` variable a hook sees comes from touchcue.
+Variables starting with `TOUCHCUE_` that touchcue itself inherited, such as `TOUCHCUE_LOG` or `TOUCHCUE_ASKPASS_FALLBACK` from your shell, are not passed to hooks: every `TOUCHCUE_` variable a hook sees comes from touchcue.
 
 ## Running
 

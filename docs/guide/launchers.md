@@ -14,7 +14,7 @@ Planned presets:
 
 - rofi
 - fuzzel, with `--keyboard-focus on-demand`
-- `hyprctl notify`
+- `hyprctl notify`, already available as a [hook recipe](./hooks#show-a-hyprland-notification)
 
 ## Commands
 

@@ -18,8 +18,8 @@ When a hardware authenticator waits for a physical touch, touchcue shows a popup
 Each [release](https://github.com/theaifam5/touchcue/releases) has a `touchcue-<target>.tar.gz` archive per platform and a `SHA256SUMS` file. For x86_64 Linux with glibc:
 
 ```sh
-curl -LO https://github.com/theaifam5/touchcue/releases/download/v0.1.0/touchcue-x86_64-unknown-linux-gnu.tar.gz
-curl -LO https://github.com/theaifam5/touchcue/releases/download/v0.1.0/SHA256SUMS
+curl -LO https://github.com/theaifam5/touchcue/releases/download/v0.1.1/touchcue-x86_64-unknown-linux-gnu.tar.gz
+curl -LO https://github.com/theaifam5/touchcue/releases/download/v0.1.1/SHA256SUMS
 sha256sum -c --ignore-missing SHA256SUMS
 tar -xzf touchcue-x86_64-unknown-linux-gnu.tar.gz
 cd touchcue-x86_64-unknown-linux-gnu
@@ -60,7 +60,7 @@ This installs `touchcue` into `~/.cargo/bin`. Contributors can use `mise run bui
 touchcue check
 ```
 
-It prints whether the configuration is valid, whether the desktop offers Wayland layer-shell, X11 and notifications, every FIDO device and whether touchcue can read it, the output backend `touchcue run` would choose, the IPC endpoints, and the gpg setup. It exits with status 1 when the configuration is invalid or a FIDO device cannot be read.
+It prints whether the configuration is valid, whether a Wayland compositor, Wayland layer-shell and a notification service are available, every FIDO device and whether touchcue can read it, the output backend `touchcue run` would choose, the IPC endpoints, the gpg setup, and the number of hooks. It exits with status 1 when the configuration is invalid or a FIDO device cannot be read.
 
 `touchcue list-devices` lists the connected FIDO devices. `touchcue trace` prints the detection signals until interrupted, which helps when a touch is not detected.
 
@@ -81,7 +81,7 @@ The archives do not include the systemd unit. Download it from the repository, a
 ```sh
 mkdir -p ~/.config/systemd/user
 curl -Lo ~/.config/systemd/user/touchcue.service \
-  https://raw.githubusercontent.com/theaifam5/touchcue/v0.1.0/packaging/systemd/touchcue.service
+  https://raw.githubusercontent.com/theaifam5/touchcue/v0.1.1/packaging/systemd/touchcue.service
 ```
 
 The unit runs `touchcue run`, which systemd finds only in `/usr/local/bin` and `/usr/bin`. For any other install path, override the command with `systemctl --user edit touchcue.service`, for example for `~/.local/bin`:

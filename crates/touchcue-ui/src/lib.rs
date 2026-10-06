@@ -1,4 +1,4 @@
-//! Popup, notification and command output backends.
+//! Popup and notification output backends.
 //!
 //! On Linux one tokio task owns the Wayland or X11 connection and every
 //! shown popup, and a second task owns the session bus connection. Other targets

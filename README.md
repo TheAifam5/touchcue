@@ -4,7 +4,7 @@ Shows who is waiting for your security key touch.
 
 [![CI](https://github.com/theaifam5/touchcue/actions/workflows/ci.yml/badge.svg)](https://github.com/theaifam5/touchcue/actions/workflows/ci.yml)
 
-> **Status: early development, Linux only. [v0.1.0](https://github.com/theaifam5/touchcue/releases/tag/v0.1.0) is released.** FIDO2/U2F keys and OpenPGP cards through gpg-agent work on Linux. The Windows and macOS builds detect nothing yet.
+> **Status: early development, Linux only. [v0.1.1](https://github.com/theaifam5/touchcue/releases/tag/v0.1.1) is released.** FIDO2/U2F keys and OpenPGP cards through gpg-agent work on Linux. The Windows and macOS builds detect nothing yet.
 
 ## What it does
 
@@ -24,7 +24,7 @@ touchcue is a daemon and CLI. When a hardware authenticator waits for a physical
 | Output | own popup on Wayland and X11 (placement, monitor choice, optional modal dim), or desktop notifications | desktop notifications |
 | Message templates | placeholders for app, process, device and request | `{{.Reasons}}` |
 | Integration | JSON socket, D-Bus, the yubikey-touch-detector socket, and command hooks | yubikey-touch-detector socket, stdout |
-| Packages | GitHub releases, mise | Arch Linux, Nix, Homebrew, GitHub releases, `go install` |
+| Packages | GitHub releases, mise | Arch Linux, Nix flake, GitHub releases, `go install` |
 
 To switch, see [Migrating from yubikey-touch-detector](https://touchcue.theaifam5.cc/guide/getting-started#migrating-from-yubikey-touch-detector).
 
@@ -45,8 +45,8 @@ To switch, see [Migrating from yubikey-touch-detector](https://touchcue.theaifam
 From a [release archive](https://github.com/theaifam5/touchcue/releases/latest), for example on x86_64 Linux:
 
 ```sh
-curl -LO https://github.com/theaifam5/touchcue/releases/download/v0.1.0/touchcue-x86_64-unknown-linux-gnu.tar.gz
-curl -LO https://github.com/theaifam5/touchcue/releases/download/v0.1.0/SHA256SUMS
+curl -LO https://github.com/theaifam5/touchcue/releases/download/v0.1.1/touchcue-x86_64-unknown-linux-gnu.tar.gz
+curl -LO https://github.com/theaifam5/touchcue/releases/download/v0.1.1/SHA256SUMS
 sha256sum -c --ignore-missing SHA256SUMS
 tar -xzf touchcue-x86_64-unknown-linux-gnu.tar.gz
 install -D touchcue-x86_64-unknown-linux-gnu/touchcue ~/.local/bin/touchcue

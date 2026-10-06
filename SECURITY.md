@@ -10,7 +10,7 @@ Include the touchcue version, operating system, device, and the steps to reprodu
 
 ## Scope
 
-touchcue observes HID input reports, agent sockets and process metadata. The optional proxies and the privileged helper are security-sensitive, and reports about them are welcome.
+touchcue observes HID input reports, agent sockets and process metadata. The hook command runner, the optional proxies and the privileged helper are security-sensitive, and reports about them are welcome.
 
 ## Supported versions
 
