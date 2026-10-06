@@ -54,6 +54,7 @@ release = true
 [[package]]
 name = "touchcue-hooks"
 release = true
+git_only = false
 
 [[package]]
 name = "touchcue-helper"
