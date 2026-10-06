@@ -55,7 +55,7 @@ install -D touchcue-x86_64-unknown-linux-gnu/touchcue ~/.local/bin/touchcue
 With [mise](https://mise.jdx.dev):
 
 ```sh
-mise use -g packslip:github.com/theaifam5/touchcue
+mise use -g --pin packslip:github.com/TheAifam5/touchcue@latest
 ```
 
 From source, with the Rust toolchain pinned in `rust-toolchain.toml`:

@@ -39,10 +39,13 @@ install -Dm644 completions/touchcue.fish ~/.config/fish/completions/touchcue.fis
 ### With mise
 
 ```sh
-mise use -g packslip:github.com/theaifam5/touchcue
+mise use -g --pin packslip:github.com/TheAifam5/touchcue@latest
 ```
 
-A `minimum_release_age` setting in your mise configuration can hide a release younger than that age.
+- `--pin` records the installed version, for example `0.1.1`, instead of `latest`. The [systemd unit](#as-a-systemd-user-service) needs this.
+- Write the project name exactly as `TheAifam5`. With another case, mise warns that the project was renamed and may install an older release.
+- A `minimum_release_age` setting in your mise configuration can hide a release younger than that age.
+- To upgrade, run `mise up --bump packslip:github.com/TheAifam5/touchcue` from a shell and restart the service. If you set up [gpg](./gpg), the path gpg-agent starts changes with the version; see that page.
 
 ### From source
 
@@ -92,7 +95,16 @@ ExecStart=
 ExecStart=%h/.local/bin/touchcue run
 ```
 
-Use `%h/.cargo/bin/touchcue` after `cargo install`. For mise, `mise which touchcue` prints the path, which changes with every upgrade. Then start it:
+Use `%h/.cargo/bin/touchcue` after `cargo install`. For mise, start touchcue through `mise exec`:
+
+```ini
+[Service]
+Environment=MISE_OFFLINE=1
+ExecStart=
+ExecStart=/usr/bin/mise exec -- touchcue run
+```
+
+Use the absolute path that `command -v mise` prints; write `%h/…` for a path under your home directory. The unit allows no internet sockets, and `MISE_OFFLINE=1` keeps mise from fetching version lists, so mise must find the pinned version already installed: install and upgrade from a shell, never through the service. Do not use `latest` or a partial version here. mise cannot resolve it offline, and the service may then start a different touchcue from `PATH` without any error. Then start it:
 
 ```sh
 systemctl --user daemon-reload
