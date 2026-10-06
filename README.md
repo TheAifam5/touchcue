@@ -8,7 +8,7 @@ Shows who is waiting for your security key touch.
 
 ## What it does
 
-touchcue is a daemon and CLI. When a hardware authenticator waits for a physical touch, it shows a popup that does not take focus, or a desktop notification. The prompt names the requesting application and the device, using templates you define with placeholders. Other programs, such as status bars, can follow requests over a JSON socket, D-Bus, or the socket protocol of yubikey-touch-detector.
+touchcue is a daemon and CLI. When a hardware authenticator waits for a physical touch, it shows a popup that does not take focus, centred by default, on the monitors you choose, or a desktop notification. An optional modal mode dims the screen and blocks clicks until you touch the key or dismiss the prompt. The prompt names the requesting application and the device, using templates you define with placeholders. Other programs, such as status bars, can follow requests over a JSON socket, D-Bus, or the socket protocol of yubikey-touch-detector.
 
 ## touchcue and yubikey-touch-detector
 
@@ -21,7 +21,7 @@ touchcue is a daemon and CLI. When a hardware authenticator waits for a physical
 | OpenPGP through gpg-agent (gpg, ssh) | yes | yes |
 | HMAC/OTP | planned | yes |
 | Shows the requesting application | yes, name and icon | no |
-| Output | own popup on Wayland and X11, or desktop notifications | desktop notifications |
+| Output | own popup on Wayland and X11 (placement, monitor choice, optional modal dim), or desktop notifications | desktop notifications |
 | Message templates | placeholders for app, process, device and request | `{{.Reasons}}` |
 | Integration | JSON socket, D-Bus, and the yubikey-touch-detector socket | yubikey-touch-detector socket, stdout |
 | Packages | none yet | Arch Linux, Nix, Homebrew, GitHub releases, `go install` |
