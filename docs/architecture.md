@@ -10,11 +10,12 @@
 | `touchcue-appinfo` | Resolves a process id to an application name, id and icon. |
 | `touchcue-ui` | Popup and notification backends. |
 | `touchcue-ipc` | JSON event socket, compatible socket, D-Bus service, the helper socket for gpg and askpass reports, and gpg-agent queries. |
+| `touchcue-hooks` | Runs the `[[hooks]]` commands on events, without a shell, in their own process groups. |
 | `touchcue-helper` | Optional privileged helper. A stub; nothing is implemented yet. |
 
 ## Runtime
 
-`touchcue run` is one process on a multi-threaded tokio runtime with two worker threads. The hidraw watcher, the helper socket, the IPC endpoints and the UI each run as tasks. The watcher and the helper socket send signals over bounded channels to one daemon loop, which owns the state machine and sends prompts to the UI task and events to the IPC tasks. Blocking work, such as scanning `/proc` to attribute a request, runs on tokio's blocking pool, with at most four threads and a 1 s deadline per attribution. SIGINT and SIGTERM stop every task within fixed deadlines.
+`touchcue run` is one process on a multi-threaded tokio runtime with two worker threads. The hidraw watcher, the helper socket, the IPC endpoints and the UI each run as tasks. The watcher and the helper socket send signals over bounded channels to one daemon loop, which owns the state machine and sends prompts to the UI task and events to the IPC tasks and the hooks. Each hook has a task with a bounded queue that starts its commands; the daemon loop never waits for them. Blocking work, such as scanning `/proc` to attribute a request, runs on tokio's blocking pool, with at most four threads and a 1 s deadline per attribution. SIGINT and SIGTERM stop every task within fixed deadlines.
 
 The scdaemon wrapper and `touchcue askpass` are separate, short-lived touchcue processes started by gpg-agent and OpenSSH. They report to the daemon over `$XDG_RUNTIME_DIR/touchcue/helper.sock`; the daemon never replies.
 

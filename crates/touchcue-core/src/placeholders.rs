@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use crate::machine::Request;
+use crate::model::Device;
 use crate::text::sanitize;
 
 /// Every key a template may reference.
@@ -39,6 +40,31 @@ pub const KNOWN: &[&str] = &[
     "request.state",
     "request.detail",
 ];
+
+/// Keys published outside the daemon besides every `request.*` key.
+/// `app.icon` is the only path among them; executable paths, uids, pids and
+/// command lines stay in the daemon.
+pub const PUBLISHED: [&str; 12] = [
+    "device.vendor",
+    "device.model",
+    "device.product",
+    "device.kind",
+    "device.transport",
+    "device.vid",
+    "device.pid",
+    "app.name",
+    "app.id",
+    "app.icon",
+    "app.container",
+    "process.name",
+];
+
+/// Returns whether the value of `key` may leave the daemon: every
+/// `request.*` key and the keys in [`PUBLISHED`].
+#[must_use]
+pub fn published(key: &str) -> bool {
+    key.starts_with("request.") || PUBLISHED.contains(&key)
+}
 
 /// Application a request is attributed to.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -103,7 +129,7 @@ pub fn values(
     confidence: Confidence,
     now: Instant,
 ) -> BTreeMap<String, String> {
-    let mut out = BTreeMap::new();
+    let mut out = device_values(&request.device);
     let mut put = |key: &str, value: Option<String>| {
         if let Some(value) = value {
             out.insert(key.to_owned(), value);
@@ -131,18 +157,6 @@ pub fn values(
         put("process.uid", process.uid.map(|u| u.to_string()));
     }
 
-    let device = &request.device;
-    put("device.vendor", device.vendor.clone());
-    put("device.model", device.model.clone());
-    put("device.product", device.product.clone());
-    put("device.vid", device.vid.map(|v| format!("{v:04x}")));
-    put("device.pid", device.pid.map(|p| format!("{p:04x}")));
-    put("device.kind", Some(device.kind.as_str().to_owned()));
-    put(
-        "device.transport",
-        Some(device.transport.as_str().to_owned()),
-    );
-
     put("request.method", Some(request.method.as_str().to_owned()));
     put("request.op", request.op.map(|op| op.as_str().to_owned()));
     put("request.source", Some(request.source.as_str().to_owned()));
@@ -158,6 +172,29 @@ pub fn values(
             .detail
             .as_deref()
             .and_then(|detail| sanitize(detail, DETAIL_MAX)),
+    );
+    out
+}
+
+/// Returns the `device.*` placeholder values of `device`, formatted as in
+/// [`values`]; absent values are omitted.
+#[must_use]
+pub fn device_values(device: &Device) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    let mut put = |key: &str, value: Option<String>| {
+        if let Some(value) = value {
+            out.insert(key.to_owned(), value);
+        }
+    };
+    put("device.vendor", device.vendor.clone());
+    put("device.model", device.model.clone());
+    put("device.product", device.product.clone());
+    put("device.vid", device.vid.map(|v| format!("{v:04x}")));
+    put("device.pid", device.pid.map(|p| format!("{p:04x}")));
+    put("device.kind", Some(device.kind.as_str().to_owned()));
+    put(
+        "device.transport",
+        Some(device.transport.as_str().to_owned()),
     );
     out
 }

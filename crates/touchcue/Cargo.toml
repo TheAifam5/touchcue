@@ -29,6 +29,7 @@ usage.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 rustix = { workspace = true, features = ["process", "stdio"] }
+touchcue-hooks.workspace = true
 tokio = { workspace = true, features = [
   "fs",
   "io-std",

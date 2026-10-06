@@ -139,6 +139,27 @@ suppress = true
 | `icon` | path | PNG or SVG file shown instead of the application's icon. |
 | `suppress` | boolean | Shows nothing for matching requests. IPC still publishes them. Default `false`. |
 
+## `[[hooks]]`
+
+Hooks run a command on touchcue events. See [Hooks](./hooks) for the events, the environment the command gets, and recipes. With hooks, this file runs commands as your user: keep it writable only by you, and never run the daemon as root with a configuration file another user can write.
+
+```toml
+[[hooks]]
+on = ["started"]
+match = { "request.method" = "fido2" }
+command = ["pw-play", "/usr/share/sounds/freedesktop/stereo/message.oga"]
+timeout_ms = 5000
+concurrency = 4
+```
+
+| Key | Type | Meaning |
+| --- | --- | --- |
+| `on` | list of event names | Events that run the command. Required and non-empty. An unknown name is an error. |
+| `match` | table of strings | Placeholder names and values that must all be equal, as in `[[rules]]`. Optional; without it, every listed event runs the command. Device events only have `device.*` values and daemon events none, so a `match` on other names never runs for them. `match` only selects events: application and process names are set by the processes themselves. |
+| `command` | list of strings | The program and its arguments, run without a shell. Required, and the program must not be empty. |
+| `timeout_ms` | 1 to 600000 | Time the command may run before it is ended. Default 5000. |
+| `concurrency` | 1 to 32 | Most runs of this hook at once. Default 4. |
+
 ## `[sources.fido]`
 
 | Key | Values | Default |

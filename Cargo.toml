@@ -32,6 +32,7 @@ touchcue = { path = "crates/touchcue" }
 touchcue-appinfo = { path = "crates/touchcue-appinfo" }
 touchcue-core = { path = "crates/touchcue-core" }
 touchcue-detect = { path = "crates/touchcue-detect" }
+touchcue-hooks = { path = "crates/touchcue-hooks" }
 touchcue-ipc = { path = "crates/touchcue-ipc" }
 touchcue-ui = { path = "crates/touchcue-ui" }
 tracing = "0.1.44"

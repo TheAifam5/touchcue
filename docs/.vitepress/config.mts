@@ -17,6 +17,7 @@ export default defineConfig({
           { text: 'Getting started', link: '/guide/getting-started' },
           { text: 'Configuration', link: '/guide/configuration' },
           { text: 'Placeholders', link: '/guide/placeholders' },
+          { text: 'Hooks', link: '/guide/hooks' },
           { text: 'Platforms', link: '/guide/platforms' },
           { text: 'Launchers', link: '/guide/launchers' },
           { text: 'gpg and ssh', link: '/guide/gpg' },

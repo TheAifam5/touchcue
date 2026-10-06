@@ -3,29 +3,8 @@
 use std::collections::BTreeMap;
 
 use serde::Serialize;
+use touchcue_core::placeholders::published;
 use touchcue_core::{EndReason, Event};
-
-/// Placeholder keys published besides every `request.*` key. `app.icon` is
-/// the only path among them; executable paths, uids, pids and command lines
-/// stay in the daemon.
-const ALLOWED: [&str; 12] = [
-    "device.vendor",
-    "device.model",
-    "device.product",
-    "device.kind",
-    "device.transport",
-    "device.vid",
-    "device.pid",
-    "app.name",
-    "app.id",
-    "app.icon",
-    "app.container",
-    "process.name",
-];
-
-fn allowed(key: &str) -> bool {
-    key.starts_with("request.") || ALLOWED.contains(&key)
-}
 
 /// Change a [`WireEvent`] reports, serialized in lowercase.
 #[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,7 +50,7 @@ impl WireEvent {
             source: request.source.as_str().to_owned(),
             values: values
                 .iter()
-                .filter(|(key, _)| allowed(key))
+                .filter(|(key, _)| published(key))
                 .map(|(key, value)| (key.clone(), value.clone()))
                 .collect(),
         }

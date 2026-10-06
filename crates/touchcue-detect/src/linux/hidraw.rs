@@ -15,6 +15,7 @@ use rustix::fs::{FileType, Mode, OFlags};
 use rustix::io::Errno;
 use tokio::io::unix::AsyncFd;
 use tokio::sync::mpsc::Sender;
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{Semaphore, TryAcquireError};
 use tokio::task::{Id, JoinError, JoinHandle, JoinSet};
 use tokio_util::sync::{CancellationToken, DropGuard};
@@ -30,6 +31,9 @@ use crate::linux::sysfs::{fido_device, is_node_name, list_fido};
 /// The watcher waits for room instead of dropping signals, so a resolution
 /// is never lost; the per-node rate limits bound what it can queue.
 pub const SIGNAL_QUEUE: usize = 256;
+/// Capacity of the device event channel the caller should create; an
+/// event that finds it full is dropped with a warning.
+pub const DEVICE_QUEUE: usize = 16;
 /// HID report size of CTAPHID packets.
 const REPORT_BYTES: usize = 64;
 /// Reports read from one node per wakeup before other tasks get a turn.
@@ -54,9 +58,21 @@ const SCAN_TIMEOUT: Duration = Duration::from_secs(2);
 const RESCAN_RETRY: Duration = Duration::from_secs(1);
 /// Shortest interval between two log events for skipped lookups.
 const SCAN_BUSY_LOG_INTERVAL: Duration = Duration::from_secs(10);
+/// Shortest interval between two log events for dropped device events.
+const DEVICE_DROP_LOG_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Opens a node path; `Ok(None)` means the path is not a node to watch.
 type Opener = fn(&Path) -> rustix::io::Result<Option<OwnedFd>>;
+
+/// A FIDO device the watcher started or stopped watching.
+///
+/// Devices present when the watcher starts are added too. After the inotify
+/// queue overflows, every watched device is removed and added again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeviceEvent {
+    Added(Device),
+    Removed(Device),
+}
 
 /// Running watcher of FIDO hidraw nodes.
 ///
@@ -70,14 +86,16 @@ pub struct Watcher {
 }
 
 /// Starts watching the FIDO hidraw nodes of `dev_root`, sending a signal per
-/// CTAPHID report of interest to `tx`.
+/// CTAPHID report of interest to `tx`, and a [`DeviceEvent`] per node it
+/// starts or stops watching to `devices`, if given.
 ///
 /// `sys_root` is the sysfs mount point, normally `/sys`; `dev_root` the device
 /// directory, normally `/dev`. Nodes present now and nodes added later are
 /// watched until they disappear. The watcher ends when `parent` is cancelled,
 /// the receiver of `tx` is dropped, or reading inotify events fails; every
-/// clone of `tx` it holds is dropped when it ends. Must be called within a
-/// Tokio runtime with I/O and time enabled.
+/// clone of `tx` it holds is dropped when it ends. Device events are sent
+/// without waiting: one that finds `devices` full is dropped. Must be called
+/// within a Tokio runtime with I/O and time enabled.
 ///
 /// # Errors
 ///
@@ -87,15 +105,17 @@ pub fn spawn(
     sys_root: PathBuf,
     dev_root: PathBuf,
     tx: Sender<Signal>,
+    devices: Option<Sender<DeviceEvent>>,
     parent: &CancellationToken,
 ) -> Result<Watcher, DetectError> {
-    spawn_with(sys_root, dev_root, tx, parent, open_node)
+    spawn_with(sys_root, dev_root, tx, devices, parent, open_node)
 }
 
 fn spawn_with(
     sys_root: PathBuf,
     dev_root: PathBuf,
     tx: Sender<Signal>,
+    devices: Option<Sender<DeviceEvent>>,
     parent: &CancellationToken,
     open: Opener,
 ) -> Result<Watcher, DetectError> {
@@ -112,7 +132,7 @@ fn spawn_with(
         context: "cannot register inotify instance",
         source,
     })?;
-    let state = State::new(sys_root, dev_root, tx, cancel.clone(), open);
+    let state = State::new(sys_root, dev_root, tx, cancel.clone(), open).reporting(devices);
     let task = tokio::spawn(
         state
             .run(inotify)
@@ -375,12 +395,15 @@ async fn read_node(
 struct NodeHandle {
     task: Id,
     cancel: CancellationToken,
+    device: Device,
 }
 
 struct State {
     sys_root: PathBuf,
     dev_root: PathBuf,
     tx: Sender<Signal>,
+    /// Receives a [`DeviceEvent`] per node opened or forgotten.
+    devices: Option<Sender<DeviceEvent>>,
     open: Opener,
     /// Cancelled by the caller to stop the watcher.
     cancel: CancellationToken,
@@ -394,6 +417,7 @@ struct State {
     /// When to rescan after a lookup was skipped or abandoned.
     rescan_at: Option<Instant>,
     busy_limit: RateLimit,
+    device_drop_limit: RateLimit,
 }
 
 impl State {
@@ -408,6 +432,7 @@ impl State {
             sys_root,
             dev_root,
             tx,
+            devices: None,
             open,
             nodes_cancel: cancel.child_token(),
             cancel,
@@ -416,6 +441,36 @@ impl State {
             scan_slot: Arc::new(Semaphore::new(1)),
             rescan_at: None,
             busy_limit: RateLimit::new(SCAN_BUSY_LOG_INTERVAL),
+            device_drop_limit: RateLimit::new(DEVICE_DROP_LOG_INTERVAL),
+        }
+    }
+
+    /// Reports the nodes opened and forgotten to `devices`.
+    fn reporting(mut self, devices: Option<Sender<DeviceEvent>>) -> Self {
+        self.devices = devices;
+        self
+    }
+
+    /// Sends `event` to `devices` without waiting; a full channel drops it
+    /// with a rate-limited warning.
+    fn report(&mut self, event: DeviceEvent) {
+        let Some(devices) = &self.devices else {
+            return;
+        };
+        match devices.try_send(event) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                self.device_drop_limit.log(now(), |suppressed| {
+                    tracing::warn!(
+                        limit = DEVICE_QUEUE,
+                        suppressed,
+                        "device event queue full; dropping an event"
+                    );
+                });
+            }
+            Err(TrySendError::Closed(_)) => {
+                tracing::debug!("device event receiver closed");
+            }
         }
     }
 
@@ -475,7 +530,14 @@ impl State {
             Ok((task, ())) => *task,
             Err(error) => error.id(),
         };
-        self.nodes.retain(|_, node| node.task != task);
+        let ended = self
+            .nodes
+            .iter()
+            .find(|(_, node)| node.task == task)
+            .map(|(name, _)| name.clone());
+        if let Some(node) = ended.and_then(|name| self.nodes.remove(&name)) {
+            self.report(DeviceEvent::Removed(node.device));
+        }
         joined.map(drop).map_err(DetectError::from)
     }
 
@@ -621,17 +683,25 @@ impl State {
         let span = tracing::debug_span!("hidraw_node", node = name);
         let task = self
             .tasks
-            .spawn(read_node(fd, device, self.tx.clone(), cancel.clone()).instrument(span))
+            .spawn(read_node(fd, device.clone(), self.tx.clone(), cancel.clone()).instrument(span))
             .id();
         tracing::debug!(node = name, "watching hidraw node");
-        self.nodes
-            .insert(name.to_owned(), NodeHandle { task, cancel });
+        self.report(DeviceEvent::Added(device.clone()));
+        self.nodes.insert(
+            name.to_owned(),
+            NodeHandle {
+                task,
+                cancel,
+                device,
+            },
+        );
     }
 
     fn close(&mut self, name: &str) {
         if let Some(node) = self.nodes.remove(name) {
             node.cancel.cancel();
             tracing::debug!(node = name, "stopped watching hidraw node");
+            self.report(DeviceEvent::Removed(node.device));
         }
     }
 }
@@ -999,10 +1069,12 @@ mod tests {
         let dev = tempfile::tempdir()?;
         sysfs_node(sys.path(), "hidraw5")?;
         let (tx, mut rx) = mpsc::channel(SIGNAL_QUEUE);
+        let (devices_tx, mut devices) = mpsc::channel(DEVICE_QUEUE);
         let watcher = spawn_with(
             sys.path().to_owned(),
             dev.path().to_owned(),
             tx,
+            Some(devices_tx),
             &CancellationToken::new(),
             open_fifo,
         )?;
@@ -1010,14 +1082,26 @@ mod tests {
         rustix::fs::mkfifoat(CWD, &node, Mode::RUSR | Mode::WUSR)?;
         // The watcher opens the FIFO after the create event; until then writes have no reader.
         let writer = wait_for_reader(&node).await?;
+        let added = timeout(WAIT, devices.recv()).await?;
+        let id = DeviceId("/dev/hidraw5".to_owned());
+        assert!(
+            matches!(&added, Some(DeviceEvent::Added(device)) if device.id == id),
+            "{added:?}"
+        );
         rustix::io::write(&writer, &pending(3))?;
         let signal = recv(&mut rx).await?;
-        assert_eq!(signal.device.id, DeviceId("/dev/hidraw5".to_owned()));
+        assert_eq!(signal.device.id, id);
         assert_eq!(signal.channel, Some(3));
 
         fs::remove_file(&node)?;
         wait_for_no_reader(&writer).await?;
+        let removed = timeout(WAIT, devices.recv()).await?;
+        assert!(
+            matches!(&removed, Some(DeviceEvent::Removed(device)) if device.id == id),
+            "{removed:?}"
+        );
         watcher.stop().await?;
+        assert!(devices.recv().await.is_none(), "one removal per node");
         Ok(())
     }
 
@@ -1124,7 +1208,13 @@ mod tests {
         let dev = tempfile::tempdir()?;
         let (tx, _rx) = mpsc::channel(SIGNAL_QUEUE);
         let parent = CancellationToken::new();
-        let watcher = spawn(sys.path().to_owned(), dev.path().to_owned(), tx, &parent)?;
+        let watcher = spawn(
+            sys.path().to_owned(),
+            dev.path().to_owned(),
+            tx,
+            None,
+            &parent,
+        )?;
         timeout(Duration::from_secs(1), watcher.stop()).await??;
         assert!(!parent.is_cancelled());
         Ok(())
@@ -1139,6 +1229,7 @@ mod tests {
             sys.path().to_owned(),
             dev.path().to_owned(),
             tx,
+            None,
             &CancellationToken::new(),
         )?;
         drop(rx);
@@ -1154,6 +1245,7 @@ mod tests {
             dir.path().to_owned(),
             dir.path().join("missing"),
             tx,
+            None,
             &CancellationToken::new(),
         );
         assert!(matches!(result, Err(DetectError::Io { .. })));

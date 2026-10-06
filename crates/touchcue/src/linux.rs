@@ -12,12 +12,16 @@ use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 use touchcue_appinfo::linux::Resolver;
+use touchcue_core::placeholders::device_values;
 use touchcue_core::text::sanitize;
 use touchcue_core::{
-    Config, Device, Event, Machine, MachineConfig, Outcome, RateLimit, Signal, SignalKind,
+    Config, Device, Event, HookEvent, Machine, MachineConfig, Outcome, RateLimit, Signal,
+    SignalKind,
 };
 use touchcue_detect::DetectError;
+use touchcue_detect::linux::hidraw::DeviceEvent;
 use touchcue_detect::linux::{hidraw, sysfs};
+use touchcue_hooks::{HookSender, Hooks, HooksError, RequestEvents};
 use touchcue_ipc::agent::{self, AgentPaths};
 use touchcue_ipc::helper::{Helper, HelperConfig, HelperOutputs, Notice};
 use touchcue_ipc::{Ipc, IpcConfig, IpcError, WireEvent};
@@ -43,6 +47,9 @@ const UI_WARN_INTERVAL: Duration = Duration::from_secs(10);
 /// Interval at which IPC clients receive the full set of active requests, so
 /// that a dropped event cannot leave them with stale state.
 const RESYNC_INTERVAL: Duration = Duration::from_secs(5);
+/// Longest wait for queued and running hook commands at shutdown before
+/// they are ended.
+const HOOKS_DRAIN: Duration = Duration::from_secs(2);
 
 /// Failure of `run`, `list-devices` or `trace`.
 #[derive(Debug, thiserror::Error)]
@@ -71,6 +78,8 @@ pub enum Error {
     HelperStop(#[source] IpcError),
     #[error("helper socket did not stop within {HELPER_STOP_TIMEOUT:?}")]
     HelperStopTimeout(#[source] tokio::time::error::Elapsed),
+    #[error("hook commands did not stop")]
+    HooksStop(#[source] HooksError),
     #[error("cannot write to stdout")]
     Stdout(#[source] io::Error),
 }
@@ -147,7 +156,9 @@ fn now() -> Instant {
 
 /// Runs the daemon until SIGINT or SIGTERM.
 ///
-/// Shutdown stops the event loop, then detection and the helper socket,
+/// Hooks get `daemon_started` once everything started. Shutdown stops the
+/// event loop and fires `daemon_stopping`, then stops detection and the
+/// helper socket, then the hooks, ending commands still running after 2 s,
 /// then the UI and IPC, each bounded by its own deadline. The helper socket
 /// is optional: when it cannot start, gpg and ssh reports are not received
 /// and the daemon runs on. A signal during startup abandons the pending
@@ -156,8 +167,8 @@ fn now() -> Instant {
 /// # Errors
 ///
 /// Returns the error of the UI or detector when it fails to start, or, after
-/// shutting down, the first error of the event loop, the watcher, the UI and
-/// IPC in that order. Later errors are logged. Returns
+/// shutting down, the first error of the event loop, the watcher, the hooks,
+/// the UI and IPC in that order. Later errors are logged. Returns
 /// [`Error::AlreadyRunning`] when another touchcue serves IPC; any other IPC
 /// failure is logged and the daemon runs without IPC.
 #[tracing::instrument(skip_all, fields(backend = tracing::field::Empty), err)]
@@ -169,6 +180,7 @@ pub async fn run(config: Config) -> Result<(), Error> {
         keepalive_timeout: Duration::from_millis(fido.keepalive_timeout_ms),
         retry_window: Duration::from_millis(fido.retry_window_ms),
     });
+    let hooks = Hooks::spawn(config.hooks.clone());
     let ui = Ui::spawn(
         UiConfig {
             output: config.output.clone(),
@@ -190,7 +202,7 @@ pub async fn run(config: Config) -> Result<(), Error> {
     let ipc = tokio::select! {
         name = signals.recv() => {
             tracing::info!(signal = name, "stopping during startup");
-            return finish(None, Outputs::new(ui, None), &root).await;
+            return finish(None, Outputs::new(ui, None, hooks.sender()), hooks, &root).await;
         }
         ipc = spawn_ipc(&config, &root) => ipc,
     };
@@ -199,7 +211,8 @@ pub async fn run(config: Config) -> Result<(), Error> {
         Err(Error::IpcStart(error @ IpcError::AlreadyRunning { .. })) => {
             return finish(
                 Some(Error::AlreadyRunning(error)),
-                Outputs::new(ui, None),
+                Outputs::new(ui, None, hooks.sender()),
+                hooks,
                 &root,
             )
             .await;
@@ -212,12 +225,13 @@ pub async fn run(config: Config) -> Result<(), Error> {
             None
         }
     };
-    let mut outputs = Outputs::new(ui, ipc);
-    let (tx, mut rx) = mpsc::channel(hidraw::SIGNAL_QUEUE);
-    let (notices_tx, mut notices) = mpsc::channel(NOTICE_QUEUE);
-    let watcher = match spawn_watcher(&config, tx.clone(), &root) {
+    let mut outputs = Outputs::new(ui, ipc, hooks.sender());
+    let (tx, rx) = mpsc::channel(hidraw::SIGNAL_QUEUE);
+    let (notices_tx, notices) = mpsc::channel(NOTICE_QUEUE);
+    let (devices_tx, devices) = mpsc::channel(hidraw::DEVICE_QUEUE);
+    let watcher = match spawn_watcher(&config, tx.clone(), devices_tx, &root) {
         Ok(watcher) => watcher,
-        Err(error) => return finish(Some(error), outputs, &root).await,
+        Err(error) => return finish(Some(error), outputs, hooks, &root).await,
     };
     let helper_outputs = HelperOutputs {
         signals: tx.clone(),
@@ -228,7 +242,7 @@ pub async fn run(config: Config) -> Result<(), Error> {
             tracing::info!(signal = name, "stopping during startup");
             let mut first = None;
             stop_detection(&mut first, watcher, None).await;
-            return finish(first, outputs, &root).await;
+            return finish(first, outputs, hooks, &root).await;
         }
         started = spawn_helper(&config, helper_outputs, &root) => started,
     };
@@ -241,6 +255,8 @@ pub async fn run(config: Config) -> Result<(), Error> {
         helper = helper.is_some(),
         "touchcue running"
     );
+    let sender = hooks.sender();
+    sender.fire(HookEvent::DaemonStarted, &BTreeMap::new());
 
     let mut daemon = Daemon::new(
         machine,
@@ -248,7 +264,8 @@ pub async fn run(config: Config) -> Result<(), Error> {
         SystemAttribution::new(Resolver::system(), agent),
         outputs,
     );
-    let ended = event_loop(&mut daemon, &mut rx, &mut notices, &mut signals).await;
+    let ended = event_loop(&mut daemon, rx, notices, devices, &sender, &mut signals).await;
+    sender.fire(HookEvent::DaemonStopping, &BTreeMap::new());
     drop(idle_tx);
     let mut first = None;
     if let Err(error) = ended {
@@ -256,22 +273,29 @@ pub async fn run(config: Config) -> Result<(), Error> {
     }
     stop_detection(&mut first, watcher, helper).await;
     outputs = daemon.into_sink();
-    finish(first, outputs, &root).await
+    finish(first, outputs, hooks, &root).await
 }
 
 /// Starts the hidraw watcher when `sources.fido` is enabled.
 fn spawn_watcher(
     config: &Config,
     tx: mpsc::Sender<Signal>,
+    devices: mpsc::Sender<DeviceEvent>,
     root: &CancellationToken,
 ) -> Result<Option<hidraw::Watcher>, Error> {
     if !config.sources.fido.enabled {
         tracing::info!("FIDO detection is disabled");
         return Ok(None);
     }
-    hidraw::spawn(PathBuf::from(SYS_ROOT), PathBuf::from(DEV_ROOT), tx, root)
-        .map(Some)
-        .map_err(Error::WatcherStart)
+    hidraw::spawn(
+        PathBuf::from(SYS_ROOT),
+        PathBuf::from(DEV_ROOT),
+        tx,
+        Some(devices),
+        root,
+    )
+    .map(Some)
+    .map_err(Error::WatcherStart)
 }
 
 /// Stops the hidraw watcher and the helper socket, each within its deadline,
@@ -342,14 +366,19 @@ async fn spawn_helper(
     }
 }
 
-/// Shuts the outputs down, cancels every remaining task and returns
-/// `first`, else the shutdown error.
+/// Stops the hooks, ending commands still running after [`HOOKS_DRAIN`],
+/// shuts the outputs down, cancels every remaining task and returns
+/// `first`, else the first shutdown error.
 async fn finish(
     first: Option<Error>,
     outputs: Outputs,
+    hooks: Hooks,
     root: &CancellationToken,
 ) -> Result<(), Error> {
     let mut first = first;
+    if let Err(error) = hooks.shutdown(HOOKS_DRAIN).await {
+        keep_first(&mut first, Error::HooksStop(error));
+    }
     if let Err(error) = shutdown(outputs).await {
         keep_first(&mut first, error);
     }
@@ -410,20 +439,25 @@ async fn spawn_ipc(config: &Config, root: &CancellationToken) -> Result<Option<I
     Ok(Some(ipc))
 }
 
-/// Feeds signals, askpass notices and deadlines to the daemon until SIGINT
-/// or SIGTERM. A closed notice channel means the helper socket stopped;
-/// the daemon runs on without notices.
+/// Feeds signals, askpass notices and deadlines to the daemon, and device
+/// events to the hooks, until SIGINT or SIGTERM. A closed notice channel
+/// means the helper socket stopped, and a closed device channel that the
+/// hidraw watcher is not running; the daemon runs on without them.
 ///
 /// # Errors
 ///
 /// Returns [`Error::WatcherGone`] when the signal channel closes.
 async fn event_loop<A: Attribute, S: Sink>(
     daemon: &mut Daemon<A, S>,
-    rx: &mut mpsc::Receiver<Signal>,
-    notices: &mut mpsc::Receiver<Notice>,
+    mut rx: mpsc::Receiver<Signal>,
+    mut notices: mpsc::Receiver<Notice>,
+    mut devices: mpsc::Receiver<DeviceEvent>,
+    hooks: &HookSender,
     signals: &mut StopSignals,
 ) -> Result<(), Error> {
     let mut notices_open = true;
+    // Already closed and empty when FIDO detection is disabled.
+    let mut devices_open = !(devices.is_closed() && devices.is_empty());
     let mut resync = tokio::time::interval_at(
         tokio::time::Instant::now() + RESYNC_INTERVAL,
         RESYNC_INTERVAL,
@@ -449,6 +483,18 @@ async fn event_loop<A: Attribute, S: Sink>(
                     notices_open = false;
                 }
             }
+            device = devices.recv(), if devices_open => match device {
+                Some(DeviceEvent::Added(device)) => {
+                    hooks.fire(HookEvent::DeviceAdded, &device_values(&device));
+                }
+                Some(DeviceEvent::Removed(device)) => {
+                    hooks.fire(HookEvent::DeviceRemoved, &device_values(&device));
+                }
+                None => {
+                    tracing::debug!("device events stopped");
+                    devices_open = false;
+                }
+            },
             () = tokio::time::sleep_until(wake), if deadline.is_some() => {}
             _ = resync.tick() => daemon.resync(),
         }
@@ -456,22 +502,26 @@ async fn event_loop<A: Attribute, S: Sink>(
     }
 }
 
-/// The real UI and IPC outputs.
+/// The real UI, IPC and hook outputs.
 struct Outputs {
     ui: Ui,
     backend: &'static str,
     ipc: Option<Ipc>,
     ui_limit: RateLimit,
+    hooks: HookSender,
+    requests: RequestEvents,
 }
 
 impl Outputs {
-    fn new(ui: Ui, ipc: Option<Ipc>) -> Self {
+    fn new(ui: Ui, ipc: Option<Ipc>, hooks: HookSender) -> Self {
         let backend = backend_name(ui.backend());
         Self {
             ui,
             backend,
             ipc,
             ui_limit: RateLimit::new(UI_WARN_INTERVAL),
+            hooks,
+            requests: RequestEvents::default(),
         }
     }
 }
@@ -524,6 +574,9 @@ impl Sink for Outputs {
         if let Some(ipc) = &self.ipc {
             ipc.publish(&wire);
         }
+        for hook_event in self.requests.map(event) {
+            self.hooks.fire(hook_event, values);
+        }
     }
 
     fn resync(&mut self, active: &[(Event, BTreeMap<String, String>)]) {
@@ -567,8 +620,14 @@ pub async fn trace() -> Result<(), Error> {
     let mut signals = StopSignals::register()?;
     let root = CancellationToken::new();
     let (tx, mut rx) = mpsc::channel(hidraw::SIGNAL_QUEUE);
-    let watcher = hidraw::spawn(PathBuf::from(SYS_ROOT), PathBuf::from(DEV_ROOT), tx, &root)
-        .map_err(Error::WatcherStart)?;
+    let watcher = hidraw::spawn(
+        PathBuf::from(SYS_ROOT),
+        PathBuf::from(DEV_ROOT),
+        tx,
+        None,
+        &root,
+    )
+    .map_err(Error::WatcherStart)?;
     let start = now();
     let mut out = tokio::io::stdout();
     let result = loop {

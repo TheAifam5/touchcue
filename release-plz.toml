@@ -25,6 +25,7 @@ changelog_include = [
   "touchcue-appinfo",
   "touchcue-ui",
   "touchcue-ipc",
+  "touchcue-hooks",
   "touchcue-helper",
 ]
 
@@ -48,6 +49,10 @@ release = true
 
 [[package]]
 name = "touchcue-ipc"
+release = true
+
+[[package]]
+name = "touchcue-hooks"
 release = true
 
 [[package]]

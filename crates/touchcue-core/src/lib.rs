@@ -14,7 +14,7 @@ pub mod text;
 #[cfg(test)]
 mod test_error;
 
-pub use config::{Config, ConfigError, Rendered};
+pub use config::{Config, ConfigError, Hook, HookEvent, Rendered};
 pub use limit::RateLimit;
 pub use machine::{EndReason, Event, Machine, MachineConfig, Request, RequestId, RequestState};
 pub use model::{

@@ -1478,6 +1478,7 @@ dependencies = [
  "touchcue-appinfo",
  "touchcue-core",
  "touchcue-detect",
+ "touchcue-hooks",
  "touchcue-ipc",
  "touchcue-ui",
  "tracing",
@@ -1524,6 +1525,19 @@ dependencies = [
 [[package]]
 name = "touchcue-helper"
 version = "0.1.0"
+
+[[package]]
+name = "touchcue-hooks"
+version = "0.1.0"
+dependencies = [
+ "rustix",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+ "touchcue-core",
+ "tracing",
+]
 
 [[package]]
 name = "touchcue-ipc"

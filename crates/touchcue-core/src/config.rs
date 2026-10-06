@@ -16,6 +16,12 @@ use crate::template::{self, Template, TemplateError};
 const DEFAULT_TITLE: &str = "Touch {device.vendor|\"your security key\"}";
 /// Upper bound of every configured duration, in milliseconds.
 const MAX_MS: u64 = 600_000;
+/// Default of `hooks.timeout_ms`.
+const DEFAULT_HOOK_TIMEOUT_MS: u64 = 5000;
+/// Default of `hooks.concurrency`.
+const DEFAULT_HOOK_CONCURRENCY: u64 = 4;
+/// Upper bound of `hooks.concurrency`.
+const MAX_HOOK_CONCURRENCY: u64 = 32;
 /// Lower bound of `sources.fido.keepalive_timeout_ms`; progress signals are
 /// sent every third of it, so a smaller value would make them spin.
 const MIN_KEEPALIVE_MS: u64 = 100;
@@ -253,6 +259,91 @@ pub struct Rule {
     pub suppress: bool,
 }
 
+/// An event that runs `[[hooks]]` commands, written in TOML in snake case.
+///
+/// One change of a request can fire several events, in the order of the
+/// variants: [`Self::Started`], [`Self::Updated`] or [`Self::Ended`] first,
+/// then [`Self::Revived`], [`Self::Waiting`] or [`Self::Lingering`], then
+/// the outcome. An outcome fires when the request's state becomes it: when
+/// the operation ends and lingers for a client retry, or, for a touch, when
+/// the request ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookEvent {
+    /// A request started.
+    Started,
+    /// A request changed, including its state.
+    Updated,
+    /// A request ended.
+    Ended,
+    /// A client retry revived a lingering request.
+    Revived,
+    /// A request started or was revived and waits for a touch.
+    Waiting,
+    /// A request's operation ended and waits for a client retry.
+    Lingering,
+    Touched,
+    Cancelled,
+    Failed,
+    TimedOut,
+    /// The FIDO watcher started watching a device.
+    DeviceAdded,
+    /// The FIDO watcher stopped watching a device.
+    DeviceRemoved,
+    /// The daemon started.
+    DaemonStarted,
+    /// The daemon is stopping.
+    DaemonStopping,
+}
+
+impl HookEvent {
+    /// Returns the snake case name used in TOML and in `TOUCHCUE_EVENT`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Started => "started",
+            Self::Updated => "updated",
+            Self::Ended => "ended",
+            Self::Revived => "revived",
+            Self::Waiting => "waiting",
+            Self::Lingering => "lingering",
+            Self::Touched => "touched",
+            Self::Cancelled => "cancelled",
+            Self::Failed => "failed",
+            Self::TimedOut => "timed_out",
+            Self::DeviceAdded => "device_added",
+            Self::DeviceRemoved => "device_removed",
+            Self::DaemonStarted => "daemon_started",
+            Self::DaemonStopping => "daemon_stopping",
+        }
+    }
+}
+
+/// One `[[hooks]]` entry: a command run on events.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hook {
+    /// Events that run the command; never empty.
+    pub on: Vec<HookEvent>,
+    /// Placeholder values that must all be present and equal, compared
+    /// exactly and case-sensitively; empty matches every event.
+    pub matches: BTreeMap<String, String>,
+    /// Program and arguments, run without a shell; never empty, and the
+    /// program is never empty.
+    pub command: Vec<String>,
+    /// Time the command may run, 1 to 600000 ms.
+    pub timeout_ms: u64,
+    /// Most runs of the command at once, 1 to 32.
+    pub concurrency: u8,
+}
+
+impl Hook {
+    /// Returns whether `event` with placeholder `values` runs the command.
+    #[must_use]
+    pub fn applies(&self, event: HookEvent, values: &BTreeMap<String, String>) -> bool {
+        self.on.contains(&event) && matches_all(&self.matches, values)
+    }
+}
+
 /// The `[sources]` section.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -387,6 +478,18 @@ pub enum ConfigError {
         help("give the rule at least one `\"key\" = \"value\"` entry in `match`")
     )]
     EmptyMatch { index: usize },
+    #[error("`{field}` must not be empty")]
+    #[diagnostic(
+        code(touchcue::config::empty_hook_field),
+        help(
+            "list at least one event in `on`, and the program and its arguments in `command`, such as `[\"pw-play\", \"/path/to/sound.oga\"]`"
+        )
+    )]
+    EmptyHookField {
+        field: String,
+        #[label("empty")]
+        span: Option<SourceSpan>,
+    },
     #[error("`{field}` is {value}, outside {min}..={max}")]
     #[diagnostic(code(touchcue::config::out_of_range))]
     OutOfRange {
@@ -402,7 +505,7 @@ impl ConfigError {
     #[must_use]
     pub fn span(&self) -> Option<Range<usize>> {
         match self {
-            Self::Toml { span, .. } => span.map(range),
+            Self::Toml { span, .. } | Self::EmptyHookField { span, .. } => span.map(range),
             Self::Template { span, .. } => span.clone(),
             Self::UnknownMatchKey { .. } | Self::EmptyMatch { .. } | Self::OutOfRange { .. } => {
                 None
@@ -411,11 +514,12 @@ impl ConfigError {
     }
 
     /// Returns the byte range in the TOML source that the diagnostic label
-    /// points at: the TOML error's span, or the offending template bytes.
+    /// points at: the TOML error's span, the empty hook list, or the
+    /// offending template bytes.
     #[must_use]
     pub fn label_span(&self) -> Option<Range<usize>> {
         match self {
-            Self::Toml { span, .. } => span.map(range),
+            Self::Toml { span, .. } | Self::EmptyHookField { span, .. } => span.map(range),
             Self::Template { label, .. } => label.map(range),
             Self::UnknownMatchKey { .. } | Self::EmptyMatch { .. } | Self::OutOfRange { .. } => {
                 None
@@ -446,6 +550,8 @@ pub struct Config {
     pub ipc: Ipc,
     pub dbus: Dbus,
     pub compat: Compat,
+    /// `[[hooks]]` entries in configuration order.
+    pub hooks: Vec<Hook>,
     templates: Templates,
     title: Template,
     body: Template,
@@ -467,6 +573,7 @@ struct RawConfig {
     notification: Notification,
     templates: RawTemplates,
     rules: Vec<RawRule>,
+    hooks: Vec<RawHook>,
     sources: Sources,
     ipc: Ipc,
     dbus: Dbus,
@@ -491,6 +598,29 @@ struct RawRule {
     suppress: bool,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RawHook {
+    on: Option<Spanned<Vec<HookEvent>>>,
+    #[serde(rename = "match")]
+    matches: BTreeMap<String, String>,
+    command: Option<Spanned<Vec<String>>>,
+    timeout_ms: u64,
+    concurrency: u64,
+}
+
+impl Default for RawHook {
+    fn default() -> Self {
+        Self {
+            on: None,
+            matches: BTreeMap::new(),
+            command: None,
+            timeout_ms: DEFAULT_HOOK_TIMEOUT_MS,
+            concurrency: DEFAULT_HOOK_CONCURRENCY,
+        }
+    }
+}
+
 impl Default for Config {
     /// Returns the configuration of an empty TOML document.
     fn default() -> Self {
@@ -502,6 +632,7 @@ impl Default for Config {
             ipc: Ipc::default(),
             dbus: Dbus::default(),
             compat: Compat::default(),
+            hooks: Vec::new(),
             templates: Templates::default(),
             title: template::default_title(),
             body: template::default_body(),
@@ -518,9 +649,10 @@ impl Config {
     /// Returns [`ConfigError::Toml`] for TOML syntax errors, type errors and
     /// unknown fields, [`ConfigError::Template`] for a template that does not
     /// parse, [`ConfigError::UnknownMatchKey`] for a rule matching a key
-    /// outside [`KNOWN`], [`ConfigError::EmptyMatch`] for a rule without
-    /// match entries, and [`ConfigError::OutOfRange`] for a duration
-    /// outside its documented range.
+    /// or hook matching a key outside [`KNOWN`], [`ConfigError::EmptyMatch`]
+    /// for a rule without match entries, [`ConfigError::EmptyHookField`] for
+    /// a hook without events or program, and [`ConfigError::OutOfRange`] for
+    /// a number outside its documented range.
     pub fn from_toml(s: &str) -> Result<Self, ConfigError> {
         let raw: RawConfig = toml::from_str(s).map_err(|e| ConfigError::Toml {
             message: e.message().to_owned(),
@@ -557,6 +689,12 @@ impl Config {
             .enumerate()
             .map(|(index, rule)| compile_rule(s, index, rule))
             .collect::<Result<Vec<_>, _>>()?;
+        let hooks = raw
+            .hooks
+            .into_iter()
+            .enumerate()
+            .map(|(index, hook)| compile_hook(index, hook))
+            .collect::<Result<Vec<_>, _>>()?;
 
         Ok(Self {
             output: raw.output,
@@ -566,6 +704,7 @@ impl Config {
             ipc: raw.ipc,
             dbus: raw.dbus,
             compat: raw.compat,
+            hooks,
             templates: Templates {
                 title: title_src,
                 body: body_src,
@@ -595,13 +734,10 @@ impl Config {
     /// Returns `None` when the matching rule suppresses output.
     #[must_use]
     pub fn rendered(&self, values: &BTreeMap<String, String>) -> Option<Rendered> {
-        let matched = self.rules.iter().find(|compiled| {
-            compiled
-                .rule
-                .matches
-                .iter()
-                .all(|(key, expected)| values.get(key) == Some(expected))
-        });
+        let matched = self
+            .rules
+            .iter()
+            .find(|compiled| matches_all(&compiled.rule.matches, values));
         let Some(compiled) = matched else {
             return Some(Rendered {
                 title: self.title.render(values),
@@ -622,6 +758,14 @@ impl Config {
             icon: compiled.rule.icon.clone(),
         })
     }
+}
+
+/// Returns whether every entry of `matches` equals the entry of `values`
+/// with the same key.
+fn matches_all(matches: &BTreeMap<String, String>, values: &BTreeMap<String, String>) -> bool {
+    matches
+        .iter()
+        .all(|(key, expected)| values.get(key) == Some(expected))
 }
 
 fn check_range(field: &str, value: u64, min: u64, max: u64) -> Result<(), ConfigError> {
@@ -704,20 +848,75 @@ fn compile_optional(
     }
 }
 
+/// Rejects a key of `matches` outside [`KNOWN`].
+fn check_match_keys(field: String, matches: &BTreeMap<String, String>) -> Result<(), ConfigError> {
+    match matches.keys().find(|key| !KNOWN.contains(&key.as_str())) {
+        Some(key) => Err(ConfigError::UnknownMatchKey {
+            field,
+            key: key.clone(),
+        }),
+        None => Ok(()),
+    }
+}
+
+/// Returns the list in `value`, or [`ConfigError::EmptyHookField`] for
+/// `field` when it is absent or empty.
+fn non_empty<T>(field: String, value: Option<Spanned<Vec<T>>>) -> Result<Vec<T>, ConfigError> {
+    match value {
+        Some(spanned) if !spanned.get_ref().is_empty() => Ok(spanned.into_inner()),
+        Some(spanned) => Err(ConfigError::EmptyHookField {
+            field,
+            span: Some(spanned.span().into()),
+        }),
+        None => Err(ConfigError::EmptyHookField { field, span: None }),
+    }
+}
+
+fn compile_hook(index: usize, raw: RawHook) -> Result<Hook, ConfigError> {
+    let on = non_empty(format!("hooks[{index}].on"), raw.on)?;
+    let command_span = raw.command.as_ref().map(Spanned::span);
+    let command = non_empty(format!("hooks[{index}].command"), raw.command)?;
+    if command.first().is_none_or(String::is_empty) {
+        return Err(ConfigError::EmptyHookField {
+            field: format!("hooks[{index}].command[0]"),
+            span: command_span.map(SourceSpan::from),
+        });
+    }
+    check_match_keys(format!("hooks[{index}].match"), &raw.matches)?;
+    check_range(
+        &format!("hooks[{index}].timeout_ms"),
+        raw.timeout_ms,
+        1,
+        MAX_MS,
+    )?;
+    let concurrency = match u8::try_from(raw.concurrency) {
+        Ok(concurrency) if (1..=MAX_HOOK_CONCURRENCY).contains(&u64::from(concurrency)) => {
+            concurrency
+        }
+        // A value beyond `u8` is out of range as well.
+        _ => {
+            return Err(ConfigError::OutOfRange {
+                field: format!("hooks[{index}].concurrency"),
+                value: raw.concurrency,
+                min: 1,
+                max: MAX_HOOK_CONCURRENCY,
+            });
+        }
+    };
+    Ok(Hook {
+        on,
+        matches: raw.matches,
+        command,
+        timeout_ms: raw.timeout_ms,
+        concurrency,
+    })
+}
+
 fn compile_rule(toml: &str, index: usize, raw: RawRule) -> Result<CompiledRule, ConfigError> {
     if raw.matches.is_empty() {
         return Err(ConfigError::EmptyMatch { index });
     }
-    if let Some(key) = raw
-        .matches
-        .keys()
-        .find(|key| !KNOWN.contains(&key.as_str()))
-    {
-        return Err(ConfigError::UnknownMatchKey {
-            field: format!("rules[{index}].match"),
-            key: key.clone(),
-        });
-    }
+    check_match_keys(format!("rules[{index}].match"), &raw.matches)?;
     let (title_src, title) = compile_optional(toml, raw.title, &format!("rules[{index}].title"))?;
     let (body_src, body) = compile_optional(toml, raw.body, &format!("rules[{index}].body"))?;
     Ok(CompiledRule {
@@ -771,6 +970,7 @@ mod tests {
         assert!(parsed.ipc.enabled && parsed.dbus.enabled);
         assert!(!parsed.compat.maxbaz_socket.enabled);
         assert_eq!(parsed.rules().count(), 0);
+        assert_eq!(parsed.hooks, []);
         Ok(())
     }
 
@@ -1052,6 +1252,10 @@ mod tests {
                 "[popup]\nmin_display_ms = 600001",
                 "touchcue::config::out_of_range",
             ),
+            (
+                "[[hooks]]\non = []\ncommand = [\"true\"]\n",
+                "touchcue::config::empty_hook_field",
+            ),
         ];
         for (src, code) in cases {
             let err = rejected(src)?;
@@ -1130,6 +1334,174 @@ mod tests {
         assert!(cfg.rendered(&values(&[("app.id", "QUIET")])).is_some());
         assert!(cfg.rendered(&values(&[])).is_some());
         assert_eq!(cfg.rules().count(), 4);
+        Ok(())
+    }
+
+    #[test]
+    fn hooks_parse_with_defaults() -> TestResult {
+        let cfg = Config::from_toml(
+            r#"
+            [[hooks]]
+            on = ["started", "timed_out", "device_added", "daemon_stopping"]
+            command = ["pw-play", "/sounds/touch.oga"]
+
+            [[hooks]]
+            on = ["touched"]
+            match = { "app.id" = "org.mozilla.firefox" }
+            command = ["notify-send", "Touched"]
+            timeout_ms = 600000
+            concurrency = 32
+            "#,
+        )?;
+        let [first, second] = cfg.hooks.as_slice() else {
+            return Err(format!("expected two hooks, got {:?}", cfg.hooks).into());
+        };
+        assert_eq!(
+            first.on,
+            [
+                HookEvent::Started,
+                HookEvent::TimedOut,
+                HookEvent::DeviceAdded,
+                HookEvent::DaemonStopping
+            ]
+        );
+        assert!(first.matches.is_empty());
+        assert_eq!(first.command, ["pw-play", "/sounds/touch.oga"]);
+        assert_eq!((first.timeout_ms, first.concurrency), (5000, 4));
+        assert_eq!(second.matches, values(&[("app.id", "org.mozilla.firefox")]));
+        assert_eq!((second.timeout_ms, second.concurrency), (600_000, 32));
+        Ok(())
+    }
+
+    #[test]
+    fn hook_applies_to_its_events_and_matches() -> TestResult {
+        let cfg = Config::from_toml(
+            "[[hooks]]\non = [\"started\", \"ended\"]\nmatch = { \"process.name\" = \"ssh\" }\ncommand = [\"x\"]\n",
+        )?;
+        let hook = cfg.hooks.first().ok_or("no hook")?;
+        let ssh = values(&[("process.name", "ssh"), ("app.name", "foot")]);
+        assert!(hook.applies(HookEvent::Started, &ssh));
+        assert!(hook.applies(HookEvent::Ended, &ssh));
+        assert!(!hook.applies(HookEvent::Updated, &ssh));
+        assert!(!hook.applies(HookEvent::Started, &values(&[("process.name", "SSH")])));
+        assert!(!hook.applies(HookEvent::Started, &values(&[])));
+        Ok(())
+    }
+
+    #[test]
+    fn hook_event_names_round_trip() -> TestResult {
+        let names = [
+            "started",
+            "updated",
+            "ended",
+            "revived",
+            "waiting",
+            "lingering",
+            "touched",
+            "cancelled",
+            "failed",
+            "timed_out",
+            "device_added",
+            "device_removed",
+            "daemon_started",
+            "daemon_stopping",
+        ];
+        let list = names.map(|name| format!("\"{name}\"")).join(", ");
+        let cfg = Config::from_toml(&format!("[[hooks]]\non = [{list}]\ncommand = [\"x\"]\n"))?;
+        let parsed: Vec<&str> = cfg
+            .hooks
+            .first()
+            .ok_or("no hook")?
+            .on
+            .iter()
+            .map(|event| event.as_str())
+            .collect();
+        assert_eq!(parsed, names);
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_hook_event_is_rejected_with_a_span() -> TestResult {
+        let src = "[[hooks]]\non = [\"started\", \"touchd\"]\ncommand = [\"x\"]\n";
+        let err = rejected(src)?;
+        assert!(matches!(err, ConfigError::Toml { .. }), "{err:?}");
+        assert_eq!(
+            err.label_span().and_then(|s| src.get(s)),
+            Some("\"touchd\"")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_hooks_are_rejected() -> TestResult {
+        fn empty(src: &str) -> Result<(String, Option<String>), TestError> {
+            match rejected(src)? {
+                ConfigError::EmptyHookField { field, span } => Ok((
+                    field,
+                    span.map(range).and_then(|s| src.get(s)).map(str::to_owned),
+                )),
+                other => Err(format!("{src:?}: {other:?}").into()),
+            }
+        }
+        let some = |s: &str| Some(s.to_owned());
+        let src = "[[hooks]]\non = []\ncommand = [\"x\"]\n";
+        assert_eq!(empty(src)?, ("hooks[0].on".to_owned(), some("[]")));
+        assert_eq!(
+            empty("[[hooks]]\ncommand = [\"x\"]\n")?,
+            ("hooks[0].on".to_owned(), None)
+        );
+        let src = "[[hooks]]\non = [\"ended\"]\ncommand = []\n";
+        assert_eq!(empty(src)?, ("hooks[0].command".to_owned(), some("[]")));
+        assert_eq!(
+            empty("[[hooks]]\non = [\"ended\"]\n")?,
+            ("hooks[0].command".to_owned(), None)
+        );
+        let src = "[[hooks]]\non = [\"ended\"]\ncommand = [\"x\"]\n[[hooks]]\non = [\"ended\"]\ncommand = [\"\", \"a\"]\n";
+        assert_eq!(
+            empty(src)?,
+            ("hooks[1].command[0]".to_owned(), some("[\"\", \"a\"]"))
+        );
+
+        assert_eq!(
+            rejected(
+                "[[hooks]]\non = [\"ended\"]\ncommand = [\"x\"]\nmatch = { \"app.colour\" = \"x\" }\n"
+            )?,
+            ConfigError::UnknownMatchKey {
+                field: "hooks[0].match".to_owned(),
+                key: "app.colour".to_owned(),
+            }
+        );
+        let src = "[[hooks]]\non = [\"ended\"]\ncommand = \"x\"\n";
+        assert!(matches!(rejected(src)?, ConfigError::Toml { .. }));
+        let src = "[[hooks]]\non = [\"ended\"]\ncommand = [\"x\"]\nshell = true\n";
+        assert!(matches!(rejected(src)?, ConfigError::Toml { .. }));
+        Ok(())
+    }
+
+    #[test]
+    fn hook_numbers_are_range_checked() -> TestResult {
+        let hook = |key: &str| format!("[[hooks]]\non = [\"ended\"]\ncommand = [\"x\"]\n{key}\n");
+        assert_eq!(
+            out_of_range(&hook("timeout_ms = 0")),
+            Some(("hooks[0].timeout_ms".to_owned(), 0))
+        );
+        assert_eq!(
+            out_of_range(&hook("timeout_ms = 600001")),
+            Some(("hooks[0].timeout_ms".to_owned(), 600_001))
+        );
+        assert_eq!(
+            out_of_range(&hook("concurrency = 0")),
+            Some(("hooks[0].concurrency".to_owned(), 0))
+        );
+        assert_eq!(
+            out_of_range(&hook("concurrency = 33")),
+            Some(("hooks[0].concurrency".to_owned(), 33))
+        );
+        assert_eq!(
+            out_of_range(&hook("concurrency = 256")),
+            Some(("hooks[0].concurrency".to_owned(), 256))
+        );
+        Config::from_toml(&hook("timeout_ms = 1\nconcurrency = 1"))?;
         Ok(())
     }
 }

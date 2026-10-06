@@ -24,4 +24,6 @@ features:
     details: FIDO requests are tracked per CTAPHID channel ID, so a prompt stays until its own request ends.
   - title: For scripts and bars
     details: A JSON event socket, a D-Bus service, and the socket protocol of yubikey-touch-detector.
+  - title: Hooks
+    details: Run your own commands on events, such as playing a sound when a request starts, without a shell and with values passed only in environment variables.
 ---

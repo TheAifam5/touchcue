@@ -18,7 +18,7 @@ pub enum Error {
 
 /// Prints the configuration status, desktop capabilities, FIDO devices, the
 /// UI backend `run` would choose, the configured IPC endpoints and the gpg
-/// setup, and returns whether touchcue is usable.
+/// setup and the number of hooks, and returns whether touchcue is usable.
 ///
 /// Usable means the configuration is valid and every FIDO device found can
 /// be opened. No device present still counts as usable, since devices plugged
@@ -104,6 +104,7 @@ fn report(
                 }
             )?;
             gpg(out, config.sources.gpg.enabled, runtime)?;
+            writeln!(out, "hooks: {}", config.hooks.len())?;
         }
         None => writeln!(out, "backend: unknown, the configuration did not load")?,
     }
