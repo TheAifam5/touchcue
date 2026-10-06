@@ -1,6 +1,6 @@
 # Platforms
 
-Linux is the only platform touchcue works on. CI builds and tests touchcue on Windows and macOS too, but there it has no sources or output backends: `run`, `list-devices`, `trace` and `gpg` print `not supported on this platform yet` and exit with status 2.
+Linux is the only platform touchcue works on. Releases include archives for Windows (`x86_64`) and macOS (`x86_64` and `aarch64`), and CI tests on both, but there touchcue has no sources or output backends and detects nothing: `run`, `list-devices`, `trace` and `gpg` print `not supported on this platform yet` and exit with status 2.
 
 ## Linux
 

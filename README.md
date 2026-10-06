@@ -4,7 +4,7 @@ Shows who is waiting for your security key touch.
 
 [![CI](https://github.com/theaifam5/touchcue/actions/workflows/ci.yml/badge.svg)](https://github.com/theaifam5/touchcue/actions/workflows/ci.yml)
 
-> **Status: early development, Linux only, not released yet.** FIDO2/U2F keys and OpenPGP cards through gpg-agent work on Linux. Windows and macOS build but detect nothing.
+> **Status: early development, Linux only. [v0.1.0](https://github.com/theaifam5/touchcue/releases/tag/v0.1.0) is released.** FIDO2/U2F keys and OpenPGP cards through gpg-agent work on Linux. The Windows and macOS builds detect nothing yet.
 
 ## What it does
 
@@ -24,7 +24,7 @@ touchcue is a daemon and CLI. When a hardware authenticator waits for a physical
 | Output | own popup on Wayland and X11 (placement, monitor choice, optional modal dim), or desktop notifications | desktop notifications |
 | Message templates | placeholders for app, process, device and request | `{{.Reasons}}` |
 | Integration | JSON socket, D-Bus, and the yubikey-touch-detector socket | yubikey-touch-detector socket, stdout |
-| Packages | none yet | Arch Linux, Nix, Homebrew, GitHub releases, `go install` |
+| Packages | GitHub releases, mise | Arch Linux, Nix, Homebrew, GitHub releases, `go install` |
 
 To switch, see [Migrating from yubikey-touch-detector](https://touchcue.theaifam5.cc/guide/getting-started#migrating-from-yubikey-touch-detector).
 
@@ -42,11 +42,29 @@ To switch, see [Migrating from yubikey-touch-detector](https://touchcue.theaifam
 
 ## Install
 
-There is no release yet. Build from source with the Rust toolchain pinned in `rust-toolchain.toml`:
+From a [release archive](https://github.com/theaifam5/touchcue/releases/latest), for example on x86_64 Linux:
+
+```sh
+curl -LO https://github.com/theaifam5/touchcue/releases/download/v0.1.0/touchcue-x86_64-unknown-linux-gnu.tar.gz
+curl -LO https://github.com/theaifam5/touchcue/releases/download/v0.1.0/SHA256SUMS
+sha256sum -c --ignore-missing SHA256SUMS
+tar -xzf touchcue-x86_64-unknown-linux-gnu.tar.gz
+install -D touchcue-x86_64-unknown-linux-gnu/touchcue ~/.local/bin/touchcue
+```
+
+With [mise](https://mise.jdx.dev):
+
+```sh
+mise use -g packslip:github.com/theaifam5/touchcue
+```
+
+From source, with the Rust toolchain pinned in `rust-toolchain.toml`:
 
 ```sh
 cargo install --locked --path crates/touchcue
 ```
+
+See [Getting started](https://touchcue.theaifam5.cc/guide/getting-started#install) for completions, the man page and the systemd unit.
 
 ## Quick start
 
