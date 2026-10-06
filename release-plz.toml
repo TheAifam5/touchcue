@@ -25,3 +25,29 @@ changelog_include = [
   "touchcue-ipc",
   "touchcue-helper",
 ]
+
+# Library crates keep their own CHANGELOG.md and also feed the touchcue
+# changelog; the workspace settings keep them untagged and unpublished.
+[[package]]
+name = "touchcue-core"
+release = true
+
+[[package]]
+name = "touchcue-detect"
+release = true
+
+[[package]]
+name = "touchcue-appinfo"
+release = true
+
+[[package]]
+name = "touchcue-ui"
+release = true
+
+[[package]]
+name = "touchcue-ipc"
+release = true
+
+[[package]]
+name = "touchcue-helper"
+release = true
