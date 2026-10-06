@@ -1,0 +1,136 @@
+.TH TOUCHCUE 1
+.SH NAME
+touchcue \- Shows who is waiting for your security key touch
+.SH SYNOPSIS
+\fBtouchcue\fR [OPTIONS] <COMMAND>
+.SH DESCRIPTION
+Shows who is waiting for your security key touch
+.PP
+.SH OPTIONS
+.TP
+\fB\-\-config\fR \fI<PATH>\fR
+Configuration file [default: $XDG_CONFIG_HOME/touchcue/config.toml]
+.TP
+\fB\-v, \-\-verbose\fR
+Log more: \-v for info, \-vv for debug; TOUCHCUE_LOG overrides it
+.TP
+\fB\-h, \-\-help\fR
+Print help
+.TP
+\fB\-V, \-\-version\fR
+Print version
+.SH COMMANDS
+.TP
+\fBrun\fR
+Run the daemon in the foreground
+.TP
+\fBcheck\fR
+Check the configuration, desktop capabilities and devices
+.TP
+\fBlist\-devices\fR
+List the connected FIDO devices
+.TP
+\fBtrace\fR
+Print touch detection signals until interrupted
+.TP
+\fBgpg\fR
+Set up touch detection for gpg and ssh through gpg\-agent
+.TP
+\fBgpg install\fR
+Make gpg\-agent run touchcue as its scdaemon
+.TP
+\fBgpg uninstall\fR
+Stop gpg\-agent from running touchcue as its scdaemon
+.TP
+\fBaskpass\fR
+Answer an OpenSSH askpass prompt
+.SH "TOUCHCUE RUN"
+Run the daemon in the foreground
+.PP
+\fBUsage:\fR touchcue run [OPTIONS]
+.PP
+\fBOptions:\fR
+.PP
+.TP
+\fB\-h, \-\-help\fR
+Print help
+.SH "TOUCHCUE CHECK"
+Check the configuration, desktop capabilities and devices
+.PP
+\fBUsage:\fR touchcue check [OPTIONS]
+.PP
+\fBOptions:\fR
+.PP
+.TP
+\fB\-h, \-\-help\fR
+Print help
+.SH "TOUCHCUE LIST-DEVICES"
+List the connected FIDO devices
+.PP
+\fBUsage:\fR touchcue list\-devices [OPTIONS]
+.PP
+\fBOptions:\fR
+.PP
+.TP
+\fB\-h, \-\-help\fR
+Print help
+.SH "TOUCHCUE TRACE"
+Print touch detection signals until interrupted
+.PP
+\fBUsage:\fR touchcue trace [OPTIONS]
+.PP
+\fBOptions:\fR
+.PP
+.TP
+\fB\-h, \-\-help\fR
+Print help
+.SH "TOUCHCUE GPG"
+Set up touch detection for gpg and ssh through gpg\-agent
+.PP
+\fBUsage:\fR touchcue gpg [OPTIONS] <COMMAND>
+.PP
+\fBOptions:\fR
+.PP
+.TP
+\fB\-h, \-\-help\fR
+Print help
+.SH "TOUCHCUE GPG INSTALL"
+Make gpg\-agent run touchcue as its scdaemon
+.PP
+\fBUsage:\fR touchcue gpg install [OPTIONS]
+.PP
+\fBOptions:\fR
+.PP
+.TP
+\fB\-h, \-\-help\fR
+Print help
+.SH "TOUCHCUE GPG UNINSTALL"
+Stop gpg\-agent from running touchcue as its scdaemon
+.PP
+\fBUsage:\fR touchcue gpg uninstall [OPTIONS]
+.PP
+\fBOptions:\fR
+.PP
+.TP
+\fB\-\-restore\-backup\fR
+Replace gpg\-agent.conf with the backup taken by install, then delete the backup
+.TP
+\fB\-h, \-\-help\fR
+Print help
+.SH "TOUCHCUE ASKPASS"
+Answer an OpenSSH askpass prompt
+
+OpenSSH runs the `SSH_ASKPASS` program with no extra arguments, so point it at a link to touchcue named `touchcue\-askpass`. `touchcue askpass` passes every argument after it through unparsed.
+.PP
+\fBUsage:\fR touchcue askpass [OPTIONS] [<MESSAGE>] ...
+.PP
+\fBOptions:\fR
+.PP
+.TP
+\fB\-h, \-\-help\fR
+Print help
+\fBArguments:\fR
+.PP
+.TP
+\fB<MESSAGE>\fR
+The prompt OpenSSH passes

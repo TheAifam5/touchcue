@@ -1,0 +1,38 @@
+[Unit]
+Description=touchcue: show which app is waiting for a security key touch
+Documentation=https://github.com/theaifam5/touchcue
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+# systemd resolves a bare command name only in /usr/local/bin and /usr/bin.
+# For a binary in ~/.local/bin, create a drop-in with
+# `systemctl --user edit touchcue.service` containing:
+#   [Service]
+#   ExecStart=
+#   ExecStart=%h/.local/bin/touchcue run
+ExecStart=touchcue run
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=10
+
+# Hardening that works in a user manager without namespaces.
+# Where unprivileged user namespaces are available, a drop-in may add
+# PrivateUsers=yes with ProtectSystem=strict, ReadWritePaths=%t (the IPC
+# sockets), ProtectHome=read-only and PrivateTmp=yes. This drop-in is
+# untested: PrivateUsers=yes may block the /proc/PID/fd scan that names the
+# requesting app. PrivateDevices= and ProtectHome=yes break touchcue: it reads
+# /dev/hidraw* and the desktop entries and icons under the home directory.
+UMask=0077
+NoNewPrivileges=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=graphical-session.target
