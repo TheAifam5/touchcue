@@ -188,11 +188,13 @@ impl ExeIndex {
         Self { entries, homes }
     }
 
-    /// Returns the first entry matching the executable name `exe_basename`.
+    /// Returns the first entry without `Hidden` or `NoDisplay` matching the executable name `exe_basename`.
     ///
     /// An entry matches when its `StartupWMClass` equals the name ignoring
     /// ASCII case, or when the base name of `TryExec` or of the first `Exec`
     /// token equals it and is not a generic wrapper such as `sh` or `env`.
+    /// Hidden entries are skipped because they are typically URL or MIME
+    /// handlers of a program that is not an application window.
     #[must_use]
     pub fn find(&self, exe_basename: &str) -> Option<&Path> {
         if exe_basename.is_empty() {
@@ -201,11 +203,12 @@ impl ExeIndex {
         self.entries
             .iter()
             .find(|entry| {
-                entry
-                    .wm_class
-                    .as_deref()
-                    .is_some_and(|class| class.eq_ignore_ascii_case(exe_basename))
-                    || entry.programs.iter().any(|program| program == exe_basename)
+                entry.visible
+                    && (entry
+                        .wm_class
+                        .as_deref()
+                        .is_some_and(|class| class.eq_ignore_ascii_case(exe_basename))
+                        || entry.programs.iter().any(|program| program == exe_basename))
             })
             .map(|entry| entry.path.as_path())
     }
@@ -541,6 +544,30 @@ mod tests {
         assert_eq!(found("sh"), None);
         assert_eq!(found("launch"), None);
         assert_eq!(found(""), None);
+        Ok(())
+    }
+
+    #[test]
+    fn exe_match_skips_hidden_entries() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        write_entry(
+            dir.path(),
+            "a-handler.desktop",
+            "Name=Handler\nExec=/opt/cli/cli --handle-uri %u\nNoDisplay=true\n",
+        )?;
+        write_entry(
+            dir.path(),
+            "b-removed.desktop",
+            "Name=Removed\nExec=cli\nHidden=true\n",
+        )?;
+        let dirs = [dir.path().to_owned()];
+        assert_eq!(find_by_exe(&dirs, "cli"), None);
+
+        write_entry(dir.path(), "c-app.desktop", "Name=App\nExec=cli\n")?;
+        assert_eq!(
+            find_by_exe(&dirs, "cli"),
+            Some(dir.path().join("applications/c-app.desktop"))
+        );
         Ok(())
     }
 
