@@ -10,6 +10,7 @@ This file is the single source of instructions for all coding agents working in 
 - Be concise and specific in code, comments, commit messages, PR text and replies.
 - Keep the code and git history clean. Rebase instead of merging, and amend or rewrite unpublished and feature-branch commits so each commit is one logical change. Force-push only with `--force-with-lease`, never to `main`. Leave no fixup noise, scratch files or commented-out code.
 - Commits follow Conventional Commits. Each has a title `type(scope): imperative description` and a short body describing what changed and why. Allowed types: feat, fix, docs, refactor, test, perf, build, ci, chore. Breaking changes use `!` plus a `BREAKING CHANGE:` footer. release-plz derives versions and the changelog from these.
+- A change that spans crates is split into one commit per crate, in dependency order so each commit builds, each scoped and described for that crate. When a non-additive change forces crates to change together, keep them in one commit scoped to the crate that owns the change. release-plz copies a commit's title into the changelog of every crate it touches.
 - Commits are GPG-signed and signing needs a physical key touch. Never bypass signing (no `--no-gpg-sign`). If signing times out, retry the same command.
 
 ## Project
