@@ -42,7 +42,7 @@ Cargo runs through mr-boxington (mbx) via mise. Set `MBX_DISABLE=1` to disable i
 - `touchcue-core`: domain model, request state machine, template engine and configuration; no OS dependencies.
 - `touchcue-detect`: platform sources of touch requests.
 - `touchcue-appinfo`: resolves a process id to an application name, id and icon.
-- `touchcue-ui`: popup, notification and command output backends.
+- `touchcue-ui`: popup and notification backends.
 - `touchcue-ipc`: JSON event socket, compatibility socket, D-Bus service and helper protocol.
 - `touchcue-hooks`: runs user-configured commands on daemon events.
 - `touchcue-helper`: optional privileged helper for data the unprivileged daemon cannot read.
@@ -116,5 +116,6 @@ Cargo runs through mr-boxington (mbx) via mise. Set `MBX_DISABLE=1` to disable i
 - [ ] `mise run deny` and `mise run render` pass too, if dependencies or the CLI changed.
 - [ ] The report lists the exact commands and results, and what was not run.
 - [ ] Generated files are regenerated.
-- [ ] Docs are updated when behaviour changed.
+- [ ] Docs sweep: README, the docs site, AGENTS.md and CONTRIBUTING.md are checked in full for stale content, not only text about the change, and `mise run docs:build` passes.
+- [ ] Code review: the diff is reviewed independently, and every finding is fixed or reported.
 - [ ] History is clean.

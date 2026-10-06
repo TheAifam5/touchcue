@@ -20,5 +20,5 @@ Closes #
 
 - [ ] `mise run lint` and `mise run test` pass
 - [ ] `mise run render` was run if the CLI changed
-- [ ] Docs are updated
+- [ ] README, docs site, AGENTS.md and CONTRIBUTING.md checked in full for stale content
 - [ ] I can explain every line

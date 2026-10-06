@@ -20,8 +20,10 @@ hk install --mise
 ```sh
 mise run lint
 mise run test
-mise run deny      # when dependencies changed
+mise run deny        # when dependencies changed
 mise run xwin-check  # when platform code changed
+mise run render      # when the CLI changed
+mise run docs:build
 ```
 
 `mise run fix` applies the automatic fixers.
@@ -32,7 +34,7 @@ mise run xwin-check  # when platform code changed
 
 ## Documentation
 
-`mise run docs:dev` serves the documentation site locally. Update the docs when behaviour changes.
+`mise run docs:dev` serves the documentation site locally. Every PR checks README, the docs site, AGENTS.md and CONTRIBUTING.md in full for stale content, not only text about the change.
 
 ## Commits and pull requests
 
