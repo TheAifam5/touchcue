@@ -13,6 +13,7 @@ mise.local.toml
 .claude/settings.local.json
 .claude/agent-memory/
 .claude/.cc-writes/
+.claude/worktrees/
 
 .idea/
 .vscode/*
