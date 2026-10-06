@@ -1,0 +1,55 @@
+# yaml-language-server: $schema=https://www.schemastore.org/github-issue-forms.json
+name: Bug report
+description: Report something that does not work as expected.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Search existing issues before filing a new one.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What did you expect to happen, and what happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: touchcue version
+      description: Output of `touchcue --version`.
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Linux
+        - Windows
+        - macOS
+    validations:
+      required: true
+  - type: input
+    id: os-version
+    attributes:
+      label: OS version
+  - type: input
+    id: session
+    attributes:
+      label: Desktop and session
+      description: For example Hyprland on Wayland.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: |
+        Review the output for private data before pasting it.
+        Redact device serials, PINs and personal paths before posting.
+      render: text

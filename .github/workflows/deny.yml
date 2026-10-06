@@ -1,0 +1,43 @@
+name: deny
+
+on:
+  schedule:
+    # New advisories can land without any change in this repository.
+    - cron: "17 6 * * 1"
+  push:
+    branches: [main]
+    paths: [Cargo.lock, deny.toml]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Tools outside a job's install_args stay uninstalled: auto-install would
+  # fetch them unauthenticated and can hit the GitHub API rate limit.
+  MISE_AUTO_INSTALL: "false"
+  MISE_GITHUB_TOKEN: ${{ github.token }}
+
+jobs:
+  deny:
+    name: deny
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
+        with:
+          version: 2026.10.2
+          install_args: rust mr-boxington cargo-deny
+          cache: false
+      - uses: jdx/mr-boxington-action@d0825fbaf3cc36ca2609aa38e71046265a1f1e37 # v1.7.1
+        with:
+          cache-key-suffix: deny
+      - run: mise run deny

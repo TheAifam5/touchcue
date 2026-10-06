@@ -1,0 +1,82 @@
+name: release-plz
+
+on:
+  push:
+    branches: [main]
+
+permissions: {}
+
+# Serialize runs and never cancel one that is tagging or pushing a branch.
+concurrency:
+  group: release-plz
+  cancel-in-progress: false
+
+jobs:
+  # Tags the release when the release PR's version is on main. The tag push
+  # starts release.yml only when it is made with RELEASE_PLZ_TOKEN: a tag
+  # created with GITHUB_TOKEN does not trigger other workflows.
+  release:
+    name: release
+    environment: release
+    if: ${{ github.repository_owner == 'theaifam5' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write # push the release tag
+      pull-requests: read # find the merged release PR
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
+        with:
+          version: 2026.10.2
+          install_args: rust mr-boxington
+          cache: false
+      - name: Warn when tags cannot start the release workflow
+        env:
+          RELEASE_PLZ_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
+        run: |
+          if [ -z "$RELEASE_PLZ_TOKEN" ]; then
+            echo "::warning title=RELEASE_PLZ_TOKEN is not set::Falling back to GITHUB_TOKEN: tags it creates will not trigger release.yml, and release PRs it opens will not trigger ci.yml."
+          fi
+      - uses: release-plz/action@b8d6b54b02889ff2ae2bb82e8b57c3a8fc1683a5 # v0.5.139
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN || secrets.GITHUB_TOKEN }}
+
+  # Opens or updates the release PR. A PR opened with GITHUB_TOKEN does not
+  # trigger ci.yml, so RELEASE_PLZ_TOKEN is what lets its checks run.
+  release-pr:
+    name: release-pr
+    environment: release
+    if: ${{ github.repository_owner == 'theaifam5' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write # push the release branch
+      pull-requests: write # open and update the release PR
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
+        with:
+          version: 2026.10.2
+          install_args: rust mr-boxington
+          cache: false
+      - name: Warn when tags cannot start the release workflow
+        env:
+          RELEASE_PLZ_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
+        run: |
+          if [ -z "$RELEASE_PLZ_TOKEN" ]; then
+            echo "::warning title=RELEASE_PLZ_TOKEN is not set::Falling back to GITHUB_TOKEN: tags it creates will not trigger release.yml, and release PRs it opens will not trigger ci.yml."
+          fi
+      - uses: release-plz/action@b8d6b54b02889ff2ae2bb82e8b57c3a8fc1683a5 # v0.5.139
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN || secrets.GITHUB_TOKEN }}

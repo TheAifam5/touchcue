@@ -1,0 +1,32 @@
+name: conventional-commits
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  title:
+    name: title
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Check pull request title
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        # The description starts lowercase, or with an acronym of two or more
+        # capitals such as CLI. A capitalized word like "Add" is rejected.
+        run: |
+          pattern='^(feat|fix|docs|refactor|test|perf|build|ci|chore)(\([[:alnum:]][[:alnum:]./_-]*(, ?[[:alnum:]][[:alnum:]./_-]*)*\))?!?: ([[:lower:]]|[[:upper:]][[:upper:][:digit:]]+([^[:alpha:]]|$))(.*[[:graph:]])?$'
+          if [[ ! "$PR_TITLE" =~ $pattern ]]; then
+            echo "::error title=Invalid pull request title::The title does not match the required format."
+            printf 'Received title: %q\n' "$PR_TITLE"
+            echo "Use: <type>[optional scope][optional !]: <description>"
+            echo "Types: feat, fix, docs, refactor, test, perf, build, ci, chore"
+            exit 1
+          fi

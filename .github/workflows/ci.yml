@@ -1,0 +1,221 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Tools outside a job's install_args stay uninstalled: auto-install would
+  # fetch them unauthenticated and can hit the GitHub API rate limit.
+  MISE_AUTO_INSTALL: "false"
+  MISE_GITHUB_TOKEN: ${{ github.token }}
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: 10
+
+# Jobs that install rust set `cache: false` on mise-action: it caches only
+# mise's data directory, while rustup keeps toolchains, components and
+# targets elsewhere, so a restored cache can claim a toolchain whose
+# components are missing (mise-action README, "Rust Cache").
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
+        with:
+          version: 2026.10.2
+          install_args: rust mr-boxington hk actionlint typos taplo gitleaks
+          cache: false
+      - uses: jdx/mr-boxington-action@d0825fbaf3cc36ca2609aa38e71046265a1f1e37 # v1.7.1
+        with:
+          cache-key-suffix: lint
+      - run: mise run lint
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
+        with:
+          version: 2026.10.2
+          install_args: rust mr-boxington aqua:nextest-rs/nextest/cargo-nextest
+          cache: false
+      - uses: jdx/mr-boxington-action@d0825fbaf3cc36ca2609aa38e71046265a1f1e37 # v1.7.1
+        with:
+          cache-key-suffix: test-${{ matrix.os }}
+      - run: mise run build
+      - run: mise run test
+
+  msrv:
+    name: msrv
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
+        with:
+          version: 2026.10.2
+          install_args: rust mr-boxington
+          cache: false
+      # rust-toolchain.toml pins a newer channel, so the MSRV toolchain is
+      # installed side by side and selected with an explicit +toolchain.
+      - name: Install the workspace MSRV toolchain
+        id: msrv
+        run: |
+          msrv="$(sed -n 's/^rust-version[[:space:]]*=[[:space:]]*"\([0-9][0-9.]*\)".*/\1/p' Cargo.toml | head -n 1)"
+          if [ -z "$msrv" ]; then
+            echo "::error::no rust-version found in Cargo.toml"
+            exit 1
+          fi
+          echo "msrv=$msrv" >> "$GITHUB_OUTPUT"
+          mise exec -- rustup toolchain install "$msrv" --profile minimal
+      - uses: jdx/mr-boxington-action@d0825fbaf3cc36ca2609aa38e71046265a1f1e37 # v1.7.1
+        with:
+          toolchain: ${{ steps.msrv.outputs.msrv }}
+          cache-key-suffix: msrv
+      - name: Build with the MSRV toolchain
+        env:
+          MSRV: ${{ steps.msrv.outputs.msrv }}
+        run: mise exec -- cargo "+$MSRV" build --workspace --locked
+
+  render:
+    name: render
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
+        with:
+          version: 2026.10.2
+          install_args: rust mr-boxington usage
+          cache: false
+      - uses: jdx/mr-boxington-action@d0825fbaf3cc36ca2609aa38e71046265a1f1e37 # v1.7.1
+        with:
+          cache-key-suffix: render
+      - run: mise run render
+      - name: Assert render produces no changes
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::'mise run render' changed tracked or untracked files. Run it locally and commit the result."
+            git status --short
+            git diff
+            exit 1
+          fi
+
+  deny:
+    name: deny
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
+        with:
+          version: 2026.10.2
+          install_args: rust mr-boxington cargo-deny
+          cache: false
+      - uses: jdx/mr-boxington-action@d0825fbaf3cc36ca2609aa38e71046265a1f1e37 # v1.7.1
+        with:
+          cache-key-suffix: deny
+      - run: mise run deny
+
+  docs:
+    name: docs
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
+        with:
+          version: 2026.10.2
+          install_args: node
+      - run: mise run docs:build
+
+  commits:
+    name: commits
+    if: ${{ github.event_name == 'pull_request' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      # Pull requests are rebase-merged, so every commit lands on main as is.
+      # The pattern is the one conventional-commits.yml applies to the title.
+      - name: Check every commit subject
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          pattern='^(feat|fix|docs|refactor|test|perf|build|ci|chore)(\([[:alnum:]][[:alnum:]./_-]*(, ?[[:alnum:]][[:alnum:]./_-]*)*\))?!?: ([[:lower:]]|[[:upper:]][[:upper:][:digit:]]+([^[:alpha:]]|$))(.*[[:graph:]])?$'
+          status=0
+          while IFS= read -r sha; do
+            subject="$(git log -1 --format=%s "$sha")"
+            if [[ ! "$subject" =~ $pattern ]]; then
+              echo "::error title=Invalid commit message::${sha:0:12} does not match the required format."
+              printf '%s: %q\n' "${sha:0:12}" "$subject"
+              status=1
+            fi
+          done < <(git rev-list --no-merges "$BASE_SHA..$HEAD_SHA")
+          if [ "$status" -ne 0 ]; then
+            echo "Use: <type>[optional scope][optional !]: <description>"
+            echo "Types: feat, fix, docs, refactor, test, perf, build, ci, chore"
+          fi
+          exit "$status"
+
+  final:
+    name: final
+    needs: [lint, test, msrv, render, deny, docs, commits]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    permissions: {}
+    steps:
+      - name: Require every job to have succeeded
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        # commits runs only on pull requests, so a skipped result is allowed.
+        run: |
+          echo "$NEEDS" | jq -r 'to_entries[] | "\(.key)=\(.value.result)"'
+          echo "$NEEDS" | jq -e 'all(.[]; .result == "success" or .result == "skipped")' >/dev/null

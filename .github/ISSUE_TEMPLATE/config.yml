@@ -1,0 +1,9 @@
+# yaml-language-server: $schema=https://www.schemastore.org/github-issue-config.json
+blank_issues_enabled: false
+contact_links:
+  - name: Questions and ideas
+    url: https://github.com/theaifam5/touchcue/discussions
+    about: Ask questions and discuss ideas in GitHub Discussions.
+  - name: Documentation
+    url: https://theaifam5.github.io/touchcue/
+    about: Read the touchcue documentation.

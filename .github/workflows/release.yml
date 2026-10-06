@@ -1,0 +1,295 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions: {}
+
+# A release is built once per tag and never cancelled part way.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Tools outside a job's install_args stay uninstalled: auto-install would
+  # fetch them unauthenticated and can hit the GitHub API rate limit.
+  MISE_AUTO_INSTALL: "false"
+  MISE_GITHUB_TOKEN: ${{ github.token }}
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: 10
+
+jobs:
+  # The credentials are read in this one job so that no build step can see
+  # them; the release environment is where they are stored.
+  signing:
+    name: signing
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: release
+    permissions: {}
+    outputs:
+      macos: ${{ steps.detect.outputs.macos }}
+      windows: ${{ steps.detect.outputs.windows }}
+    steps:
+      - name: Detect signing credentials
+        id: detect
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+        run: |
+          echo "macos=$([ -n "$APPLE_CERTIFICATE" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          echo "windows=$([ -n "$WINDOWS_CERTIFICATE" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: signing
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      TARGET: ${{ matrix.target }}
+      EXT: ${{ matrix.ext }}
+      # Release builds bypass the shared build cache.
+      MBX_DISABLE: "1"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            archive: tar.gz
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            archive: tar.gz
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+            archive: tar.gz
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+            archive: tar.gz
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            archive: zip
+            ext: .exe
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            archive: tar.gz
+          # Cross-compiled on arm64: the binary may not run on this runner
+          # without Rosetta, so it is not smoke-tested.
+          - target: x86_64-apple-darwin
+            runner: macos-latest
+            archive: tar.gz
+            no_run: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # No cache here: a release is built from a clean tree.
+      - uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
+        with:
+          version: 2026.10.2
+          install_args: rust mr-boxington
+          cache: false
+      - name: Add the Rust target
+        shell: bash
+        run: mise exec -- rustup target add "$TARGET"
+      # Both musl targets build on a runner of the same architecture, so the
+      # distribution's musl-gcc is the native linker and no cross toolchain
+      # is needed.
+      - name: Install musl-tools
+        if: ${{ contains(matrix.target, 'musl') }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+      - name: Build
+        shell: bash
+        run: mise exec -- cargo build --release --locked --target "$TARGET" -p touchcue -p touchcue-helper
+      - name: Smoke-test the binary
+        if: ${{ !matrix.no_run }}
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          out="$("target/$TARGET/release/touchcue${EXT}" --version)"
+          echo "$out"
+          case "$out" in
+            *"$version"*) ;;
+            *)
+              echo "::error::touchcue --version does not report $version"
+              exit 1
+              ;;
+          esac
+      - name: Check the binaries exist
+        shell: bash
+        run: |
+          test -f "target/$TARGET/release/touchcue${EXT}"
+          test -f "target/$TARGET/release/touchcue-helper${EXT}"
+      - name: Report unsigned binaries
+        if: ${{ (runner.os == 'macOS' && needs.signing.outputs.macos != 'true') || (runner.os == 'Windows' && needs.signing.outputs.windows != 'true') }}
+        run: echo "::notice title=Unsigned binaries::No $RUNNER_OS signing certificate is configured, so these binaries are not signed."
+      - name: Sign the binaries
+        if: ${{ (runner.os == 'macOS' && needs.signing.outputs.macos == 'true') || (runner.os == 'Windows' && needs.signing.outputs.windows == 'true') }}
+        run: |
+          echo "::error title=Signing not implemented::A signing certificate is configured but this workflow has no signing step for $RUNNER_OS. Add one before this release ships signed binaries."
+          exit 1
+      - name: Stage the archive contents
+        shell: bash
+        run: |
+          shopt -s nullglob
+          name="touchcue-$TARGET"
+          stage="dist/$name"
+          rm -rf "$stage"
+          mkdir -p "$stage"
+          for bin in touchcue touchcue-helper; do
+            cp "target/$TARGET/release/$bin${EXT}" "$stage/"
+          done
+          for dir in completions man; do
+            if [ ! -d "$dir" ]; then
+              echo "::error::$dir/ is missing; run 'mise run render' and commit the result"
+              exit 1
+            fi
+            cp -R "$dir" "$stage/"
+          done
+          extras=(README* LICENSE*)
+          if [ "${#extras[@]}" -eq 0 ]; then
+            echo "::error::no README* or LICENSE* files found"
+            exit 1
+          fi
+          cp "${extras[@]}" "$stage/"
+          echo "NAME=$name" >> "$GITHUB_ENV"
+      - name: Create tar.gz archive
+        if: ${{ matrix.archive == 'tar.gz' }}
+        shell: bash
+        run: tar -czf "dist/$NAME.tar.gz" -C dist "$NAME"
+      - name: Create zip archive
+        if: ${{ matrix.archive == 'zip' }}
+        shell: pwsh
+        run: Compress-Archive -Path "dist/$env:NAME" -DestinationPath "dist/$env:NAME.zip"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: archive-${{ matrix.target }}
+          path: dist/touchcue-${{ matrix.target }}.${{ matrix.archive }}
+          if-no-files-found: error
+          retention-days: 1
+
+  # Creates the draft release with every asset except the signed manifest.
+  draft:
+    name: draft
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write # create the draft release and upload its assets
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            /CHANGELOG.md
+            /touchcue.usage.kdl
+            /man/touchcue.1
+          sparse-checkout-cone-mode: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: archive-*
+          merge-multiple: true
+          path: dist
+      - name: Stage the release assets
+        run: |
+          cp touchcue.usage.kdl man/touchcue.1 dist/
+          # A convenience for manual downloads; the signed packslip manifest
+          # is the authority for the archives' digests.
+          (cd dist && sha256sum touchcue-*.tar.gz touchcue-*.zip > SHA256SUMS && cat SHA256SUMS)
+      - name: Create the draft release
+        run: |
+          # A draft left by an earlier failed run is replaced; a published
+          # release is never touched.
+          state="$(gh release list --limit 1000 --json tagName,isDraft --jq '.[] | select(.tagName == env.TAG) | .isDraft')"
+          case "$state" in
+            "") ;;
+            true) gh release delete "$TAG" --yes --cleanup-tag=false ;;
+            *)
+              echo "::error::a published release already exists for $TAG"
+              exit 1
+              ;;
+          esac
+          if [ -f CHANGELOG.md ]; then
+            awk '/^## /{if (found) exit; found=1; next} found{print}' CHANGELOG.md > release-notes.md
+          fi
+          if [ -s release-notes.md ]; then
+            notes=(--notes-file release-notes.md)
+          else
+            notes=(--generate-notes)
+          fi
+          gh release create "$TAG" --draft --verify-tag --title "$TAG" "${notes[@]}" dist/*
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-dist
+          path: dist/
+          if-no-files-found: error
+          retention-days: 1
+
+  # Signs the manifest in a job that cannot write to the release.
+  sign:
+    name: sign
+    needs: draft
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write # packslip signs with this job's OIDC identity
+      attestations: write # packslip attests build provenance of the archives
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-dist
+          path: dist
+      # Attestations in a private repository need GitHub Enterprise Cloud.
+      - uses: jdx/packslip@2af36e792faa28130987c8af509e475c7458405d # v1.6.0
+        id: packslip
+        with:
+          artifacts: dist/touchcue-*.tar.gz dist/touchcue-*.zip
+          bin: touchcue touchcue-helper
+          resources: |
+            cli-spec/usage/touchcue=asset:dist/touchcue.usage.kdl
+            man/touchcue=asset:dist/touchcue.1
+          attest: ${{ github.event.repository.private && 'false' || 'true' }}
+          upload: false
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: packslip-bundle
+          path: ${{ steps.packslip.outputs.bundle }}
+          if-no-files-found: error
+          retention-days: 1
+
+  # Uploads the signed manifest and, only once it is on the release,
+  # publishes the draft.
+  publish:
+    name: publish
+    needs: [draft, sign]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write # upload the bundle and publish the release
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: packslip-bundle
+          path: packslip
+      - name: Upload the signed manifest
+        run: |
+          test -f packslip/packslip.sigstore.json
+          gh release upload "$TAG" packslip/packslip.sigstore.json --clobber
+      - name: Check the signed manifest is on the release
+        run: gh release view "$TAG" --json assets --jq '.assets[].name' | grep -x packslip.sigstore.json >/dev/null
+      - name: Publish the release
+        run: gh release edit "$TAG" --draft=false
