@@ -35,12 +35,13 @@ pub enum OutputMode {
     Off,
 }
 
-/// Screen corner or edge of the popup.
+/// Screen corner, edge or centre of the popup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Position {
-    TopLeft,
     #[default]
+    Center,
+    TopLeft,
     TopRight,
     BottomLeft,
     BottomRight,
@@ -76,23 +77,131 @@ impl Default for Output {
     }
 }
 
+/// Outputs, or monitors, that show the popup.
+///
+/// Written in TOML as `"focused"`, `"all"`, `"cursor"` or a non-empty list
+/// of non-empty output names.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+pub enum OutputTarget {
+    /// The output the compositor picks, or on X11 the monitor under the pointer.
+    #[default]
+    Focused,
+    /// Every output.
+    All,
+    /// The output under the mouse pointer.
+    Cursor,
+    /// Each listed output that exists.
+    Named(Vec<String>),
+}
+
+impl<'de> Deserialize<'de> for OutputTarget {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(OutputTargetVisitor)
+    }
+}
+
+struct OutputTargetVisitor;
+
+impl<'de> serde::de::Visitor<'de> for OutputTargetVisitor {
+    type Value = OutputTarget;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("\"focused\", \"all\", \"cursor\" or a list of output names")
+    }
+
+    fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<OutputTarget, E> {
+        match value {
+            "focused" => Ok(OutputTarget::Focused),
+            "all" => Ok(OutputTarget::All),
+            "cursor" => Ok(OutputTarget::Cursor),
+            other => Err(E::invalid_value(serde::de::Unexpected::Str(other), &self)),
+        }
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<OutputTarget, A::Error> {
+        let mut names = Vec::new();
+        while let Some(name) = seq.next_element::<String>()? {
+            if name.is_empty() {
+                return Err(serde::de::Error::custom("output names must not be empty"));
+            }
+            names.push(name);
+        }
+        if names.is_empty() {
+            return Err(serde::de::Error::custom(
+                "the output list must name at least one output",
+            ));
+        }
+        Ok(OutputTarget::Named(names))
+    }
+}
+
+/// Opacity from 0.0, transparent, to 1.0, opaque; never NaN.
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Deserialize)]
+#[serde(try_from = "f64")]
+pub struct Opacity(f32);
+
+// Construction rejects NaN, so equality is reflexive.
+impl Eq for Opacity {}
+
+impl Opacity {
+    /// Returns the opacity, within 0.0..=1.0.
+    #[must_use]
+    pub fn get(self) -> f32 {
+        self.0
+    }
+}
+
+/// An opacity outside 0.0..=1.0, or NaN.
+#[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
+#[error("{value} is outside 0.0..=1.0")]
+pub struct OpacityError {
+    pub value: f64,
+}
+
+impl TryFrom<f64> for Opacity {
+    type Error = OpacityError;
+
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the value is within 0.0..=1.0"
+    )]
+    fn try_from(value: f64) -> Result<Self, Self::Error> {
+        if (0.0..=1.0).contains(&value) {
+            Ok(Self(value as f32))
+        } else {
+            Err(OpacityError { value })
+        }
+    }
+}
+
 /// The `[popup]` section.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Popup {
     pub position: Position,
+    pub output: OutputTarget,
     /// Minimum time a shown popup stays visible, in milliseconds, at most 600000.
     pub min_display_ms: u64,
     /// Time a request must wait before the popup appears, in milliseconds, at most 600000.
     pub show_delay_ms: u64,
+    /// Blocks clicks on the target outputs while a request waits for a touch.
+    pub modal: bool,
+    /// Darkening of the outputs behind a modal popup.
+    pub modal_dim: Opacity,
+    /// A click outside the popup hides the popup of the waiting request.
+    pub modal_dismiss: bool,
 }
 
 impl Default for Popup {
     fn default() -> Self {
         Self {
             position: Position::default(),
+            output: OutputTarget::default(),
             min_display_ms: 800,
             show_delay_ms: 0,
+            modal: false,
+            modal_dim: Opacity(0.4),
+            modal_dismiss: true,
         }
     }
 }
@@ -651,7 +760,10 @@ mod tests {
         assert_eq!(parsed, Config::default());
         assert_eq!(parsed.output.mode, OutputMode::Popup);
         assert_eq!(parsed.output.fallback, OutputMode::Notification);
-        assert_eq!(parsed.popup.position, Position::TopRight);
+        assert_eq!(parsed.popup.position, Position::Center);
+        assert_eq!(parsed.popup.output, OutputTarget::Focused);
+        assert!(!parsed.popup.modal && parsed.popup.modal_dismiss);
+        assert!((parsed.popup.modal_dim.get() - 0.4).abs() < f32::EPSILON);
         assert_eq!(parsed.popup.min_display_ms, 800);
         assert_eq!(parsed.notification.urgency, Urgency::Critical);
         assert_eq!(parsed.notification.safety_timeout_s, 60);
@@ -722,6 +834,49 @@ mod tests {
             Config::from_toml("[[rules]]\nwhen = {}"),
             Err(ConfigError::Toml { .. })
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn popup_placement_parses() -> TestResult {
+        let popup = |src: &str| Config::from_toml(&format!("[popup]\n{src}")).map(|c| c.popup);
+        assert_eq!(popup("position = \"center\"")?.position, Position::Center);
+        assert_eq!(
+            popup("position = \"top-right\"")?.position,
+            Position::TopRight
+        );
+        assert_eq!(popup("output = \"all\"")?.output, OutputTarget::All);
+        assert_eq!(popup("output = \"cursor\"")?.output, OutputTarget::Cursor);
+        assert_eq!(popup("output = \"focused\"")?.output, OutputTarget::Focused);
+        assert_eq!(
+            popup("output = [\"DP-1\", \"HDMI-A-1\"]")?.output,
+            OutputTarget::Named(vec!["DP-1".to_owned(), "HDMI-A-1".to_owned()])
+        );
+        let modal = popup("modal = true\nmodal_dim = 0\nmodal_dismiss = false")?;
+        assert!(modal.modal && !modal.modal_dismiss);
+        assert!(modal.modal_dim.get().abs() < f32::EPSILON);
+        assert!((popup("modal_dim = 1.0")?.modal_dim.get() - 1.0).abs() < f32::EPSILON);
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_popup_placement_is_rejected() -> TestResult {
+        let cases = [
+            ("output = []", "[]"),
+            ("output = [\"DP-1\", \"\"]", "[\"DP-1\", \"\"]"),
+            ("output = \"primary\"", "\"primary\""),
+            ("output = 1", "1"),
+            ("modal_dim = 1.5", "1.5"),
+            ("modal_dim = -0.1", "-0.1"),
+            ("modal_dim = nan", "nan"),
+            ("position = \"middle\"", "\"middle\""),
+        ];
+        for (body, value) in cases {
+            let src = format!("[popup]\n{body}\n");
+            let err = rejected(&src)?;
+            assert!(matches!(err, ConfigError::Toml { .. }), "{src:?}: {err:?}");
+            assert_eq!(err.span().and_then(|s| src.get(s)), Some(value), "{src:?}");
+        }
         Ok(())
     }
 
