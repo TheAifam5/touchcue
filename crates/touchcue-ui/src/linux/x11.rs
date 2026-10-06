@@ -1,6 +1,8 @@
-//! Click-through override-redirect popups on an X11 display.
+//! Click-through override-redirect popups on an X11 display, with optional
+//! modal overlays: input-only windows that take the clicks on a monitor
+//! without dimming it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::io::{self, IoSlice};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
@@ -10,7 +12,7 @@ use rustix::event::{PollFd, PollFlags, Timespec};
 use rustix::io::Errno;
 use tiny_skia::Pixmap;
 use tokio::io::unix::AsyncFd;
-use touchcue_core::config::Position;
+use touchcue_core::config::{OutputTarget, Position};
 use touchcue_core::{RateLimit, RequestId};
 use tracing::{debug, instrument, warn};
 use x11rb::connection::{Connection, RequestConnection};
@@ -20,9 +22,9 @@ use x11rb::protocol::Event;
 use x11rb::protocol::randr::ConnectionExt as _;
 use x11rb::protocol::shape::{self, ConnectionExt as _, SK, SO};
 use x11rb::protocol::xproto::{
-    AtomEnum, ClipOrdering, ConfigureWindowAux, ConnectionExt as _, CreateGCAux, CreateWindowAux,
-    EventMask, Gcontext, ImageFormat, ImageOrder, PropMode, Rectangle, Visualid, Window,
-    WindowClass,
+    AtomEnum, ButtonPressEvent, ClipOrdering, ConfigureWindowAux, ConnectionExt as _, CreateGCAux,
+    CreateWindowAux, EventMask, Gcontext, ImageFormat, ImageOrder, PropMode, Rectangle, Visualid,
+    Window, WindowClass,
 };
 use x11rb::reexports::x11rb_protocol::parse_display::parse_display;
 use x11rb::reexports::x11rb_protocol::xauth::get_auth;
@@ -32,6 +34,8 @@ use x11rb::wrapper::ConnectionExt as _;
 
 use super::WARN_INTERVAL;
 use super::icon::{ICON_DEADLINE, IconLoader};
+use super::modal::OverlayClock;
+use super::placement::{Placement, matching, stack};
 use super::render::{FontState, copy_to_argb8888, render};
 use crate::Prompt;
 use crate::text::display_body;
@@ -172,6 +176,8 @@ pub(crate) struct Monitor {
     pub(crate) width: i32,
     pub(crate) height: i32,
     pub(crate) primary: bool,
+    /// `RandR` name atom, or 0 for the root window.
+    pub(crate) name: u32,
 }
 
 impl Monitor {
@@ -191,8 +197,9 @@ pub(crate) fn pick_monitor(monitors: &[Monitor], pointer: (i32, i32)) -> Option<
 }
 
 /// Returns the top-left corner of a `size` popup on `monitor`, `offset`
-/// pixels from the anchored vertical edge and `margin` from the anchored
-/// horizontal edge, clamped to the X11 coordinate range.
+/// pixels from the anchored vertical edge, or from the top when centred,
+/// and `margin` from the anchored horizontal edge, clamped to the X11
+/// coordinate range.
 pub(crate) fn place(
     monitor: Monitor,
     position: Position,
@@ -216,14 +223,39 @@ pub(crate) fn place(
         .saturating_sub(height)
         .saturating_sub(offset);
     let (x, y) = match position {
+        Position::Center | Position::Top => (centre, top),
         Position::TopLeft => (left, top),
         Position::TopRight => (right, top),
-        Position::Top => (centre, top),
         Position::BottomLeft => (left, bottom),
         Position::BottomRight => (right, bottom),
         Position::Bottom => (centre, bottom),
     };
     (clamp_i16(x), clamp_i16(y))
+}
+
+/// Returns the offset of each popup of a stack `heights` tall on `monitor`,
+/// as [`place`] takes it.
+pub(crate) fn stack_offsets(
+    monitor: Monitor,
+    position: Position,
+    heights: &[i32],
+    margin: i32,
+    spacing: i32,
+) -> Vec<i32> {
+    let (offsets, total) = stack(heights, spacing);
+    let start = match position {
+        Position::Center => monitor.height.saturating_sub(total) / 2,
+        Position::TopLeft
+        | Position::TopRight
+        | Position::Top
+        | Position::BottomLeft
+        | Position::BottomRight
+        | Position::Bottom => margin,
+    };
+    offsets
+        .into_iter()
+        .map(|offset| start.saturating_add(offset))
+        .collect()
 }
 
 /// Converts `value` to `i16`, saturating at the type's bounds.
@@ -559,13 +591,33 @@ impl AsRawFd for SocketFd {
     }
 }
 
+/// Converts `value` to a window length, at least 1 and saturating at
+/// `u16::MAX`.
+fn clamp_length(value: i32) -> u16 {
+    match u16::try_from(value) {
+        Ok(0) => 1,
+        Ok(value) => value,
+        Err(_) if value < 0 => 1,
+        Err(_) => u16::MAX,
+    }
+}
+
 /// One shown popup window.
 struct PopupWindow {
+    monitor: Monitor,
     window: Window,
     gc: Gcontext,
     /// Pixels in `ZPixmap` order: B, G, R and an unused byte.
     data: Vec<u8>,
     size: (u16, u16),
+}
+
+/// An input-only window covering a monitor while the requests it holds wait.
+struct X11Overlay {
+    monitor: Monitor,
+    window: Window,
+    /// Never empty: an overlay is destroyed when its last request lets go.
+    holders: BTreeSet<RequestId>,
 }
 
 /// X11 client state; owns every popup window.
@@ -579,20 +631,24 @@ pub(crate) struct X11Popups {
     max_bytes: usize,
     atoms: Atoms,
     randr: bool,
-    position: Position,
-    monitor: Monitor,
+    placement: Placement,
     scale: f32,
     font: FontState,
     icons: IconLoader,
     warn_limit: RateLimit,
-    windows: BTreeMap<RequestId, PopupWindow>,
+    /// Limits warnings about output targets that fall back to `focused`.
+    target_limit: RateLimit,
+    windows: BTreeMap<RequestId, Vec<PopupWindow>>,
+    overlays: Vec<X11Overlay>,
+    overlay_clock: OverlayClock<Monitor>,
+    /// Requests dismissed by a click since [`X11Popups::take_dismissed`].
+    dismissed: Vec<RequestId>,
 }
 
 impl X11Popups {
     /// Registers the connection with the tokio reactor of the current runtime.
-    pub(crate) fn new(connected: Connected, position: Position) -> Result<Self, X11Error> {
+    pub(crate) fn new(connected: Connected, placement: Placement) -> Result<Self, X11Error> {
         let fd = AsyncFd::new(SocketFd(connected.conn.stream().as_raw_fd()))?;
-        let (width, height) = connected.root_size;
         Ok(Self {
             fd,
             conn: connected.conn,
@@ -602,94 +658,122 @@ impl X11Popups {
             max_bytes: connected.max_bytes,
             atoms: connected.atoms,
             randr: connected.randr,
-            position,
-            monitor: Monitor {
-                x: 0,
-                y: 0,
-                width,
-                height,
-                primary: true,
-            },
+            placement,
             scale: 1.0,
             font: FontState::load(),
             icons: IconLoader::new(ICON_DEADLINE),
             warn_limit: RateLimit::new(WARN_INTERVAL),
+            target_limit: RateLimit::new(WARN_INTERVAL),
             windows: BTreeMap::new(),
+            overlays: Vec::new(),
+            overlay_clock: OverlayClock::default(),
+            dismissed: Vec::new(),
         })
     }
 
-    /// Shows a popup for the prompt, or updates the one shown for its id.
+    /// Shows a popup for the prompt on each target monitor, or updates the
+    /// ones shown for its id; with `modal`, the request holds an overlay on
+    /// each of those monitors.
     #[instrument(level = "debug", skip_all, fields(id = %prompt.id, state = prompt.state.as_str()))]
-    pub(crate) async fn show(&mut self, prompt: &Prompt) -> Result<(), X11Error> {
+    pub(crate) async fn show(&mut self, prompt: &Prompt, modal: bool) -> Result<(), X11Error> {
         if self.windows.contains_key(&prompt.id) {
-            return self.update(prompt).await;
+            return self.update(prompt, modal).await;
         }
         self.scale = self.read_scale()?;
-        self.monitor = self.focused_monitor()?;
+        let targets = self.targets()?;
         let Some((data, size, shape)) = self.render(prompt).await else {
             return Ok(());
         };
-        let window = self.conn.generate_id()?;
-        let gc = self.conn.generate_id()?;
-        self.conn.create_window(
-            DEPTH,
-            window,
-            self.root,
-            0,
-            0,
-            size.0,
-            size.1,
-            0,
-            WindowClass::INPUT_OUTPUT,
-            self.visual,
-            &CreateWindowAux::new()
-                .override_redirect(1)
-                .background_pixel(0)
-                .border_pixel(0)
-                .event_mask(EventMask::EXPOSURE),
-        )?;
-        self.set_properties(window)?;
-        self.set_shape(window, &shape)?;
-        self.conn.create_gc(gc, window, &CreateGCAux::new())?;
-        self.windows.insert(
-            prompt.id,
-            PopupWindow {
+        if modal {
+            // Overlays are mapped first, so the popups stack above them.
+            for monitor in &targets {
+                self.hold_overlay(prompt.id, *monitor)?;
+            }
+        }
+        let mut popups = Vec::with_capacity(targets.len());
+        for monitor in targets {
+            let window = self.conn.generate_id()?;
+            let gc = self.conn.generate_id()?;
+            self.conn.create_window(
+                DEPTH,
+                window,
+                self.root,
+                0,
+                0,
+                size.0,
+                size.1,
+                0,
+                WindowClass::INPUT_OUTPUT,
+                self.visual,
+                &CreateWindowAux::new()
+                    .override_redirect(1)
+                    .background_pixel(0)
+                    .border_pixel(0)
+                    .event_mask(EventMask::EXPOSURE),
+            )?;
+            self.set_properties(window)?;
+            self.set_shape(window, &shape)?;
+            self.conn.create_gc(gc, window, &CreateGCAux::new())?;
+            popups.push(PopupWindow {
+                monitor,
                 window,
                 gc,
-                data,
+                data: data.clone(),
                 size,
-            },
-        );
+            });
+        }
+        let windows: Vec<Window> = popups.iter().map(|popup| popup.window).collect();
+        self.windows.insert(prompt.id, popups);
         self.restack()?;
-        self.conn.map_window(window)?;
-        debug!(id = %prompt.id, width = size.0, height = size.1, scale = self.scale, "popup shown");
+        for window in &windows {
+            self.conn.map_window(*window)?;
+        }
+        debug!(
+            id = %prompt.id,
+            width = size.0,
+            height = size.1,
+            scale = self.scale,
+            outputs = windows.len(),
+            modal,
+            "popup shown"
+        );
         Ok(())
     }
 
-    /// Re-renders a shown popup in place.
+    /// Re-renders the shown popups of a prompt in place; without `modal`,
+    /// the request lets go of its overlays.
     #[instrument(level = "debug", skip_all, fields(id = %prompt.id, state = prompt.state.as_str()))]
-    pub(crate) async fn update(&mut self, prompt: &Prompt) -> Result<(), X11Error> {
+    pub(crate) async fn update(&mut self, prompt: &Prompt, modal: bool) -> Result<(), X11Error> {
+        if !modal {
+            self.release(prompt.id)?;
+        }
         if !self.windows.contains_key(&prompt.id) {
             return Ok(());
         }
         let Some((data, size, shape)) = self.render(prompt).await else {
             return Ok(());
         };
-        let Some(popup) = self.windows.get_mut(&prompt.id) else {
+        let Some(popups) = self.windows.get_mut(&prompt.id) else {
             return Ok(());
         };
-        let window = popup.window;
-        let resized = popup.size != size;
-        popup.data = data;
-        popup.size = size;
-        if resized {
+        let mut resized = Vec::new();
+        for popup in popups.iter_mut() {
+            if popup.size != size {
+                resized.push(popup.window);
+            }
+            popup.data.clone_from(&data);
+            popup.size = size;
+        }
+        for window in &resized {
             self.conn.configure_window(
-                window,
+                *window,
                 &ConfigureWindowAux::new()
                     .width(u32::from(size.0))
                     .height(u32::from(size.1)),
             )?;
-            self.set_shape(window, &shape)?;
+            self.set_shape(*window, &shape)?;
+        }
+        if !resized.is_empty() {
             self.restack()?;
         }
         self.draw(prompt.id)?;
@@ -697,25 +781,98 @@ impl X11Popups {
         Ok(())
     }
 
-    /// Destroys the popup shown for `id`.
+    /// Destroys the popups and lets go of the overlays of `id`.
     #[instrument(level = "debug", skip_all, fields(%id))]
     pub(crate) fn hide(&mut self, id: RequestId) -> Result<(), X11Error> {
-        if let Some(popup) = self.windows.remove(&id) {
-            self.destroy(&popup)?;
+        self.release(id)?;
+        if let Some(popups) = self.windows.remove(&id) {
+            for popup in &popups {
+                self.destroy(popup)?;
+            }
             debug!(%id, "popup hidden");
             self.restack()?;
         }
         Ok(())
     }
 
-    /// Destroys every popup.
+    /// Destroys every popup and overlay.
     pub(crate) fn hide_all(&mut self) -> Result<(), X11Error> {
-        debug!(count = self.windows.len(), "hiding all popups");
+        debug!(
+            count = self.windows.len(),
+            overlays = self.overlays.len(),
+            "hiding all popups"
+        );
+        let overlays = std::mem::take(&mut self.overlays);
         let windows = std::mem::take(&mut self.windows);
-        for popup in windows.values() {
+        self.overlay_clock.clear();
+        for overlay in &overlays {
+            self.conn.destroy_window(overlay.window)?;
+        }
+        for popup in windows.values().flatten() {
             self.destroy(popup)?;
         }
         Ok(())
+    }
+
+    /// Lets go of the overlays held by `id`, destroying those it held last.
+    pub(crate) fn release(&mut self, id: RequestId) -> Result<(), X11Error> {
+        for overlay in &mut self.overlays {
+            overlay.holders.remove(&id);
+        }
+        let (released, kept) = std::mem::take(&mut self.overlays)
+            .into_iter()
+            .partition::<Vec<_>, _>(|overlay| overlay.holders.is_empty());
+        self.overlays = kept;
+        for overlay in &released {
+            self.overlay_clock.ended(&overlay.monitor);
+            self.conn.destroy_window(overlay.window)?;
+        }
+        if !released.is_empty() {
+            debug!(%id, remaining = self.overlays.len(), "modal overlays removed");
+        }
+        Ok(())
+    }
+
+    /// Destroys the overlays that reached [`super::modal::MODAL_MAX`] at
+    /// `now`; their monitors then cool down.
+    pub(crate) fn expire_overlays(&mut self, now: Instant) -> Result<(), X11Error> {
+        let expired = self.overlay_clock.expire(now);
+        let (removed, kept) = std::mem::take(&mut self.overlays)
+            .into_iter()
+            .partition::<Vec<_>, _>(|overlay| expired.contains(&overlay.monitor));
+        self.overlays = kept;
+        for overlay in &removed {
+            self.conn.destroy_window(overlay.window)?;
+        }
+        if !removed.is_empty() {
+            debug!(
+                count = removed.len(),
+                "modal overlays reached their time limit"
+            );
+        }
+        Ok(())
+    }
+
+    /// Returns the earliest time [`X11Popups::expire_overlays`] has work.
+    pub(crate) fn next_overlay_deadline(&self) -> Option<Instant> {
+        self.overlay_clock.next_deadline()
+    }
+
+    /// Returns the overlays and how many of them are mapped.
+    #[cfg(test)]
+    pub(crate) fn overlay_counts(&self) -> (usize, usize) {
+        (self.overlays.len(), self.overlays.len())
+    }
+
+    /// Returns how overlays are drawn.
+    #[cfg(test)]
+    pub(crate) fn overlay_paint() -> &'static str {
+        "input-only window without dim"
+    }
+
+    /// Returns the requests whose popups a click dismissed since the last call.
+    pub(crate) fn take_dismissed(&mut self) -> Vec<RequestId> {
+        std::mem::take(&mut self.dismissed)
     }
 
     /// Handles buffered events and sends pending requests.
@@ -754,10 +911,22 @@ impl X11Popups {
                 let id = self
                     .windows
                     .iter()
-                    .find(|(_, popup)| popup.window == expose.window)
+                    .find(|(_, popups)| popups.iter().any(|popup| popup.window == expose.window))
                     .map(|(id, _)| *id);
                 if let Some(id) = id {
                     self.draw(id)?;
+                }
+            }
+            // Buttons 4 to 7 are scroll steps, not clicks.
+            Event::ButtonPress(ButtonPressEvent { event, detail, .. })
+                if self.placement.dismiss && (1..=3).contains(&detail) =>
+            {
+                if let Some(index) = self
+                    .overlays
+                    .iter()
+                    .position(|overlay| overlay.window == event)
+                {
+                    self.dismiss_overlay(index)?;
                 }
             }
             Event::Error(err) => {
@@ -809,20 +978,36 @@ impl X11Popups {
         Some((data, (width, height), opaque_rows(&pixmap)))
     }
 
-    /// Sends the pixels of the popup for `id`, split to fit the request size limit.
-    fn draw(&self, id: RequestId) -> Result<(), X11Error> {
-        let Some(popup) = self.windows.get(&id) else {
+    /// Sends the pixels of the popups for `id`, which all have one size.
+    fn draw(&mut self, id: RequestId) -> Result<(), X11Error> {
+        let Some(width) = self
+            .windows
+            .get(&id)
+            .and_then(|popups| popups.first())
+            .map(|popup| popup.size.0)
+        else {
             return Ok(());
         };
-        let stride = usize::from(popup.size.0) * 4;
+        let stride = usize::from(width) * 4;
         let Some(rows) = rows_per_request(self.max_bytes, stride) else {
-            warn!(
-                stride,
-                max_bytes = self.max_bytes,
-                "popup row exceeds the X11 request size"
-            );
+            let max_bytes = self.max_bytes;
+            self.warn_limit.log(Instant::now(), |suppressed| {
+                warn!(
+                    stride,
+                    max_bytes, suppressed, "popup row exceeds the X11 request size"
+                );
+            });
             return Ok(());
         };
+        for popup in self.windows.get(&id).into_iter().flatten() {
+            self.draw_window(popup, rows)?;
+        }
+        Ok(())
+    }
+
+    /// Sends the pixels of a popup in requests of `rows` rows.
+    fn draw_window(&self, popup: &PopupWindow, rows: usize) -> Result<(), X11Error> {
+        let stride = usize::from(popup.size.0) * 4;
         for (chunk, y) in popup
             .data
             .chunks(rows * stride)
@@ -854,21 +1039,102 @@ impl X11Popups {
         Ok(())
     }
 
-    /// Stacks popups in id order away from the anchored edge of the monitor.
+    /// Positions popups in id order, as one stack per monitor: away from the
+    /// anchored edge, or centred.
     fn restack(&self) -> Result<(), X11Error> {
         let margin = logical(MARGIN, self.scale);
         let spacing = logical(SPACING, self.scale);
-        let mut offset = margin;
-        for popup in self.windows.values() {
-            let size = (i32::from(popup.size.0), i32::from(popup.size.1));
-            let (x, y) = place(self.monitor, self.position, size, offset, margin);
-            self.conn.configure_window(
-                popup.window,
-                &ConfigureWindowAux::new().x(i32::from(x)).y(i32::from(y)),
-            )?;
-            offset = offset.saturating_add(size.1).saturating_add(spacing);
+        let position = self.placement.position;
+        let mut monitors: Vec<Monitor> = Vec::new();
+        for popup in self.windows.values().flatten() {
+            if !monitors.contains(&popup.monitor) {
+                monitors.push(popup.monitor);
+            }
+        }
+        for monitor in monitors {
+            let members: Vec<&PopupWindow> = self
+                .windows
+                .values()
+                .flatten()
+                .filter(|popup| popup.monitor == monitor)
+                .collect();
+            let heights: Vec<i32> = members
+                .iter()
+                .map(|popup| i32::from(popup.size.1))
+                .collect();
+            let offsets = stack_offsets(monitor, position, &heights, margin, spacing);
+            for (popup, offset) in members.into_iter().zip(offsets) {
+                let size = (i32::from(popup.size.0), i32::from(popup.size.1));
+                let (x, y) = place(monitor, position, size, offset, margin);
+                self.conn.configure_window(
+                    popup.window,
+                    &ConfigureWindowAux::new().x(i32::from(x)).y(i32::from(y)),
+                )?;
+            }
         }
         Ok(())
+    }
+
+    /// Adds `id` to the overlay on `monitor`, creating and mapping the
+    /// overlay when the monitor has none.
+    fn hold_overlay(&mut self, id: RequestId, monitor: Monitor) -> Result<(), X11Error> {
+        if let Some(overlay) = self
+            .overlays
+            .iter_mut()
+            .find(|overlay| overlay.monitor == monitor)
+        {
+            overlay.holders.insert(id);
+            return Ok(());
+        }
+        if !self.overlay_clock.start(&monitor, Instant::now()) {
+            debug!(%id, "monitor is cooling down; no modal overlay");
+            return Ok(());
+        }
+        let window = self.conn.generate_id()?;
+        // Input-only windows take clicks without drawing; the keyboard and
+        // pointer are never grabbed.
+        self.conn.create_window(
+            0,
+            window,
+            self.root,
+            clamp_i16(monitor.x),
+            clamp_i16(monitor.y),
+            clamp_length(monitor.width),
+            clamp_length(monitor.height),
+            0,
+            WindowClass::INPUT_ONLY,
+            x11rb::COPY_FROM_PARENT,
+            &CreateWindowAux::new()
+                .override_redirect(1)
+                .event_mask(EventMask::BUTTON_PRESS),
+        )?;
+        self.conn.map_window(window)?;
+        self.overlays.push(X11Overlay {
+            monitor,
+            window,
+            holders: BTreeSet::from([id]),
+        });
+        debug!(%id, "modal overlay shown");
+        Ok(())
+    }
+
+    /// Hides the popups of every request holding the overlay `index`.
+    fn dismiss_overlay(&mut self, index: usize) -> Result<(), X11Error> {
+        let Some(overlay) = self.overlays.get(index) else {
+            return Ok(());
+        };
+        let holders: Vec<_> = overlay.holders.iter().copied().collect();
+        for id in holders {
+            self.release(id)?;
+            if let Some(popups) = self.windows.remove(&id) {
+                for popup in &popups {
+                    self.destroy(popup)?;
+                }
+            }
+            debug!(%id, "modal popup dismissed");
+            self.dismissed.push(id);
+        }
+        self.restack()
     }
 
     /// Sets the EWMH and ICCCM properties of a popup window before it is mapped.
@@ -972,8 +1238,8 @@ impl X11Popups {
         Ok(scale_from_dpi(dpi_from_property(&value)))
     }
 
-    /// Returns the monitor under the pointer, or the whole root window.
-    fn focused_monitor(&self) -> Result<Monitor, X11Error> {
+    /// Returns the monitors a new popup is shown on.
+    fn targets(&mut self) -> Result<Vec<Monitor>, X11Error> {
         let pointer = self.conn.query_pointer(self.root)?;
         let monitors = if self.randr {
             Some(self.conn.randr_get_monitors(self.root, true)?)
@@ -993,18 +1259,77 @@ impl X11Popups {
                     width: i32::from(monitor.width),
                     height: i32::from(monitor.height),
                     primary: monitor.primary,
+                    name: monitor.name,
                 })
                 .collect(),
             None => Vec::new(),
         };
         let (width, height) = self.root_size;
-        Ok(pick_monitor(&monitors, pointer).unwrap_or(Monitor {
+        let root = Monitor {
             x: 0,
             y: 0,
             width,
             height,
             primary: true,
-        }))
+            name: 0,
+        };
+        let focused = pick_monitor(&monitors, pointer).unwrap_or(root);
+        let wanted = match &self.placement.target {
+            // The monitor under the pointer is the focused one on X11.
+            OutputTarget::Focused | OutputTarget::Cursor => return Ok(vec![focused]),
+            OutputTarget::All if monitors.is_empty() => return Ok(vec![root]),
+            OutputTarget::All => return Ok(monitors),
+            OutputTarget::Named(wanted) => wanted.clone(),
+        };
+        let names = match self.monitor_names(&monitors) {
+            Ok(names) => names,
+            Err(ReplyError::X11Error(err)) => {
+                self.target_limit.log(Instant::now(), |suppressed| {
+                    warn!(
+                        error_kind = ?err.error_kind,
+                        suppressed, "monitor names unavailable; using the focused output"
+                    );
+                });
+                return Ok(vec![focused]);
+            }
+            Err(err) => return Err(err.into()),
+        };
+        let names: Vec<Option<&str>> = names.iter().map(Option::as_deref).collect();
+        let found: Vec<Monitor> = matching(&wanted, &names)
+            .into_iter()
+            .filter_map(|index| monitors.get(index).copied())
+            .collect();
+        if found.is_empty() {
+            self.target_limit.log(Instant::now(), |suppressed| {
+                warn!(
+                    reason = "no configured output exists",
+                    suppressed, "using the focused output"
+                );
+            });
+            return Ok(vec![focused]);
+        }
+        Ok(found)
+    }
+
+    /// Returns the `RandR` name of each monitor, sending every request before
+    /// reading the replies.
+    fn monitor_names(&self, monitors: &[Monitor]) -> Result<Vec<Option<String>>, ReplyError> {
+        let cookies = monitors
+            .iter()
+            .map(|monitor| match monitor.name {
+                0 => Ok(None),
+                atom => self.conn.get_atom_name(atom).map(Some),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        cookies
+            .into_iter()
+            .map(|cookie| match cookie {
+                Some(cookie) => Ok(Some(
+                    String::from_utf8_lossy(&cookie.reply()?.name).into_owned(),
+                )),
+                None => Ok(None),
+            })
+            .collect()
     }
 }
 
@@ -1149,6 +1474,7 @@ mod tests {
             width,
             height,
             primary,
+            name: 0,
         }
     }
 
@@ -1162,6 +1488,41 @@ mod tests {
         assert_eq!(place(mon, Position::BottomLeft, size, 124, 16), (16, 856));
         assert_eq!(place(mon, Position::BottomRight, size, 16, 16), (1544, 964));
         assert_eq!(place(mon, Position::Bottom, size, 16, 16), (780, 964));
+        assert_eq!(place(mon, Position::Center, size, 490, 16), (780, 490));
+    }
+
+    #[test]
+    fn centred_popups_stack_around_the_centre() {
+        let mon = monitor(1080, 0, 1920, 1080, true);
+        let place_all = |heights: &[i32]| -> Vec<(i16, i16)> {
+            stack_offsets(mon, Position::Center, heights, 16, 8)
+                .into_iter()
+                .zip(heights)
+                .map(|(offset, height)| place(mon, Position::Center, (360, *height), offset, 16))
+                .collect()
+        };
+        assert_eq!(place_all(&[100]), [(1860, 490)]);
+        // 100 + 8 + 60 = 168 pixels, centred: 456..624.
+        assert_eq!(place_all(&[100, 60]), [(1860, 456), (1860, 564)]);
+        assert_eq!(
+            place_all(&[100, 60, 80]),
+            [(1860, 412), (1860, 520), (1860, 588)]
+        );
+        // A stack taller than the monitor overflows both edges equally.
+        assert_eq!(place_all(&[1000, 1000]), [(1860, -464), (1860, 544)]);
+    }
+
+    #[test]
+    fn edge_stacks_start_at_the_margin() {
+        let mon = monitor(0, 0, 1920, 1080, true);
+        assert_eq!(
+            stack_offsets(mon, Position::TopRight, &[100, 60], 16, 8),
+            [16, 124]
+        );
+        assert_eq!(
+            stack_offsets(mon, Position::BottomLeft, &[100], 16, 8),
+            [16]
+        );
     }
 
     #[test]
@@ -1263,21 +1624,27 @@ mod tests {
         use touchcue_core::{EndReason, RequestState};
 
         let connected = tokio::task::spawn_blocking(connect).await??;
-        let mut popups = X11Popups::new(connected, Position::TopRight)?;
+        let popup = touchcue_core::config::Popup {
+            position: Position::TopRight,
+            ..touchcue_core::config::Popup::default()
+        };
+        let mut popups = X11Popups::new(connected, Placement::new(&popup))?;
         popups
-            .show(&smoke_prompt(
-                1,
-                "Touch your security key",
-                RequestState::Waiting,
-            ))
+            .show(
+                &smoke_prompt(1, "Touch your security key", RequestState::Waiting),
+                false,
+            )
             .await?;
         popups
-            .show(&smoke_prompt(2, "Second prompt", RequestState::Waiting))
+            .show(
+                &smoke_prompt(2, "Second prompt", RequestState::Waiting),
+                false,
+            )
             .await?;
         pump(&mut popups, std::time::Duration::from_millis(1500)).await?;
         let cancelled = RequestState::Lingering(EndReason::Cancelled);
         popups
-            .update(&smoke_prompt(2, "Second prompt", cancelled))
+            .update(&smoke_prompt(2, "Second prompt", cancelled), false)
             .await?;
         pump(&mut popups, std::time::Duration::from_millis(1500)).await?;
         popups.hide(RequestId(1))?;

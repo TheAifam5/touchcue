@@ -2,8 +2,10 @@
 //! second task.
 
 mod icon;
+mod modal;
 mod notify;
 mod output;
+mod placement;
 mod render;
 mod wayland;
 mod x11;
@@ -15,17 +17,19 @@ use tokio::sync::mpsc::{self, error::TrySendError};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
-use touchcue_core::RequestId;
 use touchcue_core::config::OutputMode;
+use touchcue_core::{RequestId, RequestState};
 use tracing::{Instrument, debug, info, info_span, instrument, warn};
 
+use self::modal::ModalTimer;
 use self::notify::{Notifier, NotifyWorker};
 use self::output::{Incoming, OutputError, PopupOutput};
+use self::placement::Placement;
 use crate::text::sanitize_command;
 use crate::timing::{Action, Timing};
 use crate::{
-    Backend, Capabilities, Command, HIDE_SEND_TIMEOUT, INIT_TIMEOUT, QUEUE_LEN, SHUTDOWN_TIMEOUT,
-    UiConfig, UiError,
+    Backend, Capabilities, Command, HIDE_SEND_TIMEOUT, INIT_TIMEOUT, Prompt, QUEUE_LEN,
+    SHUTDOWN_TIMEOUT, UiConfig, UiError,
 };
 
 /// Time reserved for the UI task to exit after its notifier task.
@@ -120,6 +124,8 @@ pub(crate) async fn spawn(
             Duration::from_millis(cfg.popup.min_display_ms),
         ),
         popups: outputs.popups,
+        modal: cfg.popup.modal,
+        modal_timer: ModalTimer::default(),
         notifier: outputs.notifier.map(NotifyWorker::start),
     };
     info!(
@@ -220,6 +226,9 @@ pub(crate) async fn probe() -> Capabilities {
 struct App {
     timing: Timing,
     popups: Option<PopupOutput>,
+    /// Popups of waiting requests hold overlays that block clicks.
+    modal: bool,
+    modal_timer: ModalTimer,
     notifier: Option<NotifyWorker>,
 }
 
@@ -233,16 +242,44 @@ impl App {
     }
 
     async fn on_tick(&mut self) {
-        let actions = self.timing.tick(Instant::now().into_std());
+        let now = Instant::now().into_std();
+        let actions = self.timing.tick(now);
         self.apply(actions).await;
+        if let Some(output) = &mut self.popups
+            && let Err(err) = output.expire_overlays(now)
+        {
+            self.lose_popups(&err);
+        }
+    }
+
+    /// Returns the earliest time [`App::on_tick`] has work.
+    fn next_deadline(&self) -> Option<std::time::Instant> {
+        let overlays = self
+            .popups
+            .as_ref()
+            .and_then(PopupOutput::next_overlay_deadline);
+        match (self.timing.next_deadline(), overlays) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    /// Reports whether the prompt's popups may hold overlays.
+    fn modal(&mut self, prompt: &Prompt) -> bool {
+        self.modal
+            && self.popups.is_some()
+            && self
+                .modal_timer
+                .sync(prompt.id, prompt.state == RequestState::Waiting)
     }
 
     async fn apply(&mut self, actions: Vec<Action>) {
         for action in actions {
             match action {
                 Action::Show(prompt) => {
+                    let modal = self.modal(&prompt);
                     if let Some(output) = &mut self.popups
-                        && let Err(err) = output.show(&prompt).await
+                        && let Err(err) = output.show(&prompt, modal).await
                     {
                         self.lose_popups(&err);
                     }
@@ -251,8 +288,9 @@ impl App {
                     }
                 }
                 Action::Update(prompt) => {
+                    let modal = self.modal(&prompt);
                     if let Some(output) = &mut self.popups
-                        && let Err(err) = output.update(&prompt).await
+                        && let Err(err) = output.update(&prompt, modal).await
                     {
                         self.lose_popups(&err);
                     }
@@ -261,6 +299,7 @@ impl App {
                     }
                 }
                 Action::Hide(id) => {
+                    self.modal_timer.remove(id);
                     if let Some(output) = &mut self.popups
                         && let Err(err) = output.hide(id)
                     {
@@ -282,6 +321,18 @@ impl App {
         };
         if let Err(err) = output.dispatch().await {
             self.lose_popups(&err);
+            return;
+        }
+        self.take_dismissed();
+    }
+
+    /// Ends the modal state of requests whose popups a click dismissed.
+    fn take_dismissed(&mut self) {
+        let Some(output) = &mut self.popups else {
+            return;
+        };
+        for id in output.take_dismissed() {
+            self.modal_timer.dismiss(id);
         }
     }
 
@@ -291,15 +342,19 @@ impl App {
         };
         if let Err(err) = incoming.and_then(|incoming| output.handle(incoming)) {
             self.lose_popups(&err);
+            return;
         }
+        self.take_dismissed();
     }
 
+    /// Drops the display connection, which destroys every popup and overlay.
     fn lose_popups(&mut self, err: &OutputError) {
         warn!(
             error = err as &dyn std::error::Error,
             "display connection lost; popups are disabled"
         );
         self.popups = None;
+        self.modal_timer.clear();
     }
 }
 
@@ -324,7 +379,7 @@ async fn read_display(popups: Option<&PopupOutput>) -> Result<Incoming, OutputEr
 async fn run(mut app: App, mut queue: mpsc::Receiver<Msg>, cancel: CancellationToken) {
     let deadline = loop {
         app.dispatch().await;
-        let next = app.timing.next_deadline();
+        let next = app.next_deadline();
         tokio::select! {
             () = cancel.cancelled() => break Instant::now() + SHUTDOWN_TIMEOUT,
             msg = queue.recv() => match msg {
@@ -385,7 +440,7 @@ impl Outputs {
             .collect();
         let wants = |wanted: &[OutputMode]| modes.iter().any(|mode| wanted.contains(mode));
         let popups = if wants(&[OutputMode::Popup, OutputMode::Both]) {
-            PopupOutput::open(cfg.popup.position).await
+            PopupOutput::open(&Placement::new(&cfg.popup)).await
         } else {
             None
         };
@@ -428,10 +483,11 @@ async fn open_notifier(cfg: &UiConfig) -> Option<Notifier> {
 mod tests {
     use std::process::Stdio;
 
-    use touchcue_core::{EndReason, RequestState};
+    use touchcue_core::EndReason;
+    use touchcue_core::config::{OutputTarget, Position};
 
     use super::*;
-    use crate::{Prompt, Ui};
+    use crate::Ui;
 
     const CHILD_ENV: &str = "TOUCHCUE_UI_PROBE_CHILD";
 
@@ -447,6 +503,10 @@ mod tests {
         Fixture,
         #[error("failed to encode the PNG fixture")]
         Encode(#[from] png::EncodingError),
+        #[error(transparent)]
+        Output(#[from] OutputError),
+        #[error("no display server accepted popups")]
+        NoDisplay,
     }
 
     /// Runs [`probe`] in a child process without a Wayland or session bus
@@ -532,6 +592,126 @@ mod tests {
         ui.send(Command::Hide(RequestId(2))).await?;
         ui.shutdown(Instant::now() + SHUTDOWN_TIMEOUT).await?;
         std::fs::remove_file(&icon)?;
+        Ok(())
+    }
+
+    /// Shows two prompts with `popup` for about 3 s on the running desktop,
+    /// ending the second one halfway.
+    async fn placement_smoke(popup: touchcue_core::config::Popup) -> Result<(), TestError> {
+        let mut cfg = UiConfig::default();
+        cfg.output.fallback = OutputMode::Off;
+        cfg.popup = popup;
+        let ui = Ui::spawn(cfg, CancellationToken::new()).await?;
+        assert_eq!(ui.backend(), Backend::Popup);
+        ui.send(Command::Show(prompt(
+            1,
+            "Touch your security key",
+            "touchcue placement smoke test; this text wraps onto a second line",
+            RequestState::Waiting,
+        )))
+        .await?;
+        let second = |state| prompt(2, "Second prompt", "stacked below the first", state);
+        ui.send(Command::Show(second(RequestState::Waiting)))
+            .await?;
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let touched = RequestState::Lingering(EndReason::Touched);
+        ui.send(Command::Update(second(touched))).await?;
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        ui.send(Command::Hide(RequestId(1))).await?;
+        ui.send(Command::Hide(RequestId(2))).await?;
+        ui.shutdown(Instant::now() + SHUTDOWN_TIMEOUT).await?;
+        Ok(())
+    }
+
+    /// Shows two popups stacked at the centre of the focused output.
+    #[tokio::test]
+    #[ignore = "draws on the running desktop"]
+    async fn center_focused_smoke() -> Result<(), TestError> {
+        placement_smoke(touchcue_core::config::Popup::default()).await
+    }
+
+    /// Shows two popups stacked at the centre of every output.
+    #[tokio::test]
+    #[ignore = "draws on the running desktop"]
+    async fn center_all_smoke() -> Result<(), TestError> {
+        placement_smoke(touchcue_core::config::Popup {
+            output: OutputTarget::All,
+            ..touchcue_core::config::Popup::default()
+        })
+        .await
+    }
+
+    /// Shows two popups in the top-right corner of the output under the
+    /// mouse pointer; outside Hyprland this falls back to the focused output.
+    #[tokio::test]
+    #[ignore = "draws on the running desktop"]
+    async fn cursor_smoke() -> Result<(), TestError> {
+        placement_smoke(touchcue_core::config::Popup {
+            position: Position::TopRight,
+            output: OutputTarget::Cursor,
+            ..touchcue_core::config::Popup::default()
+        })
+        .await
+    }
+
+    /// Handles display events and sends requests for `duration`.
+    async fn pump(output: &mut PopupOutput, duration: Duration) -> Result<(), OutputError> {
+        let end = Instant::now() + duration;
+        loop {
+            output.dispatch().await?;
+            match tokio::time::timeout_at(end, output.read()).await {
+                Ok(incoming) => output.handle(incoming?)?,
+                Err(_deadline_reached) => return Ok(()),
+            }
+        }
+    }
+
+    /// Shows two centred modal popups on the focused output, which is dimmed
+    /// and takes no clicks for about 3 s; a click on the dim area hides both.
+    /// Fails when the overlay is not created and drawn.
+    #[tokio::test]
+    #[ignore = "draws on the running desktop and blocks its clicks for about 3 s"]
+    async fn modal_smoke() -> Result<(), TestError> {
+        let popup = touchcue_core::config::Popup {
+            modal: true,
+            ..touchcue_core::config::Popup::default()
+        };
+        let mut output = PopupOutput::open(&Placement::new(&popup))
+            .await
+            .ok_or(TestError::NoDisplay)?;
+        let second = |state| prompt(2, "Second prompt", "stacked below the first", state);
+        output
+            .show(
+                &prompt(
+                    1,
+                    "Touch your security key",
+                    "touchcue modal_smoke: the output is dimmed and takes no clicks",
+                    RequestState::Waiting,
+                ),
+                true,
+            )
+            .await?;
+        output.show(&second(RequestState::Waiting), true).await?;
+        pump(&mut output, Duration::from_millis(1500)).await?;
+        let (overlays, drawn) = output.overlay_counts();
+        println!(
+            "modal overlays: {overlays}, drawn: {drawn}, as {}",
+            output.overlay_paint()
+        );
+        assert_eq!((overlays, drawn), (1, 1), "overlay missing or not drawn");
+        let touched = RequestState::Lingering(EndReason::Touched);
+        output.update(&second(touched), false).await?;
+        pump(&mut output, Duration::from_millis(1500)).await?;
+        let (overlays, drawn) = output.overlay_counts();
+        println!("after 3 s: modal overlays: {overlays}, drawn: {drawn}");
+        output.hide(RequestId(1))?;
+        output.hide(RequestId(2))?;
+        assert_eq!(
+            output.overlay_counts(),
+            (0, 0),
+            "overlay outlived its requests"
+        );
+        output.dispatch().await?;
         Ok(())
     }
 

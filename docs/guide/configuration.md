@@ -14,9 +14,13 @@ mode = "popup"
 fallback = "notification"
 
 [popup]
-position = "top-right"
+position = "center"
+output = "focused"
 min_display_ms = 800
 show_delay_ms = 0
+modal = false
+modal_dim = 0.4
+modal_dismiss = true
 
 [notification]
 urgency = "critical"
@@ -63,13 +67,36 @@ enabled = false
 
 | Key | Values | Default |
 | --- | --- | --- |
-| `position` | `top-left`, `top-right`, `bottom-left`, `bottom-right`, `top`, `bottom` | `top-right` |
+| `position` | `center`, `top-left`, `top-right`, `bottom-left`, `bottom-right`, `top`, `bottom` | `center` |
+| `output` | `"focused"`, `"all"`, `"cursor"`, or a list of output names | `"focused"` |
 | `min_display_ms` | 0 to 600000 | 800 |
 | `show_delay_ms` | 0 to 600000 | 0 |
+| `modal` | `true`, `false` | `false` |
+| `modal_dim` | 0.0 to 1.0 | 0.4 |
+| `modal_dismiss` | `true`, `false` | `true` |
 
 `min_display_ms` is the shortest time a shown popup stays visible. `show_delay_ms` is how long a request must wait before its popup appears.
 
-Centring, choosing the monitor and a modal mode are planned.
+Several popups on one output stack in the order the requests started: away from the screen edge, or vertically around the centre with `center`.
+
+### Outputs
+
+`output` chooses the monitors that show the popup. The popup's output is chosen when it appears.
+
+- `"focused"` lets the Wayland compositor pick, usually the focused monitor. On X11 it is the monitor under the mouse pointer.
+- `"all"` shows a popup on every output.
+- `"cursor"` uses the output under the mouse pointer. On Wayland this works only on Hyprland, through its IPC socket. Elsewhere, or when the query fails, touchcue logs a warning and falls back to `"focused"`. On X11 it is the same as `"focused"`.
+- A list such as `["DP-1", "HDMI-A-1"]` shows a popup on each listed output that exists. Wayland names come from the compositor (`hyprctl monitors`, `swaymsg -t get_outputs`), X11 names from RandR (`xrandr --listmonitors`). When none of them exists, touchcue logs a warning and falls back to `"focused"`. An empty list or an empty name is an error.
+
+### Modal popups
+
+With `modal = true`, a popup that waits for a touch also blocks clicks: on each of its outputs, a full-screen layer behind the popup takes every click. The keyboard is never grabbed, so typing still goes to the focused window. The overlay is removed when no request on that output waits any more, and after 120 seconds at most, even when requests still wait; requests that start while it is shown do not extend it. After those 120 seconds, that output gets no new overlay for 30 seconds.
+
+- `modal_dim` is how dark the overlay is, up to `1.0` (black). `0.0` blocks clicks without dimming.
+- With `modal_dismiss = true`, a click or touch on the overlay hides the popups and overlays of the requests on it. Only the display is hidden: the request keeps waiting for a touch. The next request on that output gets a new overlay right away. Only the left, middle and right buttons dismiss; scrolling and side buttons do not.
+- With `modal_dismiss = false`, requests that follow each other can keep an output dimmed for longer than 120 seconds: the limit applies to each overlay, and a new request gets a new overlay once the previous one ended, or 30 seconds after it reached the limit. The keyboard keeps working throughout.
+
+On X11 the overlay is an input-only window that blocks clicks without dimming, so `modal_dim` has no effect there. On Wayland the overlay is on the layer-shell overlay layer, above windows and panels.
 
 ## `[notification]`
 

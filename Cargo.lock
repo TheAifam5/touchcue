@@ -1549,6 +1549,8 @@ dependencies = [
  "png",
  "resvg",
  "rustix",
+ "serde",
+ "serde_json",
  "skrifa",
  "smithay-client-toolkit",
  "thiserror 2.0.21",

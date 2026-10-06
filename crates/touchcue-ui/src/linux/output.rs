@@ -1,10 +1,12 @@
 //! Popups on whichever display server is available.
 
+use std::time::Instant;
+
 use touchcue_core::RequestId;
-use touchcue_core::config::Position;
 use tracing::{debug, instrument, warn};
 use x11rb::protocol::Event;
 
+use super::placement::Placement;
 use super::wayland::{self, Popups, WaylandIo, WaylandIoError};
 use super::x11::{self, DisplayServer, X11Error, X11Popups};
 use crate::{INIT_TIMEOUT, Prompt};
@@ -27,15 +29,15 @@ pub(crate) enum Incoming {
 
 /// Popups on one display server together with its connection.
 pub(crate) enum PopupOutput {
-    Wayland { popups: Popups, io: WaylandIo },
-    X11(X11Popups),
+    Wayland { popups: Box<Popups>, io: WaylandIo },
+    X11(Box<X11Popups>),
 }
 
 impl PopupOutput {
     /// Opens popups on the first display server named by the environment
     /// that supports them.
-    #[instrument(skip_all, fields(?position))]
-    pub(crate) async fn open(position: Position) -> Option<Self> {
+    #[instrument(skip_all, fields(position = ?placement.position))]
+    pub(crate) async fn open(placement: &Placement) -> Option<Self> {
         let servers = x11::display_servers(
             std::env::var_os("WAYLAND_DISPLAY").as_deref(),
             std::env::var_os("WAYLAND_SOCKET").as_deref(),
@@ -43,8 +45,8 @@ impl PopupOutput {
         );
         for server in servers {
             let opened = match server {
-                DisplayServer::Wayland => open_wayland(position).await,
-                DisplayServer::X11 => open_x11(position).await,
+                DisplayServer::Wayland => open_wayland(placement.clone()).await,
+                DisplayServer::X11 => open_x11(placement.clone()).await,
             };
             if opened.is_some() {
                 debug!(?server, "popups available");
@@ -54,20 +56,67 @@ impl PopupOutput {
         None
     }
 
-    pub(crate) async fn show(&mut self, prompt: &Prompt) -> Result<(), OutputError> {
+    /// Shows the prompt; with `modal`, it holds overlays that block clicks.
+    pub(crate) async fn show(&mut self, prompt: &Prompt, modal: bool) -> Result<(), OutputError> {
         match self {
-            Self::Wayland { popups, .. } => popups.show(prompt).await,
-            Self::X11(popups) => popups.show(prompt).await?,
+            Self::Wayland { popups, .. } => popups.show(prompt, modal).await,
+            Self::X11(popups) => popups.show(prompt, modal).await?,
         }
         Ok(())
     }
 
-    pub(crate) async fn update(&mut self, prompt: &Prompt) -> Result<(), OutputError> {
+    /// Updates the prompt; without `modal`, it lets go of its overlays.
+    pub(crate) async fn update(&mut self, prompt: &Prompt, modal: bool) -> Result<(), OutputError> {
         match self {
-            Self::Wayland { popups, .. } => popups.update(prompt).await,
-            Self::X11(popups) => popups.update(prompt).await?,
+            Self::Wayland { popups, .. } => popups.update(prompt, modal).await,
+            Self::X11(popups) => popups.update(prompt, modal).await?,
         }
         Ok(())
+    }
+
+    /// Removes the overlays that reached their time limit at `now`; the
+    /// popups stay.
+    pub(crate) fn expire_overlays(&mut self, now: Instant) -> Result<(), OutputError> {
+        match self {
+            Self::Wayland { popups, .. } => popups.expire_overlays(now),
+            Self::X11(popups) => popups.expire_overlays(now)?,
+        }
+        Ok(())
+    }
+
+    /// Returns the earliest time [`PopupOutput::expire_overlays`] has work.
+    pub(crate) fn next_overlay_deadline(&self) -> Option<Instant> {
+        match self {
+            Self::Wayland { popups, .. } => popups.next_overlay_deadline(),
+            Self::X11(popups) => popups.next_overlay_deadline(),
+        }
+    }
+
+    /// Returns the modal overlays and how many of them are drawn.
+    #[cfg(test)]
+    pub(crate) fn overlay_counts(&self) -> (usize, usize) {
+        match self {
+            Self::Wayland { popups, .. } => popups.overlay_counts(),
+            Self::X11(popups) => popups.overlay_counts(),
+        }
+    }
+
+    /// Returns how overlays are drawn.
+    #[cfg(test)]
+    pub(crate) fn overlay_paint(&self) -> &'static str {
+        match self {
+            Self::Wayland { popups, .. } => popups.overlay_paint(),
+            Self::X11(_) => X11Popups::overlay_paint(),
+        }
+    }
+
+    /// Returns the requests whose popups a click on an overlay hid since
+    /// the last call.
+    pub(crate) fn take_dismissed(&mut self) -> Vec<RequestId> {
+        match self {
+            Self::Wayland { popups, .. } => popups.take_dismissed(),
+            Self::X11(popups) => popups.take_dismissed(),
+        }
     }
 
     pub(crate) fn hide(&mut self, id: RequestId) -> Result<(), OutputError> {
@@ -116,7 +165,7 @@ impl PopupOutput {
     }
 }
 
-async fn open_wayland(position: Position) -> Option<PopupOutput> {
+async fn open_wayland(placement: Placement) -> Option<PopupOutput> {
     let connected = match tokio::task::spawn_blocking(wayland::connect).await {
         Ok(connected) => connected,
         Err(err) => {
@@ -128,9 +177,12 @@ async fn open_wayland(position: Position) -> Option<PopupOutput> {
         }
     };
     let opened = connected.and_then(|(conn, globals, queue)| {
-        let popups = Popups::new(&globals, &queue, position)?;
+        let popups = Popups::new(&globals, &queue, placement)?;
         let io = WaylandIo::new(conn, queue)?;
-        Ok(PopupOutput::Wayland { popups, io })
+        Ok(PopupOutput::Wayland {
+            popups: Box::new(popups),
+            io,
+        })
     });
     match opened {
         Ok(opened) => Some(opened),
@@ -144,7 +196,7 @@ async fn open_wayland(position: Position) -> Option<PopupOutput> {
     }
 }
 
-async fn open_x11(position: Position) -> Option<PopupOutput> {
+async fn open_x11(placement: Placement) -> Option<PopupOutput> {
     let connected = tokio::time::timeout(INIT_TIMEOUT, tokio::task::spawn_blocking(x11::connect));
     let connected = match connected.await {
         Ok(Ok(connected)) => connected,
@@ -163,8 +215,8 @@ async fn open_x11(position: Position) -> Option<PopupOutput> {
             return None;
         }
     };
-    match connected.and_then(|connected| X11Popups::new(connected, position)) {
-        Ok(popups) => Some(PopupOutput::X11(popups)),
+    match connected.and_then(|connected| X11Popups::new(connected, placement)) {
+        Ok(popups) => Some(PopupOutput::X11(Box::new(popups))),
         Err(err) => {
             debug!(
                 error = &err as &dyn std::error::Error,

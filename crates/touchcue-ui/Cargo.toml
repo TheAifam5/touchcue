@@ -17,10 +17,12 @@ tracing.workspace = true
 fontdb.workspace = true
 resvg.workspace = true
 rustix.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 skrifa.workspace = true
 smithay-client-toolkit.workspace = true
 tiny-skia.workspace = true
-tokio = { workspace = true, features = ["macros", "net"] }
+tokio = { workspace = true, features = ["io-util", "macros", "net"] }
 x11rb.workspace = true
 zbus.workspace = true
 
