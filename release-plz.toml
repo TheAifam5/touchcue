@@ -5,6 +5,8 @@ git_only = true
 publish = false
 git_release_enable = false
 git_tag_enable = false
+# Library crates look up and link the touchcue release tag; they never create tags.
+git_tag_name = "v{{ version }}"
 release = false
 release_always = false
 semver_check = false
