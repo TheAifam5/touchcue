@@ -7,6 +7,7 @@ use std::path::Path;
 use tokio::runtime::Runtime;
 #[cfg(target_os = "linux")]
 use touchcue_appinfo::linux::Origin;
+use touchcue_core::Hook;
 use touchcue_core::config::RequesterConfig;
 #[cfg(target_os = "linux")]
 use touchcue_core::skip::SkipList;
@@ -23,8 +24,9 @@ pub enum Error {
 
 /// Prints the configuration status, desktop capabilities, FIDO devices, the
 /// UI backend `run` would choose, the configured IPC endpoints and the gpg
-/// setup, the number of hooks and the requester skip list with how it reads
-/// this process, and returns whether touchcue is usable.
+/// setup, the number of hooks and of hooks with `until`, and the requester
+/// skip list with how it reads this process, and returns whether touchcue
+/// is usable.
 ///
 /// Usable means the configuration is valid and every FIDO device found can
 /// be opened. No device present still counts as usable, since devices plugged
@@ -110,7 +112,7 @@ fn report(
                 }
             )?;
             gpg(out, config.sources.gpg.enabled, runtime)?;
-            writeln!(out, "hooks: {}", config.hooks.len())?;
+            writeln!(out, "{}", hooks_line(&config.hooks))?;
             requester(out, &config.requester)?;
         }
         None => writeln!(out, "backend: unknown, the configuration did not load")?,
@@ -385,6 +387,16 @@ fn yes_no(value: bool) -> &'static str {
     if value { "yes" } else { "no" }
 }
 
+/// Returns `hooks: N`, with the number of hooks with `until` when there are any.
+fn hooks_line(hooks: &[Hook]) -> String {
+    let until = hooks.iter().filter(|hook| hook.lifetime.is_some()).count();
+    if until == 0 {
+        format!("hooks: {}", hooks.len())
+    } else {
+        format!("hooks: {}, {until} until ended", hooks.len())
+    }
+}
+
 /// Returns the lowercase name of a UI backend.
 pub fn backend_name(backend: Backend) -> &'static str {
     match backend {
@@ -397,6 +409,20 @@ pub fn backend_name(backend: Backend) -> &'static str {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hooks_line_counts_hooks_with_until() -> Result<(), touchcue_core::ConfigError> {
+        let plain = "[[hooks]]\non = [\"started\"]\ncommand = [\"x\"]\n";
+        let until = "[[hooks]]\non = [\"started\"]\nuntil = \"ended\"\ncommand = [\"x\"]\n";
+        let hooks = |src: &str| touchcue_core::Config::from_toml(src).map(|c| c.hooks);
+        assert_eq!(hooks_line(&hooks("")?), "hooks: 0");
+        assert_eq!(hooks_line(&hooks(plain)?), "hooks: 1");
+        assert_eq!(
+            hooks_line(&hooks(&format!("{plain}{until}{until}"))?),
+            "hooks: 3, 2 until ended"
+        );
+        Ok(())
+    }
 
     #[test]
     fn scdaemon_status_checks_the_touchcue_program() -> io::Result<()> {

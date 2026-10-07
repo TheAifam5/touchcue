@@ -58,7 +58,15 @@ pub trait Sink {
     /// Queues a UI command and returns whether it was queued; a failure is
     /// logged by the sink.
     async fn ui(&mut self, command: Command) -> bool;
-    fn publish(&mut self, event: &Event, values: &BTreeMap<String, String>);
+    /// Publishes `event` with placeholder `values` and the rendered
+    /// `prompt`, which is `None` when a rule suppresses it or the request
+    /// ended.
+    fn publish(
+        &mut self,
+        event: &Event,
+        values: &BTreeMap<String, String>,
+        prompt: Option<&Prompt>,
+    );
     /// Replaces the published set of active requests; each entry is a
     /// [`Event::Started`] with the values of its last published event.
     fn resync(&mut self, active: &[(Event, BTreeMap<String, String>)]);
@@ -559,7 +567,7 @@ impl<A: Attribute, S: Sink> Daemon<A, S> {
                     self.sink.ui(Command::Hide(request.id)).await;
                 }
                 self.sink
-                    .publish(&Event::Ended { request, reason }, &values);
+                    .publish(&Event::Ended { request, reason }, &values, None);
             }
         }
     }
@@ -585,6 +593,7 @@ impl<A: Attribute, S: Sink> Daemon<A, S> {
             return;
         };
         let (values, prompt) = render(&self.config, request, &cached.attribution, now);
+        let published = prompt.clone();
         match (prompt, cached.shown) {
             (Some(prompt), false) => {
                 cached.shown = self.sink.ui(Command::Show(prompt)).await;
@@ -597,7 +606,7 @@ impl<A: Attribute, S: Sink> Daemon<A, S> {
             }
             (None, false) => {}
         }
-        self.sink.publish(event, &values);
+        self.sink.publish(event, &values, published.as_ref());
         cached.published = Some((request.clone(), values));
     }
 }
@@ -768,6 +777,8 @@ mod tests {
     struct Recorder {
         out: Vec<Out>,
         values: Vec<BTreeMap<String, String>>,
+        /// Body of the prompt of every published event, in order.
+        prompts: Vec<Option<String>>,
         reject_shows: u32,
     }
 
@@ -785,7 +796,13 @@ mod tests {
             std::future::ready(true)
         }
 
-        fn publish(&mut self, event: &Event, values: &BTreeMap<String, String>) {
+        fn publish(
+            &mut self,
+            event: &Event,
+            values: &BTreeMap<String, String>,
+            prompt: Option<&Prompt>,
+        ) {
+            self.prompts.push(prompt.map(|p| p.body.clone()));
             let (kind, request) = match event {
                 Event::Started(r) => ("started", r),
                 Event::Updated(r) => ("updated", r),
@@ -1089,14 +1106,32 @@ mod tests {
         d.tick(base + MS * 2500).await;
         let id = RequestId(1);
         let high = Some("high".to_owned());
+        let sink = d.into_sink();
         assert_eq!(
-            d.into_sink().out,
+            sink.out,
             [
                 Out::Publish("started", id, high.clone()),
                 Out::Publish("updated", id, high.clone()),
                 Out::Publish("ended", id, high),
             ]
         );
+        assert_eq!(sink.prompts, [None, None, None]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn published_events_carry_the_shown_prompt() -> TestResult {
+        let mut d = daemon("")?;
+        let base = Instant::now();
+        d.signal(pending(1), base).await;
+        d.tick(base + MS * 1500).await;
+        d.tick(base + MS * 2500).await;
+        let sink = d.into_sink();
+        let [Some(started), Some(updated), None] = sink.prompts.as_slice() else {
+            return Err(TestError::NoPrompt);
+        };
+        assert!(started.contains("is waiting for"), "{started}");
+        assert_eq!(started, updated);
         Ok(())
     }
 

@@ -21,11 +21,11 @@ use touchcue_core::{
 use touchcue_detect::DetectError;
 use touchcue_detect::linux::hidraw::DeviceEvent;
 use touchcue_detect::linux::{hidraw, sysfs};
-use touchcue_hooks::{HookSender, Hooks, HooksError, RequestEvents};
+use touchcue_hooks::{HookSender, Hooks, HooksError, PromptText, RequestEvents};
 use touchcue_ipc::agent::{self, AgentPaths};
 use touchcue_ipc::helper::{Helper, HelperConfig, HelperOutputs, Notice};
 use touchcue_ipc::{Ipc, IpcConfig, IpcError, WireEvent};
-use touchcue_ui::{Command, Ui, UiConfig, UiError};
+use touchcue_ui::{Command, Prompt, Ui, UiConfig, UiError};
 
 use crate::check::backend_name;
 use crate::daemon::{Attribute, Daemon, Sink, SystemAttribution};
@@ -550,7 +550,12 @@ impl Sink for Outputs {
         false
     }
 
-    fn publish(&mut self, event: &Event, values: &BTreeMap<String, String>) {
+    fn publish(
+        &mut self,
+        event: &Event,
+        values: &BTreeMap<String, String>,
+        prompt: Option<&Prompt>,
+    ) {
         let wire = WireEvent::new(event, values);
         let (Event::Started(request) | Event::Updated(request) | Event::Ended { request, .. }) =
             event;
@@ -573,9 +578,16 @@ impl Sink for Outputs {
         if let Some(ipc) = &self.ipc {
             ipc.publish(&wire);
         }
-        for hook_event in self.requests.map(event) {
+        let hook_events = self.requests.map(event);
+        for &hook_event in &hook_events {
             self.hooks.fire(hook_event, values);
         }
+        let prompt = prompt.map(|prompt| PromptText {
+            title: &prompt.title,
+            body: &prompt.body,
+            state: prompt.state,
+        });
+        self.hooks.request(request.id, &hook_events, values, prompt);
     }
 
     fn resync(&mut self, active: &[(Event, BTreeMap<String, String>)]) {
