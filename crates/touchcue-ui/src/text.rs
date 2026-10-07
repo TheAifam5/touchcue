@@ -1,7 +1,6 @@
 //! Prompt text shared by the popup and notification backends.
 
-use touchcue_core::text::sanitize;
-use touchcue_core::{EndReason, RequestState};
+use touchcue_core::text::{outcome_body, sanitize};
 
 use crate::{Command, Prompt};
 
@@ -25,20 +24,10 @@ pub(crate) fn sanitize_command(cmd: Command) -> Command {
     }
 }
 
-/// Returns the body with the outcome of a cancelled, failed or timed-out request appended.
+/// Returns the body as shown, with the outcome of a cancelled, failed or
+/// timed-out request appended; see [`outcome_body`].
 pub(crate) fn display_body(prompt: &Prompt) -> String {
-    let suffix = match prompt.state {
-        RequestState::Lingering(EndReason::Cancelled | EndReason::Failed) => "(cancelled)",
-        RequestState::Lingering(EndReason::TimedOut) => "(timed out)",
-        RequestState::Waiting | RequestState::Lingering(EndReason::Touched) => {
-            return prompt.body.clone();
-        }
-    };
-    if prompt.body.is_empty() {
-        suffix.to_owned()
-    } else {
-        format!("{} {suffix}", prompt.body)
-    }
+    outcome_body(&prompt.body, prompt.state)
 }
 
 /// Escapes `&`, `<` and `>` for a notification server that parses body markup.
@@ -111,6 +100,8 @@ pub(crate) fn wrap(
 
 #[cfg(test)]
 mod tests {
+    use touchcue_core::{EndReason, RequestState};
+
     use super::*;
 
     fn prompt(body: &str, state: RequestState) -> Prompt {
