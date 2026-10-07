@@ -7,7 +7,7 @@
 | `touchcue` | The `touchcue` binary: CLI, daemon loop, `check`, `gpg install`, the scdaemon wrapper and `askpass`. |
 | `touchcue-core` | Domain model, request state machine, CTAPHID and Assuan parsing, template engine and configuration, with no OS dependencies. |
 | `touchcue-detect` | Sources of touch requests: the Linux hidraw watcher for FIDO keys. |
-| `touchcue-appinfo` | Resolves a process id to an application name, id and icon. |
+| `touchcue-appinfo` | Resolves a process id to an application name, id and icon, and to the requester among its ancestors. |
 | `touchcue-ui` | Popup and notification backends. |
 | `touchcue-ipc` | JSON event socket, compatible socket, D-Bus service, the helper socket for gpg and askpass reports, and gpg-agent queries. |
 | `touchcue-hooks` | Runs the `[[hooks]]` commands on events, without a shell, in their own process groups. |
@@ -36,3 +36,13 @@ Tracking per channel ID keeps the prompt steady: frames from other channels do n
 ## OpenPGP detection
 
 gpg-agent runs touchcue as its `scdaemon-program`. The wrapper starts the real scdaemon and watches the Assuan commands. A `PKSIGN`, `PKDECRYPT` or `PKAUTH` that gets no reply for 400 ms is reported as waiting for a touch. The daemon reports it only when the card's touch policy (UIF) for that key requires a touch, or is unknown. See [gpg and ssh](./guide/gpg).
+
+## Attribution
+
+For a FIDO request, the daemon scans `/proc` for the processes holding the device node open; for an OpenPGP request, for the processes connected to gpg-agent's sockets. The first of them is the client, `process`. From the client, one walk up its parent processes, at most 32, finds:
+
+- the application, `app`: the nearest process in a systemd application unit, else the nearest whose executable matches a desktop entry;
+- the requester, `requester`: walking from the application down to the client, the first process not on the skip list of shells, multiplexers, wrappers and service managers, and neither running the application's executable nor owned by another user;
+- the chain, `process.chain`: the names from the client up to the application.
+
+Each process's start time is read during the walk and checked again after its names are read, so a pid reused in between ends the walk. See [Placeholders](./guide/placeholders#requester) for the rules and their limits.

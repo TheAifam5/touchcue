@@ -8,7 +8,7 @@ Shows who is waiting for your security key touch.
 
 ## What it does
 
-touchcue is a daemon and CLI. When a hardware authenticator waits for a physical touch, it shows a popup that does not take focus, centred by default, on the monitors you choose, or a desktop notification. An optional modal mode dims the screen and blocks clicks until you touch the key or dismiss the prompt. The prompt names the requesting application and the device, using templates you define with placeholders. Other programs, such as status bars, can follow requests over a JSON socket, D-Bus, or the socket protocol of yubikey-touch-detector. Hooks run your own commands on events, for example to play a sound when a request starts.
+touchcue is a daemon and CLI. When a hardware authenticator waits for a physical touch, it shows a popup that does not take focus, centred by default, on the monitors you choose, or a desktop notification. An optional modal mode dims the screen and blocks clicks until you touch the key or dismiss the prompt. The prompt names the program that asked for the touch, such as the browser or the tool that ran `git`, and the device, using templates you define with placeholders. Other programs, such as status bars, can follow requests over a JSON socket, D-Bus, or the socket protocol of yubikey-touch-detector. Hooks run your own commands on events, for example to play a sound when a request starts.
 
 ## touchcue and yubikey-touch-detector
 
@@ -22,7 +22,7 @@ touchcue is a daemon and CLI. When a hardware authenticator waits for a physical
 | HMAC/OTP | planned | yes |
 | Shows the requesting application | yes, name and icon | no |
 | Output | own popup on Wayland and X11 (placement, monitor choice, optional modal dim), or desktop notifications | desktop notifications |
-| Message templates | placeholders for app, process, device and request | `{{.Reasons}}` |
+| Message templates | placeholders for app, requester, process, device and request | `{{.Reasons}}` |
 | Integration | JSON socket, D-Bus, the yubikey-touch-detector socket, and command hooks | yubikey-touch-detector socket, stdout |
 | Packages | GitHub releases, mise | Arch Linux, Nix flake, GitHub releases, `go install` |
 
@@ -69,7 +69,7 @@ See [Getting started](https://touchcue.theaifam5.cc/guide/getting-started#instal
 ## Quick start
 
 ```sh
-touchcue check        # configuration, desktop, devices, IPC and gpg setup
+touchcue check        # configuration, desktop, devices, IPC, gpg setup and requester
 touchcue run -v       # run the daemon in the foreground
 touchcue gpg install  # optional: detect gpg and ssh through gpg-agent
 ```

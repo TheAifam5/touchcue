@@ -46,7 +46,7 @@ A command gets touchcue's own environment, so `PATH`, `WAYLAND_DISPLAY` and `DBU
 - `TOUCHCUE_EVENT` is the event name, such as `started`.
 - Each [placeholder](./placeholders) that touchcue publishes becomes a variable named `TOUCHCUE_` followed by the placeholder name in upper case with dots replaced by underscores. For example, `app.name` is `TOUCHCUE_APP_NAME` and `request.state` is `TOUCHCUE_REQUEST_STATE`.
 
-The published placeholders are the same as on the [event socket](./configuration#ipc): every `request.*` value, `device.vendor`, `device.model`, `device.product`, `device.kind`, `device.transport`, `device.vid`, `device.pid`, `app.name`, `app.id`, `app.icon`, `app.container` and `process.name`. Executable paths, pids, uids and command lines are never passed.
+The published placeholders are the same as on the [event socket](./configuration#ipc): every `request.*` value, `device.vendor`, `device.model`, `device.product`, `device.kind`, `device.transport`, `device.vid`, `device.pid`, `app.name`, `app.id`, `app.icon`, `app.container`, `process.name`, `process.chain`, `requester.name` and `requester.label`. Executable paths, pids, uids and command lines are never passed.
 
 A value that is not known is not set. Control and invisible characters in a value are replaced by spaces, runs of whitespace become one space, and a value is cut after 1024 characters. A value can start with `-`, so pass `--` before it to programs that parse options. Device events set only the `device.*` variables, and `daemon_started` and `daemon_stopping` set only `TOUCHCUE_EVENT`.
 

@@ -28,7 +28,7 @@ safety_timeout_s = 60
 
 [templates]
 title = 'Touch {device.vendor|"your security key"}'
-body = '{app.name|process.name|"An application"} is waiting for {request.method}'
+body = '{requester.label|process.name|"An application"} is waiting for {request.method}'
 
 [sources.fido]
 enabled = true
@@ -46,6 +46,16 @@ enabled = true
 
 [compat.maxbaz_socket]
 enabled = false
+
+[requester]
+skip = [
+  "sh", "bash", "dash", "zsh", "fish", "nu", "ksh", "mksh", "tcsh", "csh", "elvish", "xonsh",
+  "tmux*", "screen", "zellij", "herdr", "abduco", "dtach",
+  "timeout", "nice", "nohup", "setsid", "stdbuf", "time", "xargs", "flock", "ionice", "chrt",
+  "taskset", "env", "sudo", "doas", "su", "run0",
+  "systemd", "init",
+]
+extend_skip = []
 ```
 
 ## `[output]`
@@ -112,7 +122,9 @@ On X11 the overlay is an input-only window that blocks clicks without dimming, s
 | Key | Default |
 | --- | --- |
 | `title` | `Touch {device.vendor\|"your security key"}` |
-| `body` | `{app.name\|process.name\|"An application"} is waiting for {request.method}` |
+| `body` | `{requester.label\|process.name\|"An application"} is waiting for {request.method}` |
+
+The default body names the requester and its application through [`requester.label`](./placeholders#requester): `claude in Kitty is waiting for openpgp`, or `Firefox is waiting for fido2` when the application asks itself.
 
 Templates use [placeholders](./placeholders). A request that ended without a touch keeps its prompt briefly, with `(cancelled)` or `(timed out)` appended to the body.
 
@@ -178,6 +190,22 @@ concurrency = 4
 
 Turns on the helper socket `$XDG_RUNTIME_DIR/touchcue/helper.sock`, through which [the gpg-agent wrapper](./gpg) and [`touchcue askpass`](./ssh-askpass) report operations.
 
+## `[requester]`
+
+| Key | Values | Default |
+| --- | --- | --- |
+| `skip` | list of process names | shells, multiplexers, wrappers and service managers, as in the example above |
+| `extend_skip` | list of process names | `[]` |
+
+These lists name the processes passed over when looking for the [requester](./placeholders#requester). `skip` replaces the built-in list, and `skip = []` passes over nothing; `extend_skip` adds names to `skip` or to the built-in list. To also pass over the editor whose terminal you work in:
+
+```toml
+[requester]
+extend_skip = ["nvim"]
+```
+
+An entry is a name, compared exactly and case-sensitively with the process's `comm`, or with its executable's file name when `comm` cannot be read, or a prefix ending in `*`, such as `tmux*`. The kernel cuts `comm` to 15 bytes, so match longer names with a prefix. An invalid entry is reported with its location in the file. `touchcue check` prints the effective list; copy the list after `skip =` into the configuration to start from it.
+
 ## IPC
 
 | Section | Key | Default |
@@ -192,6 +220,6 @@ All endpoints need `XDG_RUNTIME_DIR`. They only send; clients cannot change anyt
 - **D-Bus**, from `[dbus]`: the session bus name `io.github.theaifam5.Touchcue`, object `/io/github/theaifam5/Touchcue`, interface `io.github.theaifam5.Touchcue1`. It has the property `Active`, the method `ActiveRequests`, and the signals `RequestStarted`, `RequestUpdated` and `RequestEnded`.
 - **Compatible socket**, `$XDG_RUNTIME_DIR/yubikey-touch-detector.socket`, from `[compat.maxbaz_socket]`. It sends the 5-byte messages of yubikey-touch-detector: `U2F_1`/`U2F_0` for FIDO, `GPG_1`/`GPG_0` for gpg and ssh, and `MAC_1`/`MAC_0`. Only requests that still wait for a touch count.
 
-`values` holds only these placeholders: every `request.*` key, `device.vendor`, `device.model`, `device.product`, `device.kind`, `device.transport`, `device.vid`, `device.pid`, `app.name`, `app.id`, `app.icon`, `app.container` and `process.name`. Executable paths, pids, uids and command lines are never published.
+`values` holds only these placeholders: every `request.*` key, `device.vendor`, `device.model`, `device.product`, `device.kind`, `device.transport`, `device.vid`, `device.pid`, `app.name`, `app.id`, `app.icon`, `app.container`, `process.name`, `process.chain`, `requester.name` and `requester.label`. Executable paths, pids, uids and command lines are never published. `process.chain` and `requester.*` do expose the names of the client's parent processes, such as the shell and tools that ran it, to every client of the socket and the bus name.
 
 A second `touchcue run` exits while the event socket or the bus name is in use.

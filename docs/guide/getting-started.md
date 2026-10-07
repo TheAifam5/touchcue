@@ -6,7 +6,7 @@ touchcue works on Linux only. Release archives for Windows and macOS exist but d
 
 ## What it does
 
-When a hardware authenticator waits for a physical touch, touchcue shows a popup that takes no input focus, or a desktop notification. The prompt names the requesting application and the device. It detects:
+When a hardware authenticator waits for a physical touch, touchcue shows a popup that takes no input focus, or a desktop notification. The prompt names the program that asked for the touch, such as the browser or the tool that ran `git`, and the device. It detects:
 
 - FIDO2/U2F keys of any vendor, read from their hidraw devices;
 - OpenPGP cards used through gpg-agent, by `gpg` and by ssh through gpg-agent's ssh support. This needs [`touchcue gpg install`](./gpg).
@@ -60,7 +60,14 @@ This installs `touchcue` into `~/.cargo/bin`. Contributors can use `mise run bui
 touchcue check
 ```
 
-It prints whether the configuration is valid, whether a Wayland compositor, Wayland layer-shell and a notification service are available, every FIDO device and whether touchcue can read it, the output backend `touchcue run` would choose, the IPC endpoints, the gpg setup, and the number of hooks. It exits with status 1 when the configuration is invalid or a FIDO device cannot be read.
+It prints whether the configuration is valid, whether a Wayland compositor, Wayland layer-shell and a notification service are available, every FIDO device and whether touchcue can read it, the output backend `touchcue run` would choose, the IPC endpoints, the gpg setup, the number of hooks, and the requester skip list. Its last line shows how touchcue reads the terminal it runs in, with skipped processes in brackets:
+
+```text
+requester: skip = ["sh", "bash", …, "systemd", "init"] (defaults)
+requester: here: touchcue ← [nu] ← [herdr] ← [herdr] ← [nu] ← kitty → "touchcue in kitty"
+```
+
+It exits with status 1 when the configuration is invalid or a FIDO device cannot be read.
 
 `touchcue list-devices` lists the connected FIDO devices. `touchcue trace` prints the detection signals until interrupted, which helps when a touch is not detected.
 

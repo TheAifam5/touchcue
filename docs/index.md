@@ -15,7 +15,7 @@ hero:
 
 features:
   - title: Names the requester
-    details: The prompt shows the requesting application's name and icon and the device that is waiting.
+    details: The prompt names the program that asked, such as the tool that ran git rather than git itself, with its application's icon and the device that is waiting.
   - title: Does not steal focus
     details: A popup on Wayland (layer-shell) or X11 that takes no input focus, with desktop notifications as the fallback.
   - title: Where you look
