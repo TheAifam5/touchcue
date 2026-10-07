@@ -264,6 +264,9 @@ pub struct Rule {
     pub matches: BTreeMap<String, String>,
     pub title: Option<String>,
     pub body: Option<String>,
+    /// An absolute path, a path starting with `~/` without `..` components,
+    /// or an icon theme name without `/`; non-empty and free of control
+    /// characters.
     pub icon: Option<String>,
     /// Shows nothing for matching requests.
     pub suppress: bool,
@@ -487,6 +490,14 @@ pub struct Compat {
     pub maxbaz_socket: Toggle,
 }
 
+/// The `[icons]` section.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Icons {
+    /// Icon theme looked up before hicolor; `None` detects the desktop's
+    /// theme. A name without `/`, non-empty and free of control characters.
+    pub theme: Option<String>,
+}
+
 /// The `[requester]` section.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RequesterConfig {
@@ -590,6 +601,30 @@ pub enum ConfigError {
         #[label("here")]
         span: Option<SourceSpan>,
     },
+    #[error("`{field}` is not an icon path or name")]
+    #[diagnostic(
+        code(touchcue::config::invalid_icon),
+        help(
+            "write an absolute path, a path starting with `~/`, or an icon theme name, such as `utilities-terminal`"
+        )
+    )]
+    InvalidIcon {
+        field: String,
+        #[label("here")]
+        span: Option<SourceSpan>,
+    },
+    #[error("`{field}` is not an icon theme name")]
+    #[diagnostic(
+        code(touchcue::config::invalid_icon_theme),
+        help(
+            "write the directory name of an installed icon theme, such as `Papirus-Dark`, or remove the key to detect the desktop's theme"
+        )
+    )]
+    InvalidIconTheme {
+        field: String,
+        #[label("here")]
+        span: Option<SourceSpan>,
+    },
     #[error("`{field}` applies only to a hook with `until`")]
     #[diagnostic(
         code(touchcue::config::needs_until),
@@ -634,6 +669,8 @@ impl ConfigError {
             Self::Toml { span, .. }
             | Self::EmptyHookField { span, .. }
             | Self::InvalidPattern { span, .. }
+            | Self::InvalidIcon { span, .. }
+            | Self::InvalidIconTheme { span, .. }
             | Self::NeedsUntil { span, .. }
             | Self::NotWithUntil { span, .. }
             | Self::UntilEvents { span, .. } => span.map(range),
@@ -653,6 +690,8 @@ impl ConfigError {
             Self::Toml { span, .. }
             | Self::EmptyHookField { span, .. }
             | Self::InvalidPattern { span, .. }
+            | Self::InvalidIcon { span, .. }
+            | Self::InvalidIconTheme { span, .. }
             | Self::NeedsUntil { span, .. }
             | Self::NotWithUntil { span, .. }
             | Self::UntilEvents { span, .. } => span.map(range),
@@ -687,6 +726,7 @@ pub struct Config {
     pub dbus: Dbus,
     pub compat: Compat,
     pub requester: RequesterConfig,
+    pub icons: Icons,
     /// `[[hooks]]` entries in configuration order.
     pub hooks: Vec<Hook>,
     templates: Templates,
@@ -716,6 +756,13 @@ struct RawConfig {
     dbus: Dbus,
     compat: Compat,
     requester: RawRequester,
+    icons: RawIcons,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RawIcons {
+    theme: Option<Spanned<String>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -739,7 +786,7 @@ struct RawRule {
     matches: BTreeMap<String, String>,
     title: Option<Spanned<String>>,
     body: Option<Spanned<String>>,
-    icon: Option<String>,
+    icon: Option<Spanned<String>>,
     suppress: bool,
 }
 
@@ -778,6 +825,7 @@ impl Default for Config {
             dbus: Dbus::default(),
             compat: Compat::default(),
             requester: RequesterConfig::default(),
+            icons: Icons::default(),
             hooks: Vec::new(),
             templates: Templates::default(),
             title: template::default_title(),
@@ -800,8 +848,13 @@ impl Config {
     /// a hook without events or program, [`ConfigError::NeedsUntil`],
     /// [`ConfigError::NotWithUntil`] and [`ConfigError::UntilEvents`] for a
     /// hook option that does not fit its `until`, [`ConfigError::OutOfRange`]
-    /// for a number outside its documented range, and
-    /// [`ConfigError::InvalidPattern`] for a malformed skip entry.
+    /// for a number outside its documented range,
+    /// [`ConfigError::InvalidPattern`] for a malformed skip entry,
+    /// [`ConfigError::InvalidIcon`] for a rule icon that is empty, holds
+    /// control characters, is a relative path, or is a `~/` path that leaves
+    /// the home directory, and
+    /// [`ConfigError::InvalidIconTheme`] for an `icons.theme` that cannot
+    /// name a theme directory.
     pub fn from_toml(s: &str) -> Result<Self, ConfigError> {
         let raw: RawConfig = toml::from_str(s).map_err(|e| ConfigError::Toml {
             message: e.message().to_owned(),
@@ -830,6 +883,7 @@ impl Config {
             MAX_MS / 1000,
         )?;
         let requester = compile_requester(raw.requester)?;
+        let icons = compile_icons(raw.icons)?;
 
         let (title_src, title) = compile(s, raw.templates.title, DEFAULT_TITLE, "templates.title")?;
         let (body_src, body) = compile(s, raw.templates.body, DEFAULT_BODY, "templates.body")?;
@@ -855,6 +909,7 @@ impl Config {
             dbus: raw.dbus,
             compat: raw.compat,
             requester,
+            icons,
             hooks,
             templates: Templates {
                 title: title_src,
@@ -1180,6 +1235,45 @@ fn compile_hook(index: usize, mut raw: RawHook) -> Result<Hook, ConfigError> {
     })
 }
 
+/// Returns the `[icons]` section, or [`ConfigError::InvalidIconTheme`] for
+/// a theme that is empty, `.` or `..`, or holds `/` or control characters.
+fn compile_icons(raw: RawIcons) -> Result<Icons, ConfigError> {
+    let theme = match raw.theme {
+        Some(theme) => {
+            let name = theme.get_ref();
+            if name.is_empty()
+                || name == "."
+                || name == ".."
+                || name.contains('/')
+                || name.chars().any(char::is_control)
+            {
+                return Err(ConfigError::InvalidIconTheme {
+                    field: "icons.theme".to_owned(),
+                    span: Some(theme.span().into()),
+                });
+            }
+            Some(theme.into_inner())
+        }
+        None => None,
+    };
+    Ok(Icons { theme })
+}
+
+/// Returns whether `icon` is a usable rule icon: non-empty, free of control
+/// characters, and either a path starting with `/`, a path starting with
+/// `~/` that stays inside the home directory, or a name without `/`.
+///
+/// Whether the file or theme icon exists is not checked.
+fn is_icon(icon: &str) -> bool {
+    if icon.is_empty() || icon.chars().any(char::is_control) {
+        return false;
+    }
+    match icon.strip_prefix("~/") {
+        Some(rest) => !rest.starts_with('/') && !rest.split('/').any(|part| part == ".."),
+        None => !icon.contains('/') || icon.starts_with('/'),
+    }
+}
+
 fn compile_rule(toml: &str, index: usize, raw: RawRule) -> Result<CompiledRule, ConfigError> {
     if raw.matches.is_empty() {
         return Err(ConfigError::EmptyMatch { index });
@@ -1187,12 +1281,21 @@ fn compile_rule(toml: &str, index: usize, raw: RawRule) -> Result<CompiledRule, 
     check_match_keys(format!("rules[{index}].match"), &raw.matches)?;
     let (title_src, title) = compile_optional(toml, raw.title, &format!("rules[{index}].title"))?;
     let (body_src, body) = compile_optional(toml, raw.body, &format!("rules[{index}].body"))?;
+    let icon = match raw.icon {
+        Some(icon) if !is_icon(icon.get_ref()) => {
+            return Err(ConfigError::InvalidIcon {
+                field: format!("rules[{index}].icon"),
+                span: Some(icon.span().into()),
+            });
+        }
+        icon => icon.map(Spanned::into_inner),
+    };
     Ok(CompiledRule {
         rule: Rule {
             matches: raw.matches,
             title: title_src,
             body: body_src,
-            icon: raw.icon,
+            icon,
             suppress: raw.suppress,
         },
         title,
@@ -1684,6 +1787,69 @@ mod tests {
         assert!(cfg.rendered(&values(&[("app.id", "QUIET")])).is_some());
         assert!(cfg.rendered(&values(&[])).is_some());
         assert_eq!(cfg.rules().count(), 4);
+        Ok(())
+    }
+
+    #[test]
+    fn rule_icons_are_paths_or_names() -> TestResult {
+        for icon in [
+            "/usr/share/icons/key.svg",
+            "~/icons/key.png",
+            "utilities-terminal",
+        ] {
+            let cfg = Config::from_toml(&format!(
+                "[[rules]]\nmatch = {{ \"app.id\" = \"a\" }}\nicon = \"{icon}\"\n"
+            ))?;
+            let rule = cfg.rules().next().ok_or("no rule")?;
+            assert_eq!(rule.icon.as_deref(), Some(icon));
+        }
+        for (src, text) in [
+            (
+                "[[rules]]\nmatch = { \"app.id\" = \"a\" }\nicon = \"icons/key.png\"\n",
+                "\"icons/key.png\"",
+            ),
+            (
+                "[[rules]]\nmatch = { \"app.id\" = \"a\" }\nicon = \"\"\n",
+                "\"\"",
+            ),
+            (
+                "[[rules]]\nmatch = { \"app.id\" = \"a\" }\nicon = \"~/a/../../x.png\"\n",
+                "\"~/a/../../x.png\"",
+            ),
+            (
+                "[[rules]]\nmatch = { \"app.id\" = \"a\" }\nicon = \"~//etc/x.png\"\n",
+                "\"~//etc/x.png\"",
+            ),
+            (
+                "[[rules]]\nmatch = { \"app.id\" = \"a\" }\nicon = \"key\\n\"\n",
+                "\"key\\n\"",
+            ),
+        ] {
+            let error = rejected(src)?;
+            assert!(matches!(
+                &error,
+                ConfigError::InvalidIcon { field, .. } if field == "rules[0].icon"
+            ));
+            assert_eq!(error.label_span().and_then(|s| src.get(s)), Some(text));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn icon_theme_is_a_directory_name() -> TestResult {
+        assert_eq!(Config::from_toml("")?.icons.theme, None);
+        let cfg = Config::from_toml("[icons]\ntheme = \"Papirus-Dark\"\n")?;
+        assert_eq!(cfg.icons.theme.as_deref(), Some("Papirus-Dark"));
+        for (src, text) in [
+            ("[icons]\ntheme = \"\"\n", "\"\""),
+            ("[icons]\ntheme = \"..\"\n", "\"..\""),
+            ("[icons]\ntheme = \"a/b\"\n", "\"a/b\""),
+            ("[icons]\ntheme = \"a\\tb\"\n", "\"a\\tb\""),
+        ] {
+            let error = rejected(src)?;
+            assert!(matches!(&error, ConfigError::InvalidIconTheme { .. }));
+            assert_eq!(error.label_span().and_then(|s| src.get(s)), Some(text));
+        }
         Ok(())
     }
 
