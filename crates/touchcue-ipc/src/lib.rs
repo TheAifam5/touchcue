@@ -23,7 +23,8 @@
 //!
 //! Events carry only allowlisted placeholder values: `request.*`,
 //! `device.{vendor,model,product,kind,transport,vid,pid}`,
-//! `app.{name,id,icon,container}` and `process.name`. The icon path in
+//! `app.{name,id,icon,container}`, `process.{name,chain}` and
+//! `requester.{name,label}`. The icon path in
 //! `app.icon` is the only path published; executable paths, uids, pids and
 //! command lines never leave the daemon.
 //!

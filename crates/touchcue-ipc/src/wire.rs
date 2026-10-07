@@ -28,7 +28,8 @@ pub struct WireEvent {
     pub source: String,
     /// Allowlisted placeholder values: `request.*`,
     /// `device.{vendor,model,product,kind,transport,vid,pid}`,
-    /// `app.{name,id,icon,container}` and `process.name`.
+    /// `app.{name,id,icon,container}`, `process.{name,chain}` and
+    /// `requester.{name,label}`.
     pub values: BTreeMap<String, String>,
 }
 
