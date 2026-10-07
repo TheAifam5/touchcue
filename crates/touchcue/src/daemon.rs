@@ -25,6 +25,13 @@ const BODY_MAX: usize = 400;
 pub const ATTRIBUTION_TIMEOUT: Duration = Duration::from_secs(1);
 /// Shortest interval between two logged skipped attributions.
 const BUSY_WARN_INTERVAL: Duration = Duration::from_secs(10);
+/// Longest wait for finding the file of a rule icon. A lookup not done in
+/// time yields the application's icon.
+pub const ICON_TIMEOUT: Duration = Duration::from_millis(500);
+/// Shortest interval between two logged unresolved rule icons.
+const ICON_WARN_INTERVAL: Duration = Duration::from_secs(60);
+/// Longest rule icon text recorded in logs, in chars.
+const LOGGED_ICON_MAX: usize = 256;
 /// Process names never attributed as a gpg-agent client: the agent, its
 /// card daemon and touchcue's own `scdaemon` wrapper.
 const AGENT_SIDE: &[&str] = &["gpg-agent", "scdaemon", "touchcue"];
@@ -72,9 +79,13 @@ pub trait Sink {
     fn resync(&mut self, active: &[(Event, BTreeMap<String, String>)]);
 }
 
-/// Source of the client processes and application of a request.
+/// Source of the client processes and application of a request, and of
+/// the files of rule icons.
 pub trait Attribute {
     async fn attribute(&mut self, request: &Request) -> Attribution;
+    /// Returns the file of a rule's `icon`, an absolute path, a `~/` path or
+    /// an icon name; `None` when none is found.
+    async fn icon(&mut self, icon: &str) -> Option<String>;
 }
 
 /// Client processes of a request and what they resolved to.
@@ -127,7 +138,8 @@ type Scan = fn(&Resolver, &Target) -> Attribution;
 ///
 /// A scan that exceeds [`ATTRIBUTION_TIMEOUT`] is abandoned and keeps its
 /// blocking thread until it finishes; until then, further requests are not
-/// attributed and have no holders.
+/// attributed and have no holders. Rule icons are looked up the same way,
+/// one at a time within [`ICON_TIMEOUT`].
 pub struct SystemAttribution {
     resolver: Arc<Resolver>,
     /// gpg-agent's sockets, for `OpenPGP` requests.
@@ -137,6 +149,9 @@ pub struct SystemAttribution {
     /// Held by the one running scan.
     busy: Arc<Semaphore>,
     busy_limit: RateLimit,
+    /// Held by the one running rule icon lookup.
+    icon_busy: Arc<Semaphore>,
+    icon_limit: RateLimit,
 }
 
 impl SystemAttribution {
@@ -158,6 +173,8 @@ impl SystemAttribution {
             timeout,
             busy: Arc::new(Semaphore::new(1)),
             busy_limit: RateLimit::new(BUSY_WARN_INTERVAL),
+            icon_busy: Arc::new(Semaphore::new(1)),
+            icon_limit: RateLimit::new(ICON_WARN_INTERVAL),
         }
     }
 
@@ -182,6 +199,36 @@ impl SystemAttribution {
         let now = tokio::time::Instant::now().into_std();
         self.busy_limit.log(now, |suppressed| {
             tracing::warn!(suppressed, "attribution busy; skipping it");
+        });
+    }
+
+    /// Logs a rule icon without a file at most once per [`ICON_WARN_INTERVAL`],
+    /// naming an icon name but recording a path at debug level only.
+    fn warn_icon(&mut self, icon: &str, reason: &'static str) {
+        let path = icon.starts_with('/') || icon.starts_with("~/");
+        if path {
+            tracing::debug!(
+                path = sanitize(icon, LOGGED_ICON_MAX).as_deref(),
+                reason,
+                "rule icon file not usable"
+            );
+        }
+        let now = tokio::time::Instant::now().into_std();
+        self.icon_limit.log(now, |suppressed| {
+            if path {
+                tracing::warn!(
+                    reason,
+                    suppressed,
+                    "rule icon file not usable; using the application icon"
+                );
+            } else {
+                tracing::warn!(
+                    icon = sanitize(icon, LOGGED_ICON_MAX).as_deref(),
+                    reason,
+                    suppressed,
+                    "rule icon not found; using the application icon"
+                );
+            }
         });
     }
 }
@@ -233,6 +280,52 @@ impl Attribute for SystemAttribution {
                 Attribution::default()
             }
         }
+    }
+
+    #[tracing::instrument(level = "debug", skip_all)]
+    async fn icon(&mut self, icon: &str) -> Option<String> {
+        let permit = match Arc::clone(&self.icon_busy).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(TryAcquireError::NoPermits) => {
+                self.warn_icon(icon, "busy");
+                return None;
+            }
+            Err(error @ TryAcquireError::Closed) => {
+                tracing::error!(
+                    error = &error as &dyn std::error::Error,
+                    "icon lookup permits closed"
+                );
+                return None;
+            }
+        };
+        let resolver = Arc::clone(&self.resolver);
+        let owned = icon.to_owned();
+        let span = tracing::Span::current();
+        let task = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            span.in_scope(|| resolver.icons().resolve_config(&owned))
+        });
+        let reason = match tokio::time::timeout(ICON_TIMEOUT, task).await {
+            Ok(Ok(Some(file))) => return Some(file),
+            Ok(Ok(None)) => "not found",
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    error = &error as &dyn std::error::Error,
+                    "icon lookup failed"
+                );
+                "failed"
+            }
+            Err(error) => {
+                tracing::debug!(
+                    error = &error as &dyn std::error::Error,
+                    timeout_ms = millis(ICON_TIMEOUT),
+                    "icon lookup timed out"
+                );
+                "timed out"
+            }
+        };
+        self.warn_icon(icon, reason);
+        None
     }
 }
 
@@ -592,7 +685,14 @@ impl<A: Attribute, S: Sink> Daemon<A, S> {
         let Some(cached) = self.cache.get_mut(&request.id) else {
             return;
         };
-        let (values, prompt) = render(&self.config, request, &cached.attribution, now);
+        let (values, prompt) = render(
+            &self.config,
+            request,
+            &cached.attribution,
+            now,
+            &mut self.attribute,
+        )
+        .await;
         let published = prompt.clone();
         match (prompt, cached.shown) {
             (Some(prompt), false) => {
@@ -631,31 +731,40 @@ fn values(
 /// the prompt when a rule suppresses it.
 ///
 /// Title and body are sanitized and capped at 120 and 400 chars. The icon is
-/// the matching rule's icon, else the application's icon.
+/// the file `icons` finds for the matching rule's icon, else the
+/// application's icon.
 #[tracing::instrument(
     level = "debug",
     skip_all,
     fields(id = %request.id, state = request.state.as_str())
 )]
-pub fn render(
+pub async fn render(
     config: &Config,
     request: &Request,
     attribution: &Attribution,
     now: Instant,
+    icons: &mut impl Attribute,
 ) -> (BTreeMap<String, String>, Option<Prompt>) {
     let values = values(request, Some(attribution), now);
-    let prompt = config.rendered(&values).map(|rendered| Prompt {
+    let Some(rendered) = config.rendered(&values) else {
+        tracing::debug!(suppressed = true, "rendered prompt");
+        return (values, None);
+    };
+    let rule_icon = match rendered.icon.as_deref() {
+        Some(icon) => icons.icon(icon).await,
+        None => None,
+    };
+    let prompt = Prompt {
         id: request.id,
         title: sanitize(&rendered.title, TITLE_MAX).unwrap_or_default(),
         body: sanitize(&rendered.body, BODY_MAX).unwrap_or_default(),
-        icon: rendered
-            .icon
+        icon: rule_icon
             .or_else(|| attribution.app.as_ref().and_then(|app| app.icon.clone()))
             .map(PathBuf::from),
         state: request.state,
-    });
-    tracing::debug!(suppressed = prompt.is_none(), "rendered prompt");
-    (values, prompt)
+    };
+    tracing::debug!(suppressed = false, "rendered prompt");
+    (values, Some(prompt))
 }
 
 #[cfg(test)]
@@ -666,6 +775,8 @@ mod tests {
         Device, DeviceId, DeviceKind, MachineConfig, Method, Outcome, RequestState, SignalClass,
         SignalKind, Source, Transport,
     };
+
+    use touchcue_appinfo::linux::icon::IconLookup;
 
     use super::*;
 
@@ -834,6 +945,11 @@ mod tests {
             self.0 = self.0.saturating_add(1);
             std::future::ready(firefox())
         }
+
+        /// Finds only the icon named `fixture-icon`.
+        fn icon(&mut self, icon: &str) -> impl Future<Output = Option<String>> {
+            std::future::ready((icon == "fixture-icon").then(|| "/icons/fixture.svg".to_owned()))
+        }
     }
 
     fn daemon(toml: &str) -> Result<Daemon<Fixed, Recorder>, TestError> {
@@ -845,14 +961,16 @@ mod tests {
         ))
     }
 
-    #[test]
-    fn render_sanitizes_and_prefers_app_icon() -> TestResult {
+    #[tokio::test]
+    async fn render_sanitizes_and_prefers_app_icon() -> TestResult {
         let (values, prompt) = render(
             &Config::default(),
             &request(RequestState::Waiting),
             &firefox(),
             Instant::now(),
-        );
+            &mut Fixed::default(),
+        )
+        .await;
         assert_eq!(
             values.get("request.confidence").map(String::as_str),
             Some("high")
@@ -864,8 +982,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn render_caps_title_and_body() -> TestResult {
+    #[tokio::test]
+    async fn render_caps_title_and_body() -> TestResult {
         let long = "x".repeat(500);
         let config = Config::from_toml(&format!(
             "[templates]\ntitle = \"{long}\"\nbody = \"{long}\"\n"
@@ -875,17 +993,20 @@ mod tests {
             &request(RequestState::Waiting),
             &firefox(),
             Instant::now(),
-        );
+            &mut Fixed::default(),
+        )
+        .await;
         let prompt = prompt.ok_or(TestError::NoPrompt)?;
         assert_eq!(prompt.title.chars().count(), TITLE_MAX);
         assert_eq!(prompt.body.chars().count(), BODY_MAX);
         Ok(())
     }
 
-    #[test]
-    fn rule_icon_precedes_app_icon_and_suppress_hides() -> TestResult {
+    #[tokio::test]
+    async fn rule_icon_precedes_app_icon_and_suppress_hides() -> TestResult {
         let config = Config::from_toml(
-            "[[rules]]\nmatch = { \"request.state\" = \"waiting\" }\nicon = \"/rule.png\"\n\
+            "[[rules]]\nmatch = { \"request.state\" = \"waiting\" }\nicon = \"fixture-icon\"\n\
+             [[rules]]\nmatch = { \"request.state\" = \"touched\" }\nicon = \"missing\"\n\
              [[rules]]\nmatch = { \"request.state\" = \"cancelled\" }\nsuppress = true\n",
         )?;
         let (_, waiting) = render(
@@ -893,26 +1014,49 @@ mod tests {
             &request(RequestState::Waiting),
             &firefox(),
             Instant::now(),
-        );
+            &mut Fixed::default(),
+        )
+        .await;
         assert_eq!(
             waiting.ok_or(TestError::NoPrompt)?.icon,
-            Some(PathBuf::from("/rule.png"))
+            Some(PathBuf::from("/icons/fixture.svg"))
+        );
+        let (_, touched) = render(
+            &config,
+            &request(RequestState::Lingering(touchcue_core::EndReason::Touched)),
+            &firefox(),
+            Instant::now(),
+            &mut Fixed::default(),
+        )
+        .await;
+        assert_eq!(
+            touched.ok_or(TestError::NoPrompt)?.icon,
+            Some(PathBuf::from("/icons/firefox.png"))
         );
         let cancelled = RequestState::Lingering(touchcue_core::EndReason::Cancelled);
-        let (values, suppressed) = render(&config, &request(cancelled), &firefox(), Instant::now());
+        let (values, suppressed) = render(
+            &config,
+            &request(cancelled),
+            &firefox(),
+            Instant::now(),
+            &mut Fixed::default(),
+        )
+        .await;
         assert_eq!(suppressed, None);
         assert!(values.contains_key("app.name"));
         Ok(())
     }
 
-    #[test]
-    fn render_without_holder_has_low_confidence() -> TestResult {
+    #[tokio::test]
+    async fn render_without_holder_has_low_confidence() -> TestResult {
         let (values, prompt) = render(
             &Config::default(),
             &request(RequestState::Waiting),
             &Attribution::default(),
             Instant::now(),
-        );
+            &mut Fixed::default(),
+        )
+        .await;
         assert_eq!(
             values.get("request.confidence").map(String::as_str),
             Some("low")
@@ -923,8 +1067,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn render_names_the_requester_in_the_app() -> TestResult {
+    #[tokio::test]
+    async fn render_names_the_requester_in_the_app() -> TestResult {
         let attribution = Attribution {
             requester: Some(Requester {
                 name: Some("claude".to_owned()),
@@ -939,7 +1083,9 @@ mod tests {
             &request(RequestState::Waiting),
             &attribution,
             Instant::now(),
-        );
+            &mut Fixed::default(),
+        )
+        .await;
         assert_eq!(
             prompt.ok_or(TestError::NoPrompt)?.body,
             "claude in Firefox is waiting for fido2"
@@ -1003,8 +1149,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn client_in_an_application_unit_is_named_in_the_application() -> TestResult {
+    #[tokio::test]
+    async fn client_in_an_application_unit_is_named_in_the_application() -> TestResult {
         let dir = tempfile::tempdir()?;
         let proc_root = dir.path().join("proc");
         let node = Path::new("/dev/touchcue-test-hidraw");
@@ -1033,7 +1179,9 @@ mod tests {
             &request(RequestState::Waiting),
             &attribution,
             Instant::now(),
-        );
+            &mut Fixed::default(),
+        )
+        .await;
         assert_eq!(
             values.get("requester.label").map(String::as_str),
             Some("ykman in Kitty")
@@ -1196,6 +1344,39 @@ mod tests {
             Ok(()) => true,
             Err(_elapsed) => false,
         }
+    }
+
+    #[tokio::test]
+    async fn rule_icon_names_are_found_in_the_icon_theme() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let share = dir.path().join("share");
+        let theme = share.join("icons/Fixture");
+        std::fs::create_dir_all(theme.join("apps"))?;
+        std::fs::write(
+            theme.join("index.theme"),
+            "[Icon Theme]\nName=Fixture\nDirectories=apps\n[apps]\nSize=64\nType=Fixed\n",
+        )?;
+        let file = theme.join("apps/touchcue-fixture.svg");
+        std::fs::write(&file, b"<svg/>")?;
+        let icons = IconLookup::new(vec![share.join("icons")], None, "Fixture".to_owned(), 64);
+        let resolver =
+            Resolver::new(PathBuf::from("/nonexistent"), Vec::new(), 64).with_icons(icons);
+        let mut attribution = SystemAttribution::new(resolver, None);
+        let config = Config::from_toml(
+            "[[rules]]\nmatch = { \"request.state\" = \"waiting\" }\nicon = \"touchcue-fixture\"\n",
+        )?;
+        let (_, prompt) = render(
+            &config,
+            &request(RequestState::Waiting),
+            &firefox(),
+            Instant::now(),
+            &mut attribution,
+        )
+        .await;
+        assert_eq!(prompt.ok_or(TestError::NoPrompt)?.icon, Some(file));
+        assert_eq!(attribution.icon("touchcue-missing").await, None);
+        assert_eq!(attribution.icon("/nonexistent/touchcue.png").await, None);
+        Ok(())
     }
 
     #[tokio::test]

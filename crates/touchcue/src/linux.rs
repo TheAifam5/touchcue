@@ -29,6 +29,7 @@ use touchcue_ui::{Command, Prompt, Ui, UiConfig, UiError};
 
 use crate::check::backend_name;
 use crate::daemon::{Attribute, Daemon, Sink, SystemAttribution};
+use crate::icons;
 
 /// sysfs mount point.
 pub const SYS_ROOT: &str = "/sys";
@@ -154,6 +155,22 @@ fn now() -> Instant {
     tokio::time::Instant::now().into_std()
 }
 
+/// Returns the resolver of application and rule icons in the detected icon
+/// theme, or `None` when a stop signal arrives first.
+async fn resolver(config: &Config, signals: &mut StopSignals) -> Option<Resolver> {
+    let resolver = Resolver::system().with_skip(config.requester.skip_list());
+    let lookup = resolver.icons().clone();
+    tokio::select! {
+        name = signals.recv() => {
+            tracing::info!(signal = name, "stopping during startup");
+            None
+        }
+        (_, icons) = icons::detect_system(config.icons.theme.as_deref(), lookup) => {
+            Some(resolver.with_icons(icons))
+        }
+    }
+}
+
 /// Runs the daemon until SIGINT or SIGTERM.
 ///
 /// Hooks get `daemon_started` once everything started. Shutdown stops the
@@ -175,6 +192,9 @@ fn now() -> Instant {
 pub async fn run(config: Config) -> Result<(), Error> {
     let mut signals = StopSignals::register()?;
     let root = CancellationToken::new();
+    let Some(resolver) = resolver(&config, &mut signals).await else {
+        return Ok(());
+    };
     let fido = &config.sources.fido;
     let machine = Machine::new(MachineConfig {
         keepalive_timeout: Duration::from_millis(fido.keepalive_timeout_ms),
@@ -258,10 +278,7 @@ pub async fn run(config: Config) -> Result<(), Error> {
     let sender = hooks.sender();
     sender.fire(HookEvent::DaemonStarted, &BTreeMap::new());
 
-    let attribution = SystemAttribution::new(
-        Resolver::system().with_skip(config.requester.skip_list()),
-        agent,
-    );
+    let attribution = SystemAttribution::new(resolver, agent);
     let mut daemon = Daemon::new(machine, config, attribution, outputs);
     let ended = event_loop(&mut daemon, rx, notices, devices, &sender, &mut signals).await;
     sender.fire(HookEvent::DaemonStopping, &BTreeMap::new());

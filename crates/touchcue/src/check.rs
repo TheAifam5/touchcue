@@ -24,9 +24,9 @@ pub enum Error {
 
 /// Prints the configuration status, desktop capabilities, FIDO devices, the
 /// UI backend `run` would choose, the configured IPC endpoints and the gpg
-/// setup, the number of hooks and of hooks with `until`, and the requester
-/// skip list with how it reads this process, and returns whether touchcue
-/// is usable.
+/// setup, the number of hooks and of hooks with `until`, the requester skip
+/// list with how it reads this process, and the icon theme `run` would
+/// choose, and returns whether touchcue is usable.
 ///
 /// Usable means the configuration is valid and every FIDO device found can
 /// be opened. No device present still counts as usable, since devices plugged
@@ -114,6 +114,7 @@ fn report(
             gpg(out, config.sources.gpg.enabled, runtime)?;
             writeln!(out, "{}", hooks_line(&config.hooks))?;
             requester(out, &config.requester)?;
+            icons(out, config.icons.theme.as_deref(), runtime)?;
         }
         None => writeln!(out, "backend: unknown, the configuration did not load")?,
     }
@@ -347,6 +348,29 @@ fn here_line(origin: Option<&Origin>) -> String {
         Some(label) => format!("{} → \"{label}\"", walk.join(" ← ")),
         None => format!("{} → no requester", walk.join(" ← ")),
     }
+}
+
+/// Prints the icon theme `run` would choose and where it came from.
+#[cfg(target_os = "linux")]
+#[tracing::instrument(skip_all, err)]
+fn icons(out: &mut impl Write, config: Option<&str>, runtime: &Runtime) -> Result<(), Error> {
+    use touchcue_appinfo::linux::Resolver;
+
+    let lookup = Resolver::system().icons().clone();
+    let (theme, _) = runtime.block_on(crate::icons::detect_system(config, lookup));
+    writeln!(
+        out,
+        "icons: theme = {} ({})",
+        toml_string(&theme.name),
+        theme.source.as_str()
+    )?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn icons(out: &mut impl Write, _config: Option<&str>, _runtime: &Runtime) -> Result<(), Error> {
+    writeln!(out, "icons: not supported on this platform yet")?;
+    Ok(())
 }
 
 #[cfg(not(target_os = "linux"))]

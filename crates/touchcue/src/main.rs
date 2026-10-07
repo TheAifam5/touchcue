@@ -22,6 +22,8 @@ mod config;
 #[cfg(target_os = "linux")]
 mod daemon;
 #[cfg(target_os = "linux")]
+mod icons;
+#[cfg(target_os = "linux")]
 mod linux;
 
 /// File name under which touchcue runs as OpenSSH's `SSH_ASKPASS` program.
