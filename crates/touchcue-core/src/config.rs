@@ -11,6 +11,7 @@ use serde::Deserialize;
 use toml::Spanned;
 
 use crate::placeholders::KNOWN;
+use crate::skip::{self, SkipList};
 use crate::template::{self, Template, TemplateError};
 
 const DEFAULT_TITLE: &str = "Touch {device.vendor|\"your security key\"}";
@@ -26,7 +27,7 @@ const MAX_HOOK_CONCURRENCY: u64 = 32;
 /// sent every third of it, so a smaller value would make them spin.
 const MIN_KEEPALIVE_MS: u64 = 100;
 const DEFAULT_BODY: &str =
-    "{app.name|process.name|\"An application\"} is waiting for {request.method}";
+    "{requester.label|process.name|\"An application\"} is waiting for {request.method}";
 
 /// Where touch prompts are shown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
@@ -423,6 +424,24 @@ pub struct Compat {
     pub maxbaz_socket: Toggle,
 }
 
+/// The `[requester]` section.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RequesterConfig {
+    /// Process names to skip in place of [`skip::DEFAULT_SKIP`], in its
+    /// pattern form; `None` keeps the defaults.
+    pub skip: Option<Vec<String>>,
+    /// Process names to skip in addition to `skip` or the defaults.
+    pub extend_skip: Vec<String>,
+}
+
+impl RequesterConfig {
+    /// Returns the effective skip list.
+    #[must_use]
+    pub fn skip_list(&self) -> SkipList {
+        SkipList::new(self.skip.as_deref(), &self.extend_skip)
+    }
+}
+
 /// A feature switch that is off by default.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -498,6 +517,16 @@ pub enum ConfigError {
         min: u64,
         max: u64,
     },
+    #[error("`{field}` is not a process name pattern")]
+    #[diagnostic(
+        code(touchcue::config::invalid_pattern),
+        help("write a process name, such as `mise`, or a prefix ending in `*`, such as `git-*`")
+    )]
+    InvalidPattern {
+        field: String,
+        #[label("here")]
+        span: Option<SourceSpan>,
+    },
 }
 
 impl ConfigError {
@@ -505,7 +534,9 @@ impl ConfigError {
     #[must_use]
     pub fn span(&self) -> Option<Range<usize>> {
         match self {
-            Self::Toml { span, .. } | Self::EmptyHookField { span, .. } => span.map(range),
+            Self::Toml { span, .. }
+            | Self::EmptyHookField { span, .. }
+            | Self::InvalidPattern { span, .. } => span.map(range),
             Self::Template { span, .. } => span.clone(),
             Self::UnknownMatchKey { .. } | Self::EmptyMatch { .. } | Self::OutOfRange { .. } => {
                 None
@@ -514,12 +545,14 @@ impl ConfigError {
     }
 
     /// Returns the byte range in the TOML source that the diagnostic label
-    /// points at: the TOML error's span, the empty hook list, or the
-    /// offending template bytes.
+    /// points at: the TOML error's span, the empty hook list, the invalid
+    /// skip entry, or the offending template bytes.
     #[must_use]
     pub fn label_span(&self) -> Option<Range<usize>> {
         match self {
-            Self::Toml { span, .. } | Self::EmptyHookField { span, .. } => span.map(range),
+            Self::Toml { span, .. }
+            | Self::EmptyHookField { span, .. }
+            | Self::InvalidPattern { span, .. } => span.map(range),
             Self::Template { label, .. } => label.map(range),
             Self::UnknownMatchKey { .. } | Self::EmptyMatch { .. } | Self::OutOfRange { .. } => {
                 None
@@ -550,6 +583,7 @@ pub struct Config {
     pub ipc: Ipc,
     pub dbus: Dbus,
     pub compat: Compat,
+    pub requester: RequesterConfig,
     /// `[[hooks]]` entries in configuration order.
     pub hooks: Vec<Hook>,
     templates: Templates,
@@ -578,6 +612,14 @@ struct RawConfig {
     ipc: Ipc,
     dbus: Dbus,
     compat: Compat,
+    requester: RawRequester,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RawRequester {
+    skip: Option<Vec<Spanned<String>>>,
+    extend_skip: Vec<Spanned<String>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -632,6 +674,7 @@ impl Default for Config {
             ipc: Ipc::default(),
             dbus: Dbus::default(),
             compat: Compat::default(),
+            requester: RequesterConfig::default(),
             hooks: Vec::new(),
             templates: Templates::default(),
             title: template::default_title(),
@@ -651,8 +694,9 @@ impl Config {
     /// parse, [`ConfigError::UnknownMatchKey`] for a rule matching a key
     /// or hook matching a key outside [`KNOWN`], [`ConfigError::EmptyMatch`]
     /// for a rule without match entries, [`ConfigError::EmptyHookField`] for
-    /// a hook without events or program, and [`ConfigError::OutOfRange`] for
-    /// a number outside its documented range.
+    /// a hook without events or program, [`ConfigError::OutOfRange`] for
+    /// a number outside its documented range, and
+    /// [`ConfigError::InvalidPattern`] for a malformed skip entry.
     pub fn from_toml(s: &str) -> Result<Self, ConfigError> {
         let raw: RawConfig = toml::from_str(s).map_err(|e| ConfigError::Toml {
             message: e.message().to_owned(),
@@ -680,6 +724,7 @@ impl Config {
             0,
             MAX_MS / 1000,
         )?;
+        let requester = compile_requester(raw.requester)?;
 
         let (title_src, title) = compile(s, raw.templates.title, DEFAULT_TITLE, "templates.title")?;
         let (body_src, body) = compile(s, raw.templates.body, DEFAULT_BODY, "templates.body")?;
@@ -704,6 +749,7 @@ impl Config {
             ipc: raw.ipc,
             dbus: raw.dbus,
             compat: raw.compat,
+            requester,
             hooks,
             templates: Templates {
                 title: title_src,
@@ -872,6 +918,35 @@ fn non_empty<T>(field: String, value: Option<Spanned<Vec<T>>>) -> Result<Vec<T>,
     }
 }
 
+/// Returns the `[requester]` section, or [`ConfigError::InvalidPattern`]
+/// for the first entry that is not a skip pattern.
+fn compile_requester(raw: RawRequester) -> Result<RequesterConfig, ConfigError> {
+    let skip = raw
+        .skip
+        .map(|entries| patterns("requester.skip", entries))
+        .transpose()?;
+    let extend_skip = patterns("requester.extend_skip", raw.extend_skip)?;
+    Ok(RequesterConfig { skip, extend_skip })
+}
+
+/// Returns the texts of `entries` of list `field`, each checked by [`skip::is_pattern`].
+fn patterns(field: &str, entries: Vec<Spanned<String>>) -> Result<Vec<String>, ConfigError> {
+    entries
+        .into_iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            if skip::is_pattern(entry.get_ref()) {
+                Ok(entry.into_inner())
+            } else {
+                Err(ConfigError::InvalidPattern {
+                    field: format!("{field}[{index}]"),
+                    span: Some(entry.span().into()),
+                })
+            }
+        })
+        .collect()
+}
+
 fn compile_hook(index: usize, raw: RawHook) -> Result<Hook, ConfigError> {
     let on = non_empty(format!("hooks[{index}].on"), raw.on)?;
     let command_span = raw.command.as_ref().map(Spanned::span);
@@ -985,6 +1060,88 @@ mod tests {
         assert_eq!(rendered.title, "Touch your security key");
         assert_eq!(rendered.body, "An application is waiting for fido2");
         assert_eq!(rendered.icon, None);
+        Ok(())
+    }
+
+    #[test]
+    fn default_body_names_label_then_process() {
+        let cfg = Config::default();
+        let body = |pairs: &[(&str, &str)]| {
+            let mut all = vec![("request.method", "openpgp")];
+            all.extend_from_slice(pairs);
+            cfg.rendered(&values(&all)).map(|rendered| rendered.body)
+        };
+        let claude = [
+            ("requester.label", "claude in Kitty"),
+            ("process.name", "gpg"),
+        ];
+        assert_eq!(
+            body(&claude).as_deref(),
+            Some("claude in Kitty is waiting for openpgp")
+        );
+        let firefox = [("requester.label", "Firefox"), ("process.name", "firefox")];
+        assert_eq!(
+            body(&firefox).as_deref(),
+            Some("Firefox is waiting for openpgp")
+        );
+        let unnamed = [("process.name", "gpg")];
+        assert_eq!(
+            body(&unnamed).as_deref(),
+            Some("gpg is waiting for openpgp")
+        );
+    }
+
+    #[test]
+    fn requester_skip_replaces_and_extends() -> TestResult {
+        let defaults = Config::default().requester.skip_list();
+        assert!(defaults.skips("bash") && !defaults.skips("nvim"));
+
+        let extended = Config::from_toml("[requester]\nextend_skip = [\"nvim\", \"just-*\"]\n")?;
+        assert_eq!(extended.requester.skip, None);
+        let list = extended.requester.skip_list();
+        assert!(list.skips("nvim") && list.skips("just-x") && list.skips("bash"));
+
+        let replaced =
+            Config::from_toml("[requester]\nskip = [\"make\"]\nextend_skip = [\"nvim\"]\n")?;
+        let list = replaced.requester.skip_list();
+        assert!(list.skips("make") && list.skips("nvim") && !list.skips("bash"));
+
+        let empty = Config::from_toml("[requester]\nskip = []\n")?;
+        assert_eq!(empty.requester.skip, Some(Vec::new()));
+        assert!(!empty.requester.skip_list().skips("bash"));
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_skip_entries_are_located() -> TestResult {
+        for (src, field, span, text) in [
+            (
+                "[requester]\nskip = [\"ok\", \"a*b\"]\n",
+                "requester.skip[1]",
+                26..31,
+                "\"a*b\"",
+            ),
+            (
+                "[requester]\nextend_skip = [\"\"]\n",
+                "requester.extend_skip[0]",
+                27..29,
+                "\"\"",
+            ),
+        ] {
+            let error = rejected(src)?;
+            assert_eq!(
+                error,
+                ConfigError::InvalidPattern {
+                    field: field.to_owned(),
+                    span: Some(span.into()),
+                }
+            );
+            assert_eq!(error.label_span().and_then(|s| src.get(s)), Some(text));
+        }
+        assert!(matches!(
+            rejected("[attribution]\nplumbing = []\n")?,
+            ConfigError::Toml { .. }
+        ));
         Ok(())
     }
 

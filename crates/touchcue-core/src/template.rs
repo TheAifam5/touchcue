@@ -147,12 +147,12 @@ pub(crate) fn default_title() -> Template {
 }
 
 /// Returns the parsed form of
-/// `{app.name|process.name|"An application"} is waiting for {request.method}`.
+/// `{requester.label|process.name|"An application"} is waiting for {request.method}`.
 pub(crate) fn default_body() -> Template {
     Template {
         segments: vec![
             Segment::Slot(vec![
-                Choice::Key("app.name".to_owned()),
+                Choice::Key("requester.label".to_owned()),
                 Choice::Key("process.name".to_owned()),
                 Choice::Literal("An application".to_owned()),
             ]),

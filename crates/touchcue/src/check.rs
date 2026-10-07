@@ -5,6 +5,11 @@ use std::io::{self, IsTerminal as _, Write};
 use std::path::Path;
 
 use tokio::runtime::Runtime;
+#[cfg(target_os = "linux")]
+use touchcue_appinfo::linux::Origin;
+use touchcue_core::config::RequesterConfig;
+#[cfg(target_os = "linux")]
+use touchcue_core::skip::SkipList;
 use touchcue_ui::Backend;
 
 use crate::config::{self, ConfigPath};
@@ -18,7 +23,8 @@ pub enum Error {
 
 /// Prints the configuration status, desktop capabilities, FIDO devices, the
 /// UI backend `run` would choose, the configured IPC endpoints and the gpg
-/// setup and the number of hooks, and returns whether touchcue is usable.
+/// setup, the number of hooks and the requester skip list with how it reads
+/// this process, and returns whether touchcue is usable.
 ///
 /// Usable means the configuration is valid and every FIDO device found can
 /// be opened. No device present still counts as usable, since devices plugged
@@ -105,6 +111,7 @@ fn report(
             )?;
             gpg(out, config.sources.gpg.enabled, runtime)?;
             writeln!(out, "hooks: {}", config.hooks.len())?;
+            requester(out, &config.requester)?;
         }
         None => writeln!(out, "backend: unknown, the configuration did not load")?,
     }
@@ -267,6 +274,85 @@ fn executable(path: &Path) -> io::Result<bool> {
     Ok(meta.is_file() && meta.permissions().mode() & 0o111 != 0)
 }
 
+/// Prints the effective requester skip list as a TOML line, and how the
+/// requester of this process reads: its walk with skipped names in brackets
+/// and the resulting `requester.label`.
+#[cfg(target_os = "linux")]
+#[tracing::instrument(skip_all, err)]
+fn requester(out: &mut impl Write, config: &RequesterConfig) -> Result<(), Error> {
+    use touchcue_appinfo::linux::{Resolver, procfs};
+
+    let list = config.skip_list();
+    writeln!(out, "requester: {}", skip_line(config, &list))?;
+    let pid = std::process::id();
+    let origin = procfs::start_time(Path::new("/proc"), pid)
+        .and_then(|start| Resolver::system().with_skip(list).origin(pid, start));
+    writeln!(out, "requester: here: {}", here_line(origin.as_ref()))?;
+    Ok(())
+}
+
+/// Returns `skip = [...]` listing `list`, followed by where it comes from.
+#[cfg(target_os = "linux")]
+fn skip_line(config: &RequesterConfig, list: &SkipList) -> String {
+    let entries: Vec<String> = list.patterns().iter().map(|p| toml_string(p)).collect();
+    let source = match (&config.skip, config.extend_skip.len()) {
+        (None, 0) => "defaults".to_owned(),
+        (None, added) => format!("defaults + {added} from extend_skip"),
+        (Some(_), 0) => "replaced".to_owned(),
+        (Some(_), added) => format!("replaced + {added} from extend_skip"),
+    };
+    format!("skip = [{}] ({source})", entries.join(", "))
+}
+
+/// Returns `text` as a TOML basic string.
+#[cfg(target_os = "linux")]
+fn toml_string(text: &str) -> String {
+    let body: String = text
+        .chars()
+        .map(|c| match c {
+            '"' => "\\\"".to_owned(),
+            '\\' => "\\\\".to_owned(),
+            c if c.is_control() => format!("\\u{:04X}", u32::from(c)),
+            c => c.to_string(),
+        })
+        .collect();
+    format!("\"{body}\"")
+}
+
+/// Returns the walk of `origin`, client first, with skipped names in
+/// brackets, then the requester label it yields.
+#[cfg(target_os = "linux")]
+fn here_line(origin: Option<&Origin>) -> String {
+    let Some(origin) = origin else {
+        return "unknown, this process cannot be read".to_owned();
+    };
+    let walk: Vec<String> = origin
+        .walk
+        .iter()
+        .map(|step| {
+            if step.skipped {
+                format!("[{}]", step.name)
+            } else {
+                step.name.clone()
+            }
+        })
+        .collect();
+    let label = touchcue_core::placeholders::requester_label(
+        origin.requester.as_ref().and_then(|r| r.name.as_deref()),
+        origin.app.as_ref().and_then(|a| a.name.as_deref()),
+    );
+    match label {
+        Some(label) => format!("{} → \"{label}\"", walk.join(" ← ")),
+        None => format!("{} → no requester", walk.join(" ← ")),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn requester(out: &mut impl Write, _config: &RequesterConfig) -> Result<(), Error> {
+    writeln!(out, "requester: not supported on this platform yet")?;
+    Ok(())
+}
+
 #[cfg(not(target_os = "linux"))]
 fn gpg(out: &mut impl Write, _enabled: bool, _runtime: &Runtime) -> Result<(), Error> {
     writeln!(out, "gpg: not supported on this platform yet")?;
@@ -330,6 +416,83 @@ mod tests {
         std::fs::remove_file(&program)?;
         assert!(scdaemon_status(Some(&conf)).contains("cannot be found"));
         Ok(())
+    }
+
+    #[test]
+    fn skip_line_is_toml_and_names_its_source() -> Result<(), touchcue_core::ConfigError> {
+        let config = touchcue_core::Config::from_toml(
+            "[requester]\nskip = [\"make\", \"a\\\"b\"]\nextend_skip = [\"nvim\"]\n",
+        )?;
+        let requester = &config.requester;
+        assert_eq!(
+            skip_line(requester, &requester.skip_list()),
+            r#"skip = ["make", "a\"b", "nvim"] (replaced + 1 from extend_skip)"#
+        );
+        let defaults = RequesterConfig::default();
+        let line = skip_line(&defaults, &defaults.skip_list());
+        assert!(line.starts_with("skip = [\"sh\", \"bash\""), "{line}");
+        assert!(line.ends_with("\"init\"] (defaults)"), "{line}");
+        let extended = RequesterConfig {
+            skip: None,
+            extend_skip: vec!["nvim".to_owned(), "x".to_owned()],
+        };
+        let line = skip_line(&extended, &extended.skip_list());
+        assert!(
+            line.ends_with("\"nvim\", \"x\"] (defaults + 2 from extend_skip)"),
+            "{line}"
+        );
+        let empty = RequesterConfig {
+            skip: Some(Vec::new()),
+            extend_skip: Vec::new(),
+        };
+        assert_eq!(
+            skip_line(&empty, &empty.skip_list()),
+            "skip = [] (replaced)"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn here_line_brackets_skipped_processes() {
+        use touchcue_appinfo::linux::Step;
+        use touchcue_core::{AppInfo, Requester};
+
+        let step = |name: &str, skipped| Step {
+            name: name.to_owned(),
+            skipped,
+        };
+        let origin = Origin {
+            app: Some(AppInfo {
+                name: Some("kitty".to_owned()),
+                ..AppInfo::default()
+            }),
+            requester: Some(Requester {
+                name: Some("touchcue".to_owned()),
+                exe: None,
+                pid: 9,
+            }),
+            chain: None,
+            walk: vec![
+                step("touchcue", false),
+                step("nu", true),
+                step("herdr", true),
+                step("kitty", false),
+            ],
+        };
+        assert_eq!(
+            here_line(Some(&origin)),
+            "touchcue ← [nu] ← [herdr] ← kitty → \"touchcue in kitty\""
+        );
+        let none = Origin {
+            app: None,
+            requester: None,
+            ..origin
+        };
+        assert_eq!(
+            here_line(Some(&none)),
+            "touchcue ← [nu] ← [herdr] ← kitty → no requester"
+        );
+        assert_eq!(here_line(None), "unknown, this process cannot be read");
     }
 
     #[test]

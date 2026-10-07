@@ -23,6 +23,11 @@ pub const KNOWN: &[&str] = &[
     "process.pid",
     "process.cmdline",
     "process.uid",
+    "process.chain",
+    "requester.name",
+    "requester.exe",
+    "requester.pid",
+    "requester.label",
     "device.vendor",
     "device.model",
     "device.product",
@@ -44,7 +49,7 @@ pub const KNOWN: &[&str] = &[
 /// Keys published outside the daemon besides every `request.*` key.
 /// `app.icon` is the only path among them; executable paths, uids, pids and
 /// command lines stay in the daemon.
-pub const PUBLISHED: [&str; 12] = [
+pub const PUBLISHED: [&str; 15] = [
     "device.vendor",
     "device.model",
     "device.product",
@@ -57,6 +62,9 @@ pub const PUBLISHED: [&str; 12] = [
     "app.icon",
     "app.container",
     "process.name",
+    "process.chain",
+    "requester.name",
+    "requester.label",
 ];
 
 /// Returns whether the value of `key` may leave the daemon: every
@@ -89,12 +97,23 @@ pub struct ProcessInfo {
     pub uid: Option<u32>,
 }
 
+/// Process a request is attributed to as its requester: the program started
+/// inside the application that led to the request, as chosen by
+/// [`skip::requester`](crate::skip::requester).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Requester {
+    pub name: Option<String>,
+    pub exe: Option<PathBuf>,
+    pub pid: u32,
+}
+
 /// How reliably a request is attributed to its application.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Confidence {
     High,
     /// The client is inferred from processes connected to an agent, not
-    /// from the device itself.
+    /// from the device itself, or is one of several processes holding the
+    /// device.
     Medium,
     Low,
 }
@@ -116,7 +135,9 @@ const DETAIL_MAX: usize = 200;
 
 /// Returns the placeholder values for a request, keyed by entries of [`KNOWN`].
 ///
-/// Absent values are omitted. `request.detail` is sanitized and capped at
+/// Absent values are omitted. `chain` is the value of `process.chain`, and
+/// `requester.label` is composed from `requester.name` and `app.name`.
+/// `request.detail` is sanitized and capped at
 /// 200 chars. `device.vid` and `device.pid` are four-digit
 /// lowercase hex, `request.elapsed` is whole seconds since the request
 /// started, or 0 when `now` is earlier, and `request.state` is
@@ -126,6 +147,8 @@ pub fn values(
     request: &Request,
     app: Option<&AppInfo>,
     process: Option<&ProcessInfo>,
+    requester: Option<&Requester>,
+    chain: Option<&str>,
     confidence: Confidence,
     now: Instant,
 ) -> BTreeMap<String, String> {
@@ -156,6 +179,22 @@ pub fn values(
         put("process.cmdline", process.cmdline.clone());
         put("process.uid", process.uid.map(|u| u.to_string()));
     }
+    put("process.chain", chain.map(str::to_owned));
+    if let Some(requester) = requester {
+        put("requester.name", requester.name.clone());
+        put(
+            "requester.exe",
+            requester.exe.as_ref().map(|p| p.display().to_string()),
+        );
+        put("requester.pid", Some(requester.pid.to_string()));
+    }
+    put(
+        "requester.label",
+        requester_label(
+            requester.and_then(|r| r.name.as_deref()),
+            app.and_then(|a| a.name.as_deref()),
+        ),
+    );
 
     put("request.method", Some(request.method.as_str().to_owned()));
     put("request.op", request.op.map(|op| op.as_str().to_owned()));
@@ -174,6 +213,26 @@ pub fn values(
             .and_then(|detail| sanitize(detail, DETAIL_MAX)),
     );
     out
+}
+
+/// Longest `requester.label`, in chars: two 128-char names and ` in `.
+const LABEL_MAX: usize = 260;
+
+/// Returns `requester.label`: `<requester> in <app>` when both names are
+/// present and differ other than in ASCII case, else whichever is present,
+/// preferring the application's; capped at 260 chars.
+#[must_use]
+pub fn requester_label(requester: Option<&str>, app: Option<&str>) -> Option<String> {
+    let requester = requester.filter(|name| !name.is_empty());
+    let app = app.filter(|name| !name.is_empty());
+    let label = match (requester, app) {
+        (Some(requester), Some(app)) if !requester.eq_ignore_ascii_case(app) => {
+            format!("{requester} in {app}")
+        }
+        (_, Some(name)) | (Some(name), None) => name.to_owned(),
+        (None, None) => return None,
+    };
+    Some(label.chars().take(LABEL_MAX).collect())
 }
 
 /// Returns the `device.*` placeholder values of `device`, formatted as in
@@ -244,6 +303,8 @@ mod tests {
             &request(base),
             None,
             None,
+            None,
+            None,
             Confidence::Low,
             base + Duration::from_millis(2999),
         );
@@ -260,10 +321,11 @@ mod tests {
         assert_eq!(get(&v, "request.confidence"), Some("low"));
         assert_eq!(get(&v, "request.state"), Some("waiting"));
         assert_eq!(get(&v, "device.model"), None);
-        assert!(
-            !v.keys()
-                .any(|k| k.starts_with("app.") || k.starts_with("process."))
-        );
+        assert!(!v.keys().any(|k| {
+            ["app.", "process.", "requester."]
+                .iter()
+                .any(|p| k.starts_with(p))
+        }));
         assert!(v.keys().all(|k| KNOWN.contains(&k.as_str())));
     }
 
@@ -287,6 +349,8 @@ mod tests {
             &request(base),
             Some(&app),
             Some(&process),
+            None,
+            None,
             Confidence::High,
             base,
         );
@@ -302,10 +366,105 @@ mod tests {
     }
 
     #[test]
+    fn includes_requester_and_chain() {
+        let base = Instant::now();
+        let requester = Requester {
+            name: Some("claude".to_owned()),
+            exe: Some(PathBuf::from("/opt/claude/claude")),
+            pid: 12,
+        };
+        let chain = "gpg ← bash ← claude";
+        let v = values(
+            &request(base),
+            None,
+            None,
+            Some(&requester),
+            Some(chain),
+            Confidence::Medium,
+            base,
+        );
+        assert_eq!(get(&v, "requester.name"), Some("claude"));
+        assert_eq!(get(&v, "requester.exe"), Some("/opt/claude/claude"));
+        assert_eq!(get(&v, "requester.pid"), Some("12"));
+        assert_eq!(get(&v, "process.chain"), Some(chain));
+        assert!(v.keys().all(|k| KNOWN.contains(&k.as_str())));
+        let identity: Vec<&str> = v
+            .keys()
+            .map(String::as_str)
+            .filter(|&k| published(k) && !k.starts_with("request.") && !k.starts_with("device."))
+            .collect();
+        assert_eq!(
+            identity,
+            ["process.chain", "requester.label", "requester.name"]
+        );
+    }
+
+    #[test]
+    fn label_names_requester_in_app() {
+        let base = Instant::now();
+        let app = |name: &str| AppInfo {
+            name: Some(name.to_owned()),
+            ..AppInfo::default()
+        };
+        let requester = |name: &str| Requester {
+            name: Some(name.to_owned()),
+            exe: None,
+            pid: 7,
+        };
+        let label = |app: Option<&AppInfo>, requester: Option<&Requester>| {
+            let v = values(
+                &request(base),
+                app,
+                None,
+                requester,
+                None,
+                Confidence::High,
+                base,
+            );
+            v.get("requester.label").cloned()
+        };
+        let kitty = app("Kitty");
+        let claude = requester("claude");
+        let nu = requester("nu");
+        let firefox = app("Firefox");
+        let backup = requester("backup.sh");
+        assert_eq!(
+            label(Some(&kitty), Some(&claude)).as_deref(),
+            Some("claude in Kitty")
+        );
+        assert_eq!(
+            label(Some(&kitty), Some(&nu)).as_deref(),
+            Some("nu in Kitty")
+        );
+        assert_eq!(label(Some(&firefox), None).as_deref(), Some("Firefox"));
+        assert_eq!(label(None, Some(&backup)).as_deref(), Some("backup.sh"));
+        assert_eq!(label(None, None), None);
+        assert_eq!(
+            label(Some(&firefox), Some(&requester("firefox"))).as_deref(),
+            Some("Firefox")
+        );
+        let long = "x".repeat(128);
+        let bounded = label(Some(&app(&long)), Some(&requester(&"y".repeat(128))))
+            .map(|label| label.chars().count());
+        assert_eq!(bounded, Some(LABEL_MAX));
+        let huge = label(Some(&app(&"x".repeat(400))), Some(&requester("y")))
+            .map(|label| label.chars().count());
+        assert_eq!(huge, Some(LABEL_MAX));
+    }
+
+    #[test]
     fn elapsed_before_start_is_zero() {
         let now = Instant::now();
         let base = now + Duration::from_secs(3);
-        let v = values(&request(base), None, None, Confidence::High, now);
+        let v = values(
+            &request(base),
+            None,
+            None,
+            None,
+            None,
+            Confidence::High,
+            now,
+        );
         assert_eq!(get(&v, "request.elapsed"), Some("0"));
     }
 
@@ -320,7 +479,7 @@ mod tests {
             (RequestState::Lingering(EndReason::TimedOut), "timed_out"),
         ] {
             r.state = state;
-            let v = values(&r, None, None, Confidence::High, base);
+            let v = values(&r, None, None, None, None, Confidence::High, base);
             assert_eq!(get(&v, "request.state"), Some(name));
         }
     }

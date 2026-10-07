@@ -199,8 +199,7 @@ fn holds(proc_root: &Path, pid: u32, target: &Target<'_>) -> bool {
 pub fn process_info(proc_root: &Path, pid: u32) -> Option<ProcessInfo> {
     let dir = pid_dir(proc_root, pid);
     let status = read_bounded(&dir.join("status"), PROC_FILE_MAX)?;
-    let name =
-        read_truncated(&dir.join("comm"), COMM_MAX).and_then(|comm| sanitize(&comm, TEXT_MAX));
+    let name = comm(proc_root, pid);
     let cmdline = read_truncated(&dir.join("cmdline"), CMDLINE_MAX)
         .and_then(|raw| sanitize(&raw, CMDLINE_MAX));
     Some(ProcessInfo {
@@ -220,6 +219,21 @@ pub fn process_info(proc_root: &Path, pid: u32) -> Option<ProcessInfo> {
         cmdline,
         uid: status_field(&status, "Uid:"),
     })
+}
+
+/// Returns the `comm` of `pid` passed through [`sanitize`] with a 128-char
+/// cap, or `None` when it is unreadable or empty.
+#[must_use]
+pub fn comm(proc_root: &Path, pid: u32) -> Option<String> {
+    read_truncated(&pid_dir(proc_root, pid).join("comm"), COMM_MAX)
+        .and_then(|comm| sanitize(&comm, TEXT_MAX))
+}
+
+/// Returns the real uid of `pid` from `status`.
+#[must_use]
+pub fn uid(proc_root: &Path, pid: u32) -> Option<u32> {
+    let status = read_bounded(&pid_dir(proc_root, pid).join("status"), PROC_FILE_MAX)?;
+    status_field(&status, "Uid:")
 }
 
 /// Returns the parent of `pid` from `status`, treating pids 0 and 1 as no parent.

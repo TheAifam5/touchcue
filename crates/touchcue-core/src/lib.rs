@@ -8,6 +8,7 @@ pub mod limit;
 pub mod machine;
 pub mod model;
 pub mod placeholders;
+pub mod skip;
 pub mod template;
 pub mod text;
 
@@ -21,5 +22,5 @@ pub use model::{
     Device, DeviceId, DeviceKind, Method, Op, Outcome, Signal, SignalClass, SignalKind, Source,
     Transport,
 };
-pub use placeholders::{AppInfo, Confidence, ProcessInfo};
+pub use placeholders::{AppInfo, Confidence, ProcessInfo, Requester};
 pub use template::{Template, TemplateError, TemplateErrorKind};

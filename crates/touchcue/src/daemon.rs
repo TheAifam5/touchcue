@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{Semaphore, TryAcquireError};
 use touchcue_appinfo::linux::Resolver;
-use touchcue_core::placeholders::{self, AppInfo, Confidence, ProcessInfo};
+use touchcue_core::placeholders::{self, AppInfo, Confidence, ProcessInfo, Requester};
 use touchcue_core::text::sanitize;
 use touchcue_core::{Config, DeviceKind, Event, Machine, RateLimit, Request, RequestId, Signal};
 use touchcue_ipc::agent::AgentPaths;
@@ -28,6 +28,22 @@ const BUSY_WARN_INTERVAL: Duration = Duration::from_secs(10);
 /// Process names never attributed as a gpg-agent client: the agent, its
 /// card daemon and touchcue's own `scdaemon` wrapper.
 const AGENT_SIDE: &[&str] = &["gpg-agent", "scdaemon", "touchcue"];
+/// Process names of tools that ask gpg-agent for card operations; ranked
+/// before other clients, which may hold an idle connection.
+///
+/// Unlike the requester skip list, which names ancestors passed over, this
+/// lists only programs that connect to gpg-agent's sockets. It is matched
+/// against `comm`, which any process of the same user can set.
+const AGENT_TOOLS: &[&str] = &[
+    "gpg",
+    "gpg2",
+    "gpgsm",
+    "ssh",
+    "scp",
+    "sftp",
+    "ssh-add",
+    "ssh-keygen",
+];
 /// Process name of maximbaz/yubikey-touch-detector, truncated to 15 bytes
 /// as in `comm`; it proxies the agent sockets, so its clients are the
 /// requesters and it is attributed only when no client is found.
@@ -60,6 +76,9 @@ pub struct Attribution {
     pub pids: Vec<u32>,
     pub process: Option<ProcessInfo>,
     pub app: Option<AppInfo>,
+    pub requester: Option<Requester>,
+    /// Value of `process.chain`.
+    pub chain: Option<String>,
     pub confidence: Confidence,
     /// For a device node, its holders and their ancestors, sorted; matched
     /// against askpass notices.
@@ -72,6 +91,8 @@ impl Default for Attribution {
             pids: Vec::new(),
             process: None,
             app: None,
+            requester: None,
+            chain: None,
             confidence: Confidence::Low,
             lineage: Vec::new(),
         }
@@ -81,7 +102,8 @@ impl Default for Attribution {
 /// Where the clients of a request are looked for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Target {
-    /// Processes holding this device node open; high confidence.
+    /// Processes holding this device node open; high confidence for one
+    /// holder, medium for several.
     Node(PathBuf),
     /// Processes connected to these gpg-agent sockets; medium confidence.
     Agent(Vec<PathBuf>),
@@ -207,11 +229,20 @@ impl Attribute for SystemAttribution {
 }
 
 /// Attributes a request to the clients of `target`; the first client
-/// supplies the process and application.
+/// supplies the process, application, requester and chain.
 fn attribute(resolver: &Resolver, target: &Target) -> Attribution {
     let started = Instant::now();
     let (clients, confidence) = match target {
-        Target::Node(node) => (resolver.holders(node), Confidence::High),
+        Target::Node(node) => {
+            let holders = resolver.holders(node);
+            // Several holders leave the client choice ambiguous.
+            let confidence = if holders.len() > 1 {
+                Confidence::Medium
+            } else {
+                Confidence::High
+            };
+            (holders, confidence)
+        }
         Target::Agent(sockets) => agent_clients(resolver, sockets),
         Target::None => (Vec::new(), Confidence::Low),
     };
@@ -228,10 +259,17 @@ fn attribute(resolver: &Resolver, target: &Target) -> Attribution {
     };
     lineage.sort_unstable();
     lineage.dedup();
+    let origin = resolver.origin(pid, start);
+    let (app, requester, chain) = match origin {
+        Some(origin) => (origin.app, origin.requester, origin.chain),
+        None => (None, None, None),
+    };
     let attribution = Attribution {
         pids: clients.iter().map(|&(pid, _)| pid).collect(),
         process: resolver.process(pid, start),
-        app: resolver.app(pid, start),
+        app,
+        requester,
+        chain,
         confidence,
         lineage,
     };
@@ -241,6 +279,10 @@ fn attribute(resolver: &Resolver, target: &Target) -> Attribution {
         clients = attribution.pids.len(),
         confidence = confidence.as_str(),
         process = attribution.process.as_ref().and_then(|p| p.name.as_deref()),
+        requester = attribution
+            .requester
+            .as_ref()
+            .and_then(|r| r.name.as_deref()),
         app_id = app.and_then(|a| a.id.as_deref()),
         app_name = app.and_then(|a| a.name.as_deref()),
         elapsed_ms = millis(started.elapsed()),
@@ -257,8 +299,8 @@ fn millis(duration: Duration) -> u64 {
         .saturating_add(u64::from(duration.subsec_millis()))
 }
 
-/// Returns the processes connected to `sockets`, newest first, without
-/// gpg-agent, scdaemon and touchcue.
+/// Returns the processes connected to `sockets`, without gpg-agent,
+/// scdaemon and touchcue, ranked by [`rank_clients`].
 ///
 /// Clients of the proxy of maximbaz/yubikey-touch-detector are connected to
 /// sockets bound at the same paths, so they are found directly. The proxy
@@ -284,8 +326,8 @@ fn agent_clients(resolver: &Resolver, sockets: &[PathBuf]) -> (Vec<(u32, u64)>, 
             .and_then(|process| process.name);
         match name.as_deref() {
             Some(name) if AGENT_SIDE.contains(&name) => {}
-            Some(PROXY) => proxies.push((pid, start)),
-            _ => clients.push((pid, start)),
+            Some(PROXY) => proxies.push((pid, start, false)),
+            name => clients.push((pid, start, name.is_some_and(|n| AGENT_TOOLS.contains(&n)))),
         }
     }
     tracing::debug!(
@@ -294,16 +336,25 @@ fn agent_clients(resolver: &Resolver, sockets: &[PathBuf]) -> (Vec<(u32, u64)>, 
         proxies = proxies.len(),
         "gpg-agent clients"
     );
-    // The requester is most likely the client started last.
-    let newest_first =
-        |list: &mut Vec<(u32, u64)>| list.sort_by_key(|&(_, start)| std::cmp::Reverse(start));
     if clients.is_empty() {
-        newest_first(&mut proxies);
-        (proxies, Confidence::Low)
+        (rank_clients(proxies), Confidence::Low)
     } else {
-        newest_first(&mut clients);
-        (clients, Confidence::Medium)
+        (rank_clients(clients), Confidence::Medium)
     }
+}
+
+/// Returns the pids and start times of `clients`, each with whether it is
+/// one of [`AGENT_TOOLS`]: tools first, then newest first.
+///
+/// The requester is most likely the client started last, but a program such
+/// as an editor can hold an idle connection open and start after the tool
+/// that asks for the operation.
+fn rank_clients(mut clients: Vec<(u32, u64, bool)>) -> Vec<(u32, u64)> {
+    clients.sort_by_key(|&(_, start, tool)| (std::cmp::Reverse(tool), std::cmp::Reverse(start)));
+    clients
+        .into_iter()
+        .map(|(pid, start, _)| (pid, start))
+        .collect()
 }
 
 #[derive(Debug)]
@@ -560,6 +611,8 @@ fn values(
         request,
         attribution.and_then(|a| a.app.as_ref()),
         attribution.and_then(|a| a.process.as_ref()),
+        attribution.and_then(|a| a.requester.as_ref()),
+        attribution.and_then(|a| a.chain.as_deref()),
         attribution.map_or(Confidence::Low, |a| a.confidence),
         now,
     )
@@ -692,6 +745,8 @@ mod tests {
                 icon: Some("/icons/firefox.png".to_owned()),
                 ..AppInfo::default()
             }),
+            requester: None,
+            chain: Some("firefox".to_owned()),
             confidence: Confidence::High,
             lineage: vec![42, 43, 77],
         }
@@ -848,6 +903,124 @@ mod tests {
         let prompt = prompt.ok_or(TestError::NoPrompt)?;
         assert_eq!(prompt.body, "An application is waiting for fido2");
         assert_eq!(prompt.icon, None);
+        Ok(())
+    }
+
+    #[test]
+    fn render_names_the_requester_in_the_app() -> TestResult {
+        let attribution = Attribution {
+            requester: Some(Requester {
+                name: Some("claude".to_owned()),
+                exe: None,
+                pid: 50,
+            }),
+            chain: Some("gpg ← git ← bash ← claude ← nu ← kitty".to_owned()),
+            ..firefox()
+        };
+        let (values, prompt) = render(
+            &Config::default(),
+            &request(RequestState::Waiting),
+            &attribution,
+            Instant::now(),
+        );
+        assert_eq!(
+            prompt.ok_or(TestError::NoPrompt)?.body,
+            "claude in Firefox is waiting for fido2"
+        );
+        assert_eq!(
+            values.get("process.chain").map(String::as_str),
+            Some("gpg ← git ← bash ← claude ← nu ← kitty")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn tools_rank_before_newer_idle_clients() {
+        let editor = (10, 900, false);
+        let gpg = (11, 500, true);
+        let older_gpg = (12, 400, true);
+        let shell = (13, 100, false);
+        assert_eq!(
+            rank_clients(vec![shell, older_gpg, editor, gpg]),
+            [(11, 500), (12, 400), (10, 900), (13, 100)]
+        );
+    }
+
+    /// Writes a fake procfs process `pid` started at tick `pid` that holds `node` open.
+    fn holder(proc_root: &Path, pid: u32, name: &str, node: &Path) -> std::io::Result<()> {
+        let dir = proc_root.join(pid.to_string());
+        std::fs::create_dir_all(dir.join("fd"))?;
+        std::os::unix::fs::symlink(node, dir.join("fd/3"))?;
+        std::os::unix::fs::symlink(format!("/usr/bin/{name}"), dir.join("exe"))?;
+        std::fs::write(dir.join("comm"), format!("{name}\n"))?;
+        std::fs::write(
+            dir.join("status"),
+            "PPid:\t1\nUid:\t1000\t1000\t1000\t1000\n",
+        )?;
+        std::fs::write(dir.join("cgroup"), "0::/user.slice/session-2.scope\n")?;
+        let middle = vec!["0"; 18].join(" ");
+        std::fs::write(
+            dir.join("stat"),
+            format!("{pid} (x) S {middle} {pid} 0 0\n"),
+        )
+    }
+
+    #[test]
+    fn several_device_holders_lower_confidence() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let node = Path::new("/dev/touchcue-test-hidraw");
+        let target = Target::Node(node.to_owned());
+        holder(dir.path(), 300, "ssh-sk-helper", node)?;
+        let resolver = Resolver::new(dir.path().to_owned(), Vec::new(), 64);
+        let single = attribute(&resolver, &target);
+        assert_eq!(single.confidence, Confidence::High);
+        assert_eq!(single.chain.as_deref(), Some("ssh-sk-helper"));
+        assert_eq!(
+            single.requester.and_then(|r| r.name).as_deref(),
+            Some("ssh-sk-helper")
+        );
+        holder(dir.path(), 301, "pcscd", node)?;
+        let several = attribute(&resolver, &target);
+        assert_eq!(several.pids, [300, 301]);
+        assert_eq!(several.confidence, Confidence::Medium);
+        Ok(())
+    }
+
+    #[test]
+    fn client_in_an_application_unit_is_named_in_the_application() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let proc_root = dir.path().join("proc");
+        let node = Path::new("/dev/touchcue-test-hidraw");
+        let unit = "0::/user.slice/user@1000.service/app.slice/app-kitty-12.scope\n";
+        for (pid, name, parent) in [(402, "ykman", 401), (401, "zsh", 400), (400, "kitty", 1)] {
+            holder(&proc_root, pid, name, node)?;
+            std::fs::write(
+                proc_root.join(pid.to_string()).join("status"),
+                format!("PPid:\t{parent}\nUid:\t1000\t1000\t1000\t1000\n"),
+            )?;
+            std::fs::write(proc_root.join(pid.to_string()).join("cgroup"), unit)?;
+        }
+        for pid in [400, 401] {
+            std::fs::remove_file(proc_root.join(pid.to_string()).join("fd/3"))?;
+        }
+        let share = dir.path().join("share");
+        std::fs::create_dir_all(share.join("applications"))?;
+        std::fs::write(
+            share.join("applications/kitty.desktop"),
+            "[Desktop Entry]\nType=Application\nName=Kitty\nExec=kitty\n",
+        )?;
+        let resolver = Resolver::new(proc_root, vec![share], 64);
+        let attribution = attribute(&resolver, &Target::Node(node.to_owned()));
+        let (values, _) = render(
+            &Config::default(),
+            &request(RequestState::Waiting),
+            &attribution,
+            Instant::now(),
+        );
+        assert_eq!(
+            values.get("requester.label").map(String::as_str),
+            Some("ykman in Kitty")
+        );
         Ok(())
     }
 

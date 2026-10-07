@@ -3,7 +3,8 @@
 //! [`unit`](mod@unit) parses the systemd unit names desktop environments give to
 //! launched applications. On Linux, [`linux::Resolver`] finds the processes
 //! holding a device node open and attributes each to its application through
-//! its cgroup unit or, failing that, its executable.
+//! its cgroup unit or, failing that, its executable, and to the requester
+//! among its ancestors.
 
 pub mod unit;
 

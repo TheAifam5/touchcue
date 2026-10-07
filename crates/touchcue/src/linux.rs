@@ -258,12 +258,11 @@ pub async fn run(config: Config) -> Result<(), Error> {
     let sender = hooks.sender();
     sender.fire(HookEvent::DaemonStarted, &BTreeMap::new());
 
-    let mut daemon = Daemon::new(
-        machine,
-        config,
-        SystemAttribution::new(Resolver::system(), agent),
-        outputs,
+    let attribution = SystemAttribution::new(
+        Resolver::system().with_skip(config.requester.skip_list()),
+        agent,
     );
+    let mut daemon = Daemon::new(machine, config, attribution, outputs);
     let ended = event_loop(&mut daemon, rx, notices, devices, &sender, &mut signals).await;
     sender.fire(HookEvent::DaemonStopping, &BTreeMap::new());
     drop(idle_tx);

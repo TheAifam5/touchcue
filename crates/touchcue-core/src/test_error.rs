@@ -12,6 +12,8 @@ pub(crate) enum TestError {
     Config(#[from] ConfigError),
     #[error(transparent)]
     Template(#[from] TemplateError),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
     #[error("{0}")]
     Unexpected(String),
     #[error("{0}")]
