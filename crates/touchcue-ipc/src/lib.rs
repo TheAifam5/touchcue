@@ -46,6 +46,8 @@ pub mod helper;
 #[cfg(target_os = "linux")]
 mod limit;
 #[cfg(target_os = "linux")]
+pub mod portal;
+#[cfg(target_os = "linux")]
 pub mod sockdiag;
 #[cfg(target_os = "linux")]
 mod socket;
