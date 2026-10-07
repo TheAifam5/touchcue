@@ -42,9 +42,9 @@ Cargo runs through mr-boxington (mbx) via mise. Set `MBX_DISABLE=1` to disable i
 - `touchcue`: command-line interface (usage-rs definitions) and the tokio daemon.
 - `touchcue-core`: domain model, request state machine, template engine and configuration; no OS dependencies.
 - `touchcue-detect`: platform sources of touch requests.
-- `touchcue-appinfo`: resolves a process id to an application name, id and icon.
+- `touchcue-appinfo`: resolves a process id to an application name, id and icon; icon theme lookup and the icon theme of desktop settings files.
 - `touchcue-ui`: popup and notification backends.
-- `touchcue-ipc`: JSON event socket, compatibility socket, D-Bus service and helper protocol.
+- `touchcue-ipc`: JSON event socket, compatibility socket, D-Bus service, helper protocol and desktop portal settings.
 - `touchcue-hooks`: runs user-configured commands on daemon events, or for the life of a request.
 - `touchcue-helper`: optional privileged helper for data the unprivileged daemon cannot read.
 - `xtask`: build tooling invoked as `cargo xtask`.

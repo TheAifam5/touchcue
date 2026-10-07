@@ -26,6 +26,9 @@ modal_dismiss = true
 urgency = "critical"
 safety_timeout_s = 60
 
+[icons]
+# theme is detected when unset
+
 [templates]
 title = 'Touch {device.vendor|"your security key"}'
 body = '{requester.label|process.name|"An application"} is waiting for {request.method}'
@@ -117,6 +120,24 @@ On X11 the overlay is an input-only window that blocks clicks without dimming, s
 
 `safety_timeout_s` is the time after which the notification server withdraws a notification even if the request still waits; touchcue passes it as the notification's expiry, where `0` means never.
 
+## `[icons]`
+
+| Key | Values | Default |
+| --- | --- | --- |
+| `theme` | the directory name of an icon theme, such as `Papirus-Dark` | detected |
+
+Application icons from desktop entries and the icon names of [`[[rules]]`](#rules) are looked up in this theme, then in the themes it inherits from, then in `hicolor`, as the [freedesktop Icon Theme Specification](https://specifications.freedesktop.org/icon-theme/latest/) describes, at 64 pixels. Themes are found in `~/.icons`, in `icons` below `$XDG_DATA_HOME` (`~/.local/share` when unset) and below each directory of `$XDG_DATA_DIRS` (`/usr/local/share:/usr/share` when unset), and in `/usr/share/pixmaps`, in that order; the first `index.theme` found for a theme describes it. An icon that no theme holds is then looked for as a file named after it directly in those directories. Only PNG and SVG files are used, and a `.png`, `.svg` or `.xpm` ending of an icon name, as in `Icon=app.png` of some desktop entries, is ignored. The result of each name lookup is kept: a name found in no theme is not looked up again until the daemon restarts or more than 512 names have been looked up, and a file found is checked to still exist each time it is used. A value that is empty, `.` or `..`, or contains `/` or control characters is a configuration error.
+
+Without `theme`, `touchcue run` detects the theme once at start, from the first of these that names an installed theme:
+
+1. the XDG desktop portal settings `icon-theme` of `org.gnome.desktop.interface`, then `Theme` of `org.kde.kdeglobals.Icons`;
+2. `gtk-icon-theme-name` in the `[Settings]` group of `~/.config/gtk-4.0/settings.ini`, then of `~/.config/gtk-3.0/settings.ini`;
+3. `Theme` in the `[Icons]` group of `~/.config/kdeglobals`;
+4. `icon_theme` in the `[Appearance]` group of `~/.config/qt6ct/qt6ct.conf`, then of `~/.config/qt5ct/qt5ct.conf`;
+5. `hicolor`.
+
+`~/.config` stands for `$XDG_CONFIG_HOME` when it is set. On a desktop whose `XDG_CURRENT_DESKTOP` lists `KDE`, the KDE portal setting is read before the GNOME one. The portal is skipped when no portal is installed or running on the session bus, and when connecting, starting it and reading both settings take more than 1.5 s. Detection, reading the chosen theme included, takes at most 3 s; after that the daemon starts with `hicolor` and logs a warning. A configured or detected theme that is not installed is skipped with a warning, and the next source is tried: a configured theme is followed by the detection above. A theme changed on the desktop is used after the daemon restarts. `touchcue check` prints the theme and where it came from, for example `icons: theme = "Papirus-Dark" (portal org.gnome.desktop.interface)`.
+
 ## `[templates]`
 
 | Key | Default |
@@ -136,7 +157,11 @@ Rules change the prompt for matching requests. The first rule whose `match` entr
 [[rules]]
 match = { "process.name" = "ssh", "request.method" = "fido2" }
 title = "Touch your key for ssh"
-icon = "/usr/share/icons/hicolor/scalable/apps/utilities-terminal.svg"
+icon = "utilities-terminal"
+
+[[rules]]
+match = { "requester.name" = "claude" }
+icon = "~/.local/share/icons/claude.svg"
 
 [[rules]]
 match = { "app.id" = "org.mozilla.firefox" }
@@ -148,8 +173,12 @@ suppress = true
 | `match` | table of strings | Placeholder names and values. Required and non-empty. Values compare exactly and case-sensitively; a placeholder without a value never matches. |
 | `title` | template | Replaces `templates.title`. |
 | `body` | template | Replaces `templates.body`. |
-| `icon` | path | PNG or SVG file shown instead of the application's icon. |
+| `icon` | path or name | Icon shown instead of the application's icon: an absolute path, a path starting with `~/` in your home directory, or an icon name. |
 | `suppress` | boolean | Shows nothing for matching requests. IPC still publishes them. Default `false`. |
+
+An `icon` path must name a PNG or SVG file. A `~/` path must stay in your home directory: an absolute rest, as in `~//etc`, or a `..` part is a configuration error. A value without `/`, such as `utilities-terminal`, is an icon name, looked up in the [icon theme](#icons) like application icons. Other relative paths are a configuration error. The icon is looked up each time a prompt is shown or changes, within 0.5 s, so an icon path may name a file created after the daemon starts. An icon name that was not found stays unfound until the daemon restarts or more than 512 names have been looked up, as described under [`[icons]`](#icons). When no file is found in time, the prompt shows the application's icon and the daemon logs a warning.
+
+The icon shown is not proof of which program asked for a touch: any program running as your user can put lookalike icons in `~/.icons` or `~/.local/share/icons`, or install desktop entries that name another application's icon.
 
 ## `[[hooks]]`
 

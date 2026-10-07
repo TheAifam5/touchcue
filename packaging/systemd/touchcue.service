@@ -22,7 +22,8 @@ TimeoutStopSec=10
 # sockets), ProtectHome=read-only and PrivateTmp=yes. This drop-in is
 # untested: PrivateUsers=yes may block the /proc/PID/fd scan that names the
 # requesting app. PrivateDevices= and ProtectHome=yes break touchcue: it reads
-# /dev/hidraw* and the desktop entries and icons under the home directory.
+# /dev/hidraw* and the desktop entries, icons and icon theme settings under
+# the home directory.
 UMask=0077
 NoNewPrivileges=yes
 LockPersonality=yes

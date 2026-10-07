@@ -69,7 +69,7 @@ See [Getting started](https://touchcue.theaifam5.cc/guide/getting-started#instal
 ## Quick start
 
 ```sh
-touchcue check        # configuration, desktop, devices, IPC, gpg setup and requester
+touchcue check        # configuration, desktop, devices, IPC, gpg setup, requester and icon theme
 touchcue run -v       # run the daemon in the foreground
 touchcue gpg install  # optional: detect gpg and ssh through gpg-agent
 ```
