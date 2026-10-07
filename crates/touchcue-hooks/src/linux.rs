@@ -10,9 +10,13 @@ use rustix::process::{Pid, Signal, kill_process_group};
 use tokio::io::{AsyncRead, AsyncReadExt as _};
 use tokio::process::{Child, Command};
 use tokio_util::sync::CancellationToken;
+use touchcue_core::StopSignal;
 
 use crate::VAR_PREFIX;
-use crate::runner::{Ending, Finished, KILL_GRACE};
+use crate::runner::{Ending, Finished, KILL_GRACE, Stop};
+
+/// Write end of a command's stdin pipe.
+pub(crate) type Stdin = tokio::process::ChildStdin;
 
 /// Longest wait for the output pipes to close after the command exited;
 /// a background process of the command may hold them open.
@@ -34,22 +38,57 @@ pub enum RunError {
 /// Runs `command` with `env` added to the inherited environment, without a
 /// shell, and waits for it.
 ///
-/// The command runs in a new process group with stdin from `/dev/null`;
-/// inherited variables starting with [`VAR_PREFIX`] are removed. The first
-/// [`OUTPUT_MAX`] bytes of stdout and stderr are kept and the rest is read
-/// and discarded. When `timeout` passes or `kill` is cancelled, the group
-/// gets `SIGTERM`, then `SIGKILL` once the command exited or after
-/// [`KILL_GRACE`]. The command is always reaped before this returns.
+/// Stdin is `/dev/null`. When `timeout` passes or `kill` is cancelled, the
+/// group gets `SIGTERM`, then `SIGKILL` once the command exited or after
+/// [`KILL_GRACE`]. Otherwise as [`supervised`].
 pub(crate) async fn run(
     command: &[String],
     env: &[(String, String)],
     timeout: Duration,
     kill: &CancellationToken,
 ) -> Result<Finished, RunError> {
+    let stop = Stop {
+        signal: StopSignal::Term,
+        grace: KILL_GRACE,
+        kill_group_on_exit: false,
+    };
+    supervised(command, env, false, stop, |_stdin| async move {
+        tokio::select! {
+            () = tokio::time::sleep(timeout) => Ending::TimedOut,
+            () = kill.cancelled() => Ending::Killed,
+        }
+    })
+    .await
+}
+
+/// Runs `command` with `env` added to the inherited environment, without a
+/// shell, until it exits or `until` completes, and reaps it.
+///
+/// The command runs in a new process group; inherited variables starting
+/// with [`VAR_PREFIX`] are removed. Stdin is a pipe whose write end is
+/// passed to `until` when `piped` is set, else `/dev/null`. The first
+/// [`OUTPUT_MAX`] bytes of stdout and stderr are kept and the rest is read
+/// and discarded. When `until` completes first, the group gets
+/// `stop.signal`, then `SIGKILL` once the command exited or after
+/// `stop.grace`, and the run ends with the [`Ending`] `until` returned.
+/// When the command exits first, the group gets `SIGKILL` if
+/// `stop.kill_group_on_exit` is set. The command is always reaped before
+/// this returns.
+pub(crate) async fn supervised<F, U>(
+    command: &[String],
+    env: &[(String, String)],
+    piped: bool,
+    stop: Stop,
+    until: F,
+) -> Result<Finished, RunError>
+where
+    F: FnOnce(Option<Stdin>) -> U,
+    U: Future<Output = Ending>,
+{
     let (program, args) = command.split_first().ok_or(RunError::NoProgram)?;
     let mut cmd = Command::new(program);
     cmd.args(args)
-        .stdin(Stdio::null())
+        .stdin(if piped { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0)
@@ -60,13 +99,14 @@ pub(crate) async fn run(
     cmd.envs(env.iter().map(|(key, value)| (key, value)));
     let mut child = cmd.spawn().map_err(RunError::Spawn)?;
     let group = group(&child);
+    let stdin = child.stdin.take();
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
 
     let mut output = std::pin::pin!(async { tokio::join!(capture(stdout), capture(stderr)) });
     let mut captured = None;
     let ended = {
-        let mut supervised = std::pin::pin!(supervise(&mut child, group, timeout, kill));
+        let mut supervised = std::pin::pin!(supervise(&mut child, group, stop, until(stdin)));
         loop {
             tokio::select! {
                 ended = &mut supervised => break ended,
@@ -116,21 +156,27 @@ fn group(child: &Child) -> Option<Pid> {
     }
 }
 
-/// Waits for `child`, ending its process group when `timeout` passes or
-/// `kill` is cancelled.
+/// Waits for `child`, ending its process group when `until` completes first.
 async fn supervise(
     child: &mut Child,
     group: Option<Pid>,
-    timeout: Duration,
-    kill: &CancellationToken,
+    stop: Stop,
+    until: impl Future<Output = Ending>,
 ) -> io::Result<(std::process::ExitStatus, Ending)> {
     let ending = tokio::select! {
-        status = child.wait() => return Ok((status?, Ending::Exited)),
-        () = tokio::time::sleep(timeout) => Ending::TimedOut,
-        () = kill.cancelled() => Ending::Killed,
+        status = child.wait() => {
+            let status = status?;
+            if stop.kill_group_on_exit {
+                // The group id stays reserved while a member lives; once all
+                // are gone the id may be reused, a small window this accepts.
+                signal(group, Signal::KILL);
+            }
+            return Ok((status, Ending::Exited));
+        }
+        ending = until => ending,
     };
-    signal(group, Signal::TERM);
-    let exited = match tokio::time::timeout(KILL_GRACE, child.wait()).await {
+    signal(group, stop_signal(stop.signal));
+    let exited = match tokio::time::timeout(stop.grace, child.wait()).await {
         Ok(status) => Some(status?),
         Err(_elapsed) => None,
     };
@@ -144,6 +190,14 @@ async fn supervise(
     Ok((status, ending))
 }
 
+fn stop_signal(signal: StopSignal) -> Signal {
+    match signal {
+        StopSignal::Term => Signal::TERM,
+        StopSignal::Int => Signal::INT,
+        StopSignal::Hup => Signal::HUP,
+    }
+}
+
 /// Sends `signal` to `group`; a group that no longer exists is not an error.
 fn signal(group: Option<Pid>, signal: Signal) {
     let Some(group) = group else {
@@ -152,7 +206,7 @@ fn signal(group: Option<Pid>, signal: Signal) {
     if let Err(errno) = kill_process_group(group, signal) {
         tracing::debug!(
             error = &errno as &dyn std::error::Error,
-            "cannot signal the hook process group"
+            "cannot signal the process group"
         );
     }
 }

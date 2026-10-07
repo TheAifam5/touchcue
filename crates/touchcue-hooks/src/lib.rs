@@ -1,8 +1,9 @@
 //! Runs the `[[hooks]]` commands of the configuration on touchcue events.
 //!
 //! Commands run without a shell. Placeholder values reach them only through
-//! environment variables, never through arguments. Running commands is
-//! supported on Linux; elsewhere every run fails with a logged error.
+//! environment variables and, for hooks with `until`, stdin, never through
+//! arguments. Running commands is supported on Linux; elsewhere every run
+//! fails with a logged error.
 
 use std::collections::BTreeMap;
 
@@ -10,8 +11,10 @@ use touchcue_core::placeholders::published;
 use touchcue_core::text::sanitize;
 use touchcue_core::{EndReason, Event, HookEvent, RequestId, RequestState};
 
+mod lifetime;
 #[cfg(target_os = "linux")]
 mod linux;
+mod queue;
 mod runner;
 #[cfg(not(target_os = "linux"))]
 mod stub;
@@ -21,6 +24,7 @@ use linux as platform;
 #[cfg(not(target_os = "linux"))]
 use stub as platform;
 
+pub use lifetime::{BODY_VAR, LIFETIME_PROCESSES, PromptText, STDIN_QUEUE, TITLE_VAR};
 pub use platform::RunError;
 pub use runner::{HookSender, Hooks, HooksError, KILL_GRACE, QUEUE};
 
@@ -102,13 +106,25 @@ fn outcome(reason: EndReason) -> HookEvent {
 #[must_use]
 pub fn env(event: HookEvent, values: &BTreeMap<String, String>) -> Vec<(String, String)> {
     let mut out = vec![(EVENT_VAR.to_owned(), event.as_str().to_owned())];
-    out.extend(
-        values
-            .iter()
-            .filter(|(key, _)| published(key))
-            .filter_map(|(key, value)| Some((var_name(key), sanitize(value, VALUE_MAX)?))),
-    );
+    out.extend(vars(&published_values(values)));
     out
+}
+
+/// Returns the published entries of `values`, sanitized and capped at
+/// [`VALUE_MAX`] chars, without the ones with nothing visible.
+fn published_values(values: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    values
+        .iter()
+        .filter(|(key, _)| published(key))
+        .filter_map(|(key, value)| Some((key.clone(), sanitize(value, VALUE_MAX)?)))
+        .collect()
+}
+
+/// Returns the variables of published and sanitized `values`.
+fn vars(values: &BTreeMap<String, String>) -> impl Iterator<Item = (String, String)> {
+    values
+        .iter()
+        .map(|(key, value)| (var_name(key), value.clone()))
 }
 
 fn var_name(key: &str) -> String {
