@@ -1,0 +1,11 @@
+# Shows each touch prompt as a Hyprland notification for 10 seconds, next to
+# the popup.
+[[hooks]]
+on = ["started"]
+until = "ended"
+command = [
+  "sh",
+  "-c",
+  'exec hyprctl notify 1 10000 "rgb(ff1ea3)" "Touch: $TOUCHCUE_BODY"',
+]
+restart_interval_ms = 1000

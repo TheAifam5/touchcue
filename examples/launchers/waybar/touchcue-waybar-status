@@ -1,0 +1,26 @@
+#!/bin/sh
+# Prints the state of the waybar custom module from the files that
+# touchcue-waybar keeps, one per waiting request. Needs jq.
+set -eu
+
+dir="${XDG_RUNTIME_DIR:?}/touchcue-waybar"
+if [ -e "$dir" ] && [ ! -O "$dir" ]; then
+  echo "touchcue-waybar-status: $dir is not owned by you" >&2
+  exit 1
+fi
+
+# A file whose process is gone, such as one killed with SIGKILL, is stale.
+for file in "$dir"/*.json; do
+  [ -e "$file" ] || continue
+  pid=$(basename "$file" .json)
+  kill -0 "$pid" 2>/dev/null || rm -f "$file"
+done
+
+# @html escapes the text, which waybar reads as Pango markup.
+cat "$dir"/*.json 2>/dev/null | jq -sc '
+  if length == 0 then {text: "", class: "idle"}
+  else {
+    text: "touch \(length)",
+    tooltip: (map(.body | @html) | join("\n")),
+    class: "waiting"
+  } end'

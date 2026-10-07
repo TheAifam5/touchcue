@@ -25,5 +25,5 @@ features:
   - title: For scripts and bars
     details: A JSON event socket, a D-Bus service, and the socket protocol of yubikey-touch-detector.
   - title: Hooks
-    details: Run your own commands on events, such as playing a sound when a request starts, without a shell and with values passed only in environment variables.
+    details: Run your own commands on events, such as playing a sound when a request starts, or for as long as a request lasts, to show the prompt in rofi, fuzzel or a status bar, without a shell and with values passed only in environment variables and stdin.
 ---

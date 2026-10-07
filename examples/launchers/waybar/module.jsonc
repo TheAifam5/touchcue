@@ -1,0 +1,9 @@
+// Add "custom/touchcue" to a modules list of the waybar configuration.
+{
+  "custom/touchcue": {
+    "exec": "$HOME/.local/bin/touchcue-waybar-status",
+    "return-type": "json",
+    "interval": "once",
+    "signal": 8
+  }
+}

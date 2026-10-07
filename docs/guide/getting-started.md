@@ -60,7 +60,7 @@ This installs `touchcue` into `~/.cargo/bin`. Contributors can use `mise run bui
 touchcue check
 ```
 
-It prints whether the configuration is valid, whether a Wayland compositor, Wayland layer-shell and a notification service are available, every FIDO device and whether touchcue can read it, the output backend `touchcue run` would choose, the IPC endpoints, the gpg setup, the number of hooks, and the requester skip list. Its last line shows how touchcue reads the terminal it runs in, with skipped processes in brackets:
+It prints whether the configuration is valid, whether a Wayland compositor, Wayland layer-shell and a notification service are available, every FIDO device and whether touchcue can read it, the output backend `touchcue run` would choose, the IPC endpoints, the gpg setup, the number of hooks with how many of them have `until`, and the requester skip list. Its last line shows how touchcue reads the terminal it runs in, with skipped processes in brackets:
 
 ```text
 requester: skip = ["sh", "bash", …, "systemd", "init"] (defaults)

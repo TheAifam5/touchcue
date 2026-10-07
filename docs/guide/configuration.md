@@ -71,7 +71,7 @@ extend_skip = []
 - `notification` sends a desktop notification over D-Bus.
 - `both` shows the popup and a notification.
 - `none` shows nothing.
-- `command` is planned. It is accepted, but skipped with a warning.
+- `command` is accepted, but skipped with a warning. To show prompts through programs such as rofi or fuzzel, use [hooks with `until`](./hooks#hooks-that-last-for-a-request); see [Launchers](./launchers).
 
 ## `[popup]`
 
@@ -169,8 +169,13 @@ concurrency = 4
 | `on` | list of event names | Events that run the command. Required and non-empty. An unknown name is an error. |
 | `match` | table of strings | Placeholder names and values that must all be equal, as in `[[rules]]`. Optional; without it, every listed event runs the command. Device events only have `device.*` values and daemon events none, so a `match` on other names never runs for them. `match` only selects events: application and process names are set by the processes themselves. |
 | `command` | list of strings | The program and its arguments, run without a shell. Required, and the program must not be empty. |
-| `timeout_ms` | 1 to 600000 | Time the command may run before it is ended. Default 5000. |
-| `concurrency` | 1 to 32 | Most runs of this hook at once. Default 4. |
+| `timeout_ms` | 1 to 600000 | Time the command may run before it is ended. Default 5000. Not allowed with `until`. |
+| `concurrency` | 1 to 32 | Most runs of this hook at once. Default 4. Not allowed with `until`. |
+| `until` | `ended` | Runs one process per request until the request ends, instead of one run per event; `on` may then list only `started` and `waiting`. See [Hooks that last for a request](./hooks#hooks-that-last-for-a-request). |
+| `on_change` | `restart`, `stream`, `ignore` | With `until`: what a change of the request does to its process. Default `restart`. |
+| `stop_signal` | `SIGTERM`, `SIGINT`, `SIGHUP` | With `until`: signal that stops the process. Default `SIGTERM`. |
+| `stop_grace_ms` | 0 to 2000 | With `until`: time between `stop_signal` and `SIGKILL`. Default 1000. |
+| `restart_interval_ms` | 0 to 600000 | With `until`: shortest time between two starts of the process of one request. Default 200. |
 
 ## `[sources.fido]`
 

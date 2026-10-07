@@ -1,0 +1,35 @@
+#!/bin/sh
+# Runs for one touch request as a touchcue hook with until = "ended" and
+# on_change = "stream". Keeps the request's prompt in
+# $XDG_RUNTIME_DIR/touchcue-waybar/<pid>.json and removes it when the
+# request ends, signalling waybar with SIGRTMIN+8 after each change.
+# Needs jq.
+set -eu
+
+umask 077
+dir="${XDG_RUNTIME_DIR:?}/touchcue-waybar"
+state="$dir/$$.json"
+mkdir -p "$dir"
+if [ ! -O "$dir" ]; then
+  echo "touchcue-waybar: $dir is not owned by you" >&2
+  exit 1
+fi
+
+refresh() {
+  pkill -RTMIN+8 -x waybar || :
+}
+
+finish() {
+  rm -f "$state" "$state.tmp"
+  refresh
+}
+trap finish EXIT
+trap 'exit 0' TERM INT HUP
+
+while IFS= read -r line; do
+  op=$(printf '%s\n' "$line" | jq -r .op)
+  [ "$op" = hide ] && break
+  printf '%s\n' "$line" | jq -c '{body}' >"$state.tmp"
+  mv -f "$state.tmp" "$state"
+  refresh
+done

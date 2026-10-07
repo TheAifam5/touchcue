@@ -1,0 +1,13 @@
+# Shows each touch prompt as the prompt of an empty fuzzel menu instead of
+# the popup.
+[output]
+mode = "none"
+
+[[hooks]]
+on = ["started"]
+until = "ended"
+command = [
+  "sh",
+  "-c",
+  'exec fuzzel --dmenu --prompt-only="$TOUCHCUE_BODY " --keyboard-focus=on-demand',
+]

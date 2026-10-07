@@ -1,0 +1,6 @@
+# Keeps a waybar module up to date through one script per request.
+[[hooks]]
+on = ["started"]
+until = "ended"
+on_change = "stream"
+command = ["/home/me/.local/bin/touchcue-waybar"]

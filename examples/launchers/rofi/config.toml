@@ -1,0 +1,9 @@
+# Shows each touch prompt in a rofi message dialog instead of the popup.
+[output]
+mode = "none"
+
+[[hooks]]
+on = ["started"]
+until = "ended"
+command = ["sh", "-c", 'exec rofi -e "$TOUCHCUE_BODY"']
+stop_signal = "SIGINT"
