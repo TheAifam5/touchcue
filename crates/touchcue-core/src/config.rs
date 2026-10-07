@@ -26,6 +26,15 @@ const MAX_HOOK_CONCURRENCY: u64 = 32;
 /// Lower bound of `sources.fido.keepalive_timeout_ms`; progress signals are
 /// sent every third of it, so a smaller value would make them spin.
 const MIN_KEEPALIVE_MS: u64 = 100;
+/// Default of `hooks.stop_grace_ms`.
+const DEFAULT_STOP_GRACE_MS: u64 = 1000;
+/// Upper bound of `hooks.stop_grace_ms`, so that stopping fits the 4 s the
+/// daemon gives hooks at shutdown.
+const MAX_STOP_GRACE_MS: u64 = 2000;
+/// Most processes of every hook with `until` running at once.
+pub const LIFETIME_PROCESSES: usize = 8;
+/// Default of `hooks.restart_interval_ms`.
+const DEFAULT_RESTART_INTERVAL_MS: u64 = 200;
 const DEFAULT_BODY: &str =
     "{requester.label|process.name|\"An application\"} is waiting for {request.method}";
 
@@ -323,7 +332,8 @@ impl HookEvent {
 /// One `[[hooks]]` entry: a command run on events.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hook {
-    /// Events that run the command; never empty.
+    /// Events that run the command; never empty. With `lifetime`, only
+    /// [`HookEvent::Started`] and [`HookEvent::Waiting`].
     pub on: Vec<HookEvent>,
     /// Placeholder values that must all be present and equal, compared
     /// exactly and case-sensitively; empty matches every event.
@@ -331,10 +341,63 @@ pub struct Hook {
     /// Program and arguments, run without a shell; never empty, and the
     /// program is never empty.
     pub command: Vec<String>,
-    /// Time the command may run, 1 to 600000 ms.
+    /// Time the command may run, 1 to 600000 ms; unused with `lifetime`.
     pub timeout_ms: u64,
-    /// Most runs of the command at once, 1 to 32.
+    /// Most runs of the command at once, 1 to 32; unused with `lifetime`.
     pub concurrency: u8,
+    /// Set by `until = "ended"`: the command runs while its request's
+    /// prompt is shown, until the request ends.
+    pub lifetime: Option<Lifetime>,
+}
+
+/// What the process of a hook with `until` does when its request changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnChange {
+    /// The process is stopped and started again with the new values.
+    #[default]
+    Restart,
+    /// The process keeps running and gets each change on stdin.
+    Stream,
+    /// The process keeps running and gets no changes.
+    Ignore,
+}
+
+impl OnChange {
+    /// Returns the name used in TOML.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Restart => "restart",
+            Self::Stream => "stream",
+            Self::Ignore => "ignore",
+        }
+    }
+}
+
+/// Signal that asks the process of a hook with `until` to stop, written as
+/// its name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Deserialize)]
+pub enum StopSignal {
+    #[default]
+    #[serde(rename = "SIGTERM")]
+    Term,
+    #[serde(rename = "SIGINT")]
+    Int,
+    #[serde(rename = "SIGHUP")]
+    Hup,
+}
+
+/// Options of a hook whose process lasts for its request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Lifetime {
+    pub on_change: OnChange,
+    pub stop_signal: StopSignal,
+    /// Time between `stop_signal` and `SIGKILL`, 0 to 2000 ms.
+    pub stop_grace_ms: u64,
+    /// Shortest time between two starts of the process of one request, 0 to
+    /// 600000 ms.
+    pub restart_interval_ms: u64,
 }
 
 impl Hook {
@@ -527,6 +590,40 @@ pub enum ConfigError {
         #[label("here")]
         span: Option<SourceSpan>,
     },
+    #[error("`{field}` applies only to a hook with `until`")]
+    #[diagnostic(
+        code(touchcue::config::needs_until),
+        help("add `until = \"ended\"` to run the command for as long as the request lasts")
+    )]
+    NeedsUntil {
+        field: String,
+        #[label("needs `until`")]
+        span: Option<SourceSpan>,
+    },
+    #[error("`{field}` does not apply to a hook with `until`")]
+    #[diagnostic(
+        code(touchcue::config::not_with_until),
+        help(
+            "a hook with `until` runs for as long as its request lasts, at most {LIFETIME_PROCESSES} processes of all such hooks at once"
+        )
+    )]
+    NotWithUntil {
+        field: String,
+        #[label("remove this")]
+        span: Option<SourceSpan>,
+    },
+    #[error("`{field}` of a hook with `until` lists an event other than `started` or `waiting`")]
+    #[diagnostic(
+        code(touchcue::config::until_events),
+        help(
+            "a hook with `until` starts on `started` or `waiting` and runs until the request ends"
+        )
+    )]
+    UntilEvents {
+        field: String,
+        #[label("only `started` and `waiting`")]
+        span: Option<SourceSpan>,
+    },
 }
 
 impl ConfigError {
@@ -536,7 +633,10 @@ impl ConfigError {
         match self {
             Self::Toml { span, .. }
             | Self::EmptyHookField { span, .. }
-            | Self::InvalidPattern { span, .. } => span.map(range),
+            | Self::InvalidPattern { span, .. }
+            | Self::NeedsUntil { span, .. }
+            | Self::NotWithUntil { span, .. }
+            | Self::UntilEvents { span, .. } => span.map(range),
             Self::Template { span, .. } => span.clone(),
             Self::UnknownMatchKey { .. } | Self::EmptyMatch { .. } | Self::OutOfRange { .. } => {
                 None
@@ -545,14 +645,17 @@ impl ConfigError {
     }
 
     /// Returns the byte range in the TOML source that the diagnostic label
-    /// points at: the TOML error's span, the empty hook list, the invalid
-    /// skip entry, or the offending template bytes.
+    /// points at: the TOML error's span, the offending hook value, the
+    /// invalid skip entry, or the offending template bytes.
     #[must_use]
     pub fn label_span(&self) -> Option<Range<usize>> {
         match self {
             Self::Toml { span, .. }
             | Self::EmptyHookField { span, .. }
-            | Self::InvalidPattern { span, .. } => span.map(range),
+            | Self::InvalidPattern { span, .. }
+            | Self::NeedsUntil { span, .. }
+            | Self::NotWithUntil { span, .. }
+            | Self::UntilEvents { span, .. } => span.map(range),
             Self::Template { label, .. } => label.map(range),
             Self::UnknownMatchKey { .. } | Self::EmptyMatch { .. } | Self::OutOfRange { .. } => {
                 None
@@ -640,27 +743,27 @@ struct RawRule {
     suppress: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct RawHook {
     on: Option<Spanned<Vec<HookEvent>>>,
     #[serde(rename = "match")]
     matches: BTreeMap<String, String>,
     command: Option<Spanned<Vec<String>>>,
-    timeout_ms: u64,
-    concurrency: u64,
+    timeout_ms: Option<Spanned<u64>>,
+    concurrency: Option<Spanned<u64>>,
+    until: Option<Spanned<Until>>,
+    on_change: Option<Spanned<OnChange>>,
+    stop_signal: Option<Spanned<StopSignal>>,
+    stop_grace_ms: Option<Spanned<u64>>,
+    restart_interval_ms: Option<Spanned<u64>>,
 }
 
-impl Default for RawHook {
-    fn default() -> Self {
-        Self {
-            on: None,
-            matches: BTreeMap::new(),
-            command: None,
-            timeout_ms: DEFAULT_HOOK_TIMEOUT_MS,
-            concurrency: DEFAULT_HOOK_CONCURRENCY,
-        }
-    }
+/// Values of `hooks.until`.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Until {
+    Ended,
 }
 
 impl Default for Config {
@@ -694,8 +797,10 @@ impl Config {
     /// parse, [`ConfigError::UnknownMatchKey`] for a rule matching a key
     /// or hook matching a key outside [`KNOWN`], [`ConfigError::EmptyMatch`]
     /// for a rule without match entries, [`ConfigError::EmptyHookField`] for
-    /// a hook without events or program, [`ConfigError::OutOfRange`] for
-    /// a number outside its documented range, and
+    /// a hook without events or program, [`ConfigError::NeedsUntil`],
+    /// [`ConfigError::NotWithUntil`] and [`ConfigError::UntilEvents`] for a
+    /// hook option that does not fit its `until`, [`ConfigError::OutOfRange`]
+    /// for a number outside its documented range, and
     /// [`ConfigError::InvalidPattern`] for a malformed skip entry.
     pub fn from_toml(s: &str) -> Result<Self, ConfigError> {
         let raw: RawConfig = toml::from_str(s).map_err(|e| ConfigError::Toml {
@@ -947,10 +1052,94 @@ fn patterns(field: &str, entries: Vec<Spanned<String>>) -> Result<Vec<String>, C
         .collect()
 }
 
-fn compile_hook(index: usize, raw: RawHook) -> Result<Hook, ConfigError> {
-    let on = non_empty(format!("hooks[{index}].on"), raw.on)?;
+/// Returns the lifetime of a hook with `until`, checking that the options
+/// of `raw` fit its `until`; `field` names an option of the hook.
+fn compile_lifetime(
+    field: &impl Fn(&str) -> String,
+    on: &[HookEvent],
+    on_span: Option<Range<usize>>,
+    raw: &RawHook,
+) -> Result<Option<Lifetime>, ConfigError> {
+    let spans = |options: &[(&'static str, Option<Range<usize>>)]| {
+        options
+            .iter()
+            .find_map(|(key, span)| Some((*key, span.clone()?)))
+    };
+    if raw.until.is_none() {
+        let set = spans(&[
+            ("on_change", raw.on_change.as_ref().map(Spanned::span)),
+            ("stop_signal", raw.stop_signal.as_ref().map(Spanned::span)),
+            (
+                "stop_grace_ms",
+                raw.stop_grace_ms.as_ref().map(Spanned::span),
+            ),
+            (
+                "restart_interval_ms",
+                raw.restart_interval_ms.as_ref().map(Spanned::span),
+            ),
+        ]);
+        return match set {
+            Some((key, span)) => Err(ConfigError::NeedsUntil {
+                field: field(key),
+                span: Some(span.into()),
+            }),
+            None => Ok(None),
+        };
+    }
+    if on
+        .iter()
+        .any(|event| !matches!(event, HookEvent::Started | HookEvent::Waiting))
+    {
+        return Err(ConfigError::UntilEvents {
+            field: field("on"),
+            span: on_span.map(SourceSpan::from),
+        });
+    }
+    if let Some((key, span)) = spans(&[
+        ("timeout_ms", raw.timeout_ms.as_ref().map(Spanned::span)),
+        ("concurrency", raw.concurrency.as_ref().map(Spanned::span)),
+    ]) {
+        return Err(ConfigError::NotWithUntil {
+            field: field(key),
+            span: Some(span.into()),
+        });
+    }
+    let stop_grace_ms = raw
+        .stop_grace_ms
+        .as_ref()
+        .map_or(DEFAULT_STOP_GRACE_MS, |value| *value.get_ref());
+    check_range(&field("stop_grace_ms"), stop_grace_ms, 0, MAX_STOP_GRACE_MS)?;
+    let restart_interval_ms = raw
+        .restart_interval_ms
+        .as_ref()
+        .map_or(DEFAULT_RESTART_INTERVAL_MS, |value| *value.get_ref());
+    check_range(
+        &field("restart_interval_ms"),
+        restart_interval_ms,
+        0,
+        MAX_MS,
+    )?;
+    Ok(Some(Lifetime {
+        on_change: raw
+            .on_change
+            .as_ref()
+            .map(|value| *value.get_ref())
+            .unwrap_or_default(),
+        stop_signal: raw
+            .stop_signal
+            .as_ref()
+            .map(|value| *value.get_ref())
+            .unwrap_or_default(),
+        stop_grace_ms,
+        restart_interval_ms,
+    }))
+}
+
+fn compile_hook(index: usize, mut raw: RawHook) -> Result<Hook, ConfigError> {
+    let on_span = raw.on.as_ref().map(Spanned::span);
+    let on = non_empty(format!("hooks[{index}].on"), raw.on.take())?;
     let command_span = raw.command.as_ref().map(Spanned::span);
-    let command = non_empty(format!("hooks[{index}].command"), raw.command)?;
+    let command = non_empty(format!("hooks[{index}].command"), raw.command.take())?;
     if command.first().is_none_or(String::is_empty) {
         return Err(ConfigError::EmptyHookField {
             field: format!("hooks[{index}].command[0]"),
@@ -958,21 +1147,24 @@ fn compile_hook(index: usize, raw: RawHook) -> Result<Hook, ConfigError> {
         });
     }
     check_match_keys(format!("hooks[{index}].match"), &raw.matches)?;
-    check_range(
-        &format!("hooks[{index}].timeout_ms"),
-        raw.timeout_ms,
-        1,
-        MAX_MS,
-    )?;
-    let concurrency = match u8::try_from(raw.concurrency) {
+    let field = |key: &str| format!("hooks[{index}].{key}");
+    let lifetime = compile_lifetime(&field, &on, on_span, &raw)?;
+    let timeout_ms = raw
+        .timeout_ms
+        .map_or(DEFAULT_HOOK_TIMEOUT_MS, Spanned::into_inner);
+    check_range(&field("timeout_ms"), timeout_ms, 1, MAX_MS)?;
+    let raw_concurrency = raw
+        .concurrency
+        .map_or(DEFAULT_HOOK_CONCURRENCY, Spanned::into_inner);
+    let concurrency = match u8::try_from(raw_concurrency) {
         Ok(concurrency) if (1..=MAX_HOOK_CONCURRENCY).contains(&u64::from(concurrency)) => {
             concurrency
         }
         // A value beyond `u8` is out of range as well.
         _ => {
             return Err(ConfigError::OutOfRange {
-                field: format!("hooks[{index}].concurrency"),
-                value: raw.concurrency,
+                field: field("concurrency"),
+                value: raw_concurrency,
                 min: 1,
                 max: MAX_HOOK_CONCURRENCY,
             });
@@ -982,8 +1174,9 @@ fn compile_hook(index: usize, raw: RawHook) -> Result<Hook, ConfigError> {
         on,
         matches: raw.matches,
         command,
-        timeout_ms: raw.timeout_ms,
+        timeout_ms,
         concurrency,
+        lifetime,
     })
 }
 
@@ -1659,6 +1852,151 @@ mod tests {
             Some(("hooks[0].concurrency".to_owned(), 256))
         );
         Config::from_toml(&hook("timeout_ms = 1\nconcurrency = 1"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn until_hooks_parse_with_defaults() -> TestResult {
+        let cfg = Config::from_toml(
+            r#"
+            [[hooks]]
+            on = ["started"]
+            command = ["x"]
+
+            [[hooks]]
+            on = ["started", "waiting"]
+            until = "ended"
+            command = ["sh", "-c", 'exec rofi -e "$TOUCHCUE_BODY"']
+
+            [[hooks]]
+            on = ["waiting"]
+            until = "ended"
+            on_change = "stream"
+            stop_signal = "SIGINT"
+            stop_grace_ms = 2000
+            restart_interval_ms = 0
+            command = ["x"]
+            "#,
+        )?;
+        let [plain, first, second] = cfg.hooks.as_slice() else {
+            return Err(format!("expected three hooks, got {:?}", cfg.hooks).into());
+        };
+        assert_eq!(plain.lifetime, None);
+        assert_eq!(
+            first.lifetime,
+            Some(Lifetime {
+                on_change: OnChange::Restart,
+                stop_signal: StopSignal::Term,
+                stop_grace_ms: 1000,
+                restart_interval_ms: 200,
+            })
+        );
+        assert_eq!(
+            second.lifetime,
+            Some(Lifetime {
+                on_change: OnChange::Stream,
+                stop_signal: StopSignal::Int,
+                stop_grace_ms: 2000,
+                restart_interval_ms: 0,
+            })
+        );
+        let ignore = Config::from_toml(
+            "[[hooks]]\non = [\"started\"]\nuntil = \"ended\"\non_change = \"ignore\"\nstop_signal = \"SIGHUP\"\ncommand = [\"x\"]\n",
+        )?;
+        let lifetime = ignore
+            .hooks
+            .first()
+            .and_then(|hook| hook.lifetime)
+            .ok_or("no lifetime")?;
+        assert_eq!(
+            (lifetime.on_change, lifetime.stop_signal),
+            (OnChange::Ignore, StopSignal::Hup)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn until_options_are_checked_with_spans() -> TestResult {
+        let until = "[[hooks]]\nuntil = \"ended\"\ncommand = [\"x\"]\n";
+        let cases: [(String, &str, &str); 7] = [
+            (
+                format!("{until}on = [\"started\", \"ended\"]\n"),
+                "touchcue::config::until_events",
+                "[\"started\", \"ended\"]",
+            ),
+            (
+                format!("{until}on = [\"touched\"]\n"),
+                "touchcue::config::until_events",
+                "[\"touched\"]",
+            ),
+            (
+                format!("{until}on = [\"started\"]\ntimeout_ms = 5000\n"),
+                "touchcue::config::not_with_until",
+                "5000",
+            ),
+            (
+                format!("{until}on = [\"started\"]\nconcurrency = 2\n"),
+                "touchcue::config::not_with_until",
+                "2",
+            ),
+            (
+                "[[hooks]]\non = [\"started\"]\ncommand = [\"x\"]\non_change = \"stream\"\n"
+                    .to_owned(),
+                "touchcue::config::needs_until",
+                "\"stream\"",
+            ),
+            (
+                "[[hooks]]\non = [\"started\"]\ncommand = [\"x\"]\nstop_grace_ms = 10\n".to_owned(),
+                "touchcue::config::needs_until",
+                "10",
+            ),
+            (
+                format!("{until}on = [\"started\"]\nstop_signal = \"SIGKILL\"\n"),
+                "touchcue::config::toml",
+                "\"SIGKILL\"",
+            ),
+        ];
+        for (src, code, value) in cases {
+            use miette::Diagnostic as _;
+
+            let err = rejected(&src)?;
+            assert_eq!(
+                err.code().map(|c| c.to_string()).as_deref(),
+                Some(code),
+                "{src:?}"
+            );
+            assert_eq!(
+                err.label_span().and_then(|s| src.get(s)),
+                Some(value),
+                "{src:?}"
+            );
+        }
+        {
+            use miette::Diagnostic as _;
+
+            let err = rejected(&format!("{until}on = [\"started\"]\nconcurrency = 2\n"))?;
+            let help = err.help().map(|help| help.to_string());
+            assert!(
+                help.as_deref()
+                    .is_some_and(|help| help.contains("at most 8 processes")),
+                "{help:?}"
+            );
+        }
+        let err =
+            rejected("[[hooks]]\non = [\"started\"]\ncommand = [\"x\"]\nuntil = \"touched\"\n")?;
+        assert!(matches!(err, ConfigError::Toml { .. }), "{err:?}");
+        assert_eq!(
+            out_of_range(&format!(
+                "{until}on = [\"started\"]\nstop_grace_ms = 2001\n"
+            )),
+            Some(("hooks[0].stop_grace_ms".to_owned(), 2001))
+        );
+        assert_eq!(
+            out_of_range(&format!(
+                "{until}on = [\"started\"]\nrestart_interval_ms = 600001\n"
+            )),
+            Some(("hooks[0].restart_interval_ms".to_owned(), 600_001))
+        );
         Ok(())
     }
 }

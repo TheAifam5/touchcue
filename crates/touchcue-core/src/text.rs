@@ -1,6 +1,9 @@
-//! Sanitizing of untrusted text before it is displayed.
+//! Sanitizing of untrusted text before it is displayed, and the prompt
+//! body as it is shown.
 
 use std::ops::RangeInclusive;
+
+use crate::machine::{EndReason, RequestState};
 
 /// Invisible, bidirectional, format and separator characters, replaced so
 /// that displayed text reads the same as its content.
@@ -41,9 +44,53 @@ pub fn sanitize(s: &str, max_chars: usize) -> Option<String> {
     (!out.is_empty()).then(|| out.to_owned())
 }
 
+/// Returns `body` as a prompt shows it for a request in `state`: with
+/// `(cancelled)` appended while a cancelled or failed request lingers, and
+/// `(timed out)` while a timed-out one lingers.
+#[must_use]
+pub fn outcome_body(body: &str, state: RequestState) -> String {
+    let suffix = match state {
+        RequestState::Lingering(EndReason::Cancelled | EndReason::Failed) => "(cancelled)",
+        RequestState::Lingering(EndReason::TimedOut) => "(timed out)",
+        RequestState::Waiting | RequestState::Lingering(EndReason::Touched) => {
+            return body.to_owned();
+        }
+    };
+    if body.is_empty() {
+        suffix.to_owned()
+    } else {
+        format!("{body} {suffix}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn body_shows_the_outcome_while_lingering() {
+        let lingering = RequestState::Lingering;
+        assert_eq!(
+            outcome_body("ssh waits", RequestState::Waiting),
+            "ssh waits"
+        );
+        assert_eq!(
+            outcome_body("ssh waits", lingering(EndReason::Touched)),
+            "ssh waits"
+        );
+        assert_eq!(
+            outcome_body("ssh waits", lingering(EndReason::Cancelled)),
+            "ssh waits (cancelled)"
+        );
+        assert_eq!(
+            outcome_body("ssh waits", lingering(EndReason::Failed)),
+            "ssh waits (cancelled)"
+        );
+        assert_eq!(
+            outcome_body("", lingering(EndReason::TimedOut)),
+            "(timed out)"
+        );
+    }
 
     #[test]
     fn control_characters_become_spaces() {

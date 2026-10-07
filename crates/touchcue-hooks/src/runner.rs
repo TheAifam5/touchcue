@@ -9,9 +9,10 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_util::sync::{CancellationToken, DropGuard};
 use tokio_util::task::TaskTracker;
 use touchcue_core::text::sanitize;
-use touchcue_core::{Hook, HookEvent, RateLimit};
+use touchcue_core::{Hook, HookEvent, RateLimit, RequestId, StopSignal};
 use tracing::Instrument as _;
 
+use crate::lifetime::{self, LIFETIME_PROCESSES, Lifetimes, PromptText};
 use crate::platform;
 
 /// Events queued per hook; an event that finds its hook's queue full is
@@ -26,7 +27,7 @@ const OUTPUT_LOG_MAX: usize = 4096;
 const KILL_WAIT: Duration = Duration::from_secs(2);
 /// Shortest interval between two warnings of one kind for one hook: a full
 /// queue, or a run that failed.
-const WARN_INTERVAL: Duration = Duration::from_secs(10);
+pub(crate) const WARN_INTERVAL: Duration = Duration::from_secs(10);
 
 /// How a run ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,6 +42,22 @@ pub(crate) enum Ending {
     TimedOut,
     /// The command was ended at shutdown.
     Killed,
+}
+
+/// How a command is ended once touchcue decides to end it.
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(
+    not(target_os = "linux"),
+    expect(dead_code, reason = "only the Linux runner starts commands")
+)]
+pub(crate) struct Stop {
+    /// Sent to the process group first.
+    pub(crate) signal: StopSignal,
+    /// Time between `signal` and `SIGKILL`.
+    pub(crate) grace: Duration,
+    /// Also sends `SIGKILL` to the group when the command exits on its own,
+    /// ending the processes it left running.
+    pub(crate) kill_group_on_exit: bool,
 }
 
 /// Result of a run whose command was started and reaped.
@@ -66,6 +83,8 @@ struct Job {
 
 #[derive(Debug)]
 struct Queue {
+    /// Index of the hook in the configuration.
+    index: usize,
     hook: Arc<Hook>,
     tx: mpsc::Sender<Job>,
     /// Limits the full-queue warnings of this hook across every sender.
@@ -76,16 +95,16 @@ struct Queue {
 
 /// Rate limit of one kind of repeating warning of one hook, on the Tokio clock.
 #[derive(Debug)]
-struct Warnings(Mutex<RateLimit>);
+pub(crate) struct Warnings(Mutex<RateLimit>);
 
 impl Warnings {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self(Mutex::new(RateLimit::new(WARN_INTERVAL)))
     }
 
     /// Returns how many warnings were held back since the last one let
     /// through, or `None` when this one is held back.
-    fn check(&self) -> Option<u64> {
+    pub(crate) fn check(&self) -> Option<u64> {
         let now = tokio::time::Instant::now().into_std();
         let mut limit = match self.0.lock() {
             Ok(limit) => limit,
@@ -99,22 +118,26 @@ impl Warnings {
 /// Failure to stop the hook runs.
 #[derive(Debug, thiserror::Error)]
 pub enum HooksError {
-    #[error("hook commands did not end within {KILL_WAIT:?} of being ended")]
+    #[error("hook commands did not end within {KILL_WAIT:?} of the shutdown drain")]
     StopTimeout(#[source] tokio::time::error::Elapsed),
 }
 
 /// Running hooks: one task per hook that starts its runs.
 ///
 /// A hook starts runs in the order its events were queued, at most
-/// `concurrency` at once; nothing is ordered across hooks. Dropping it
-/// ends every running command without waiting; [`Hooks::shutdown`] waits.
+/// `concurrency` at once; nothing is ordered across hooks. A hook with
+/// `until` runs processes for requests instead, as described on
+/// [`HookSender::request`]. Dropping it ends every running command without
+/// waiting; [`Hooks::shutdown`] waits.
 #[derive(Debug)]
 pub struct Hooks {
     sender: HookSender,
     stop: CancellationToken,
     kill: CancellationToken,
     tracker: TaskTracker,
-    _guard: DropGuard,
+    /// Tasks of the hooks with `until`.
+    lifetime_tracker: TaskTracker,
+    _guards: [DropGuard; 2],
 }
 
 impl Hooks {
@@ -122,19 +145,30 @@ impl Hooks {
     /// I/O and time enabled.
     #[must_use]
     pub fn spawn(hooks: Vec<Hook>) -> Self {
-        Self::with_queue(hooks, QUEUE)
+        Self::with_limits(hooks, QUEUE, LIFETIME_PROCESSES)
     }
 
+    #[cfg(all(test, target_os = "linux"))]
     fn with_queue(hooks: Vec<Hook>, capacity: usize) -> Self {
+        Self::with_limits(hooks, capacity, LIFETIME_PROCESSES)
+    }
+
+    pub(crate) fn with_limits(hooks: Vec<Hook>, capacity: usize, processes: usize) -> Self {
         let stop = CancellationToken::new();
         let kill = CancellationToken::new();
         let tracker = TaskTracker::new();
-        let queues: Arc<[Queue]> = hooks
+        let (lifetime, plain): (Vec<_>, Vec<_>) = hooks
             .into_iter()
             .enumerate()
+            .partition(|(_, hook)| hook.lifetime.is_some());
+        let lifetime_tracker = TaskTracker::new();
+        let lifetimes = lifetime::spawn(lifetime, &lifetime_tracker, &stop, processes);
+        let queues: Arc<[Queue]> = plain
+            .into_iter()
             .map(|(index, hook)| {
                 let (tx, rx) = mpsc::channel(capacity);
                 let queue = Queue {
+                    index,
                     hook: Arc::new(hook),
                     tx,
                     full: Warnings::new(),
@@ -157,11 +191,12 @@ impl Hooks {
             })
             .collect();
         Self {
-            sender: HookSender { queues },
+            sender: HookSender { queues, lifetimes },
+            _guards: [stop.clone().drop_guard(), kill.clone().drop_guard()],
             stop,
-            _guard: kill.clone().drop_guard(),
             kill,
             tracker,
+            lifetime_tracker,
         }
     }
 
@@ -175,25 +210,36 @@ impl Hooks {
     /// running runs, then ends the commands still running and drops the
     /// runs not started.
     ///
+    /// The processes of hooks with `until` get their stop signal at once,
+    /// and `SIGKILL` after their `stop_grace_ms`, at most 2 s; they are
+    /// waited for alongside, until the same deadline.
+    ///
     /// # Errors
     ///
-    /// Returns [`HooksError::StopTimeout`] when the ended commands are not
-    /// reaped within 2 s.
+    /// Returns [`HooksError::StopTimeout`] when the commands are not reaped
+    /// within `drain` plus 2 s.
     #[tracing::instrument(name = "hooks_shutdown", skip_all, err)]
     pub async fn shutdown(self, drain: Duration) -> Result<(), HooksError> {
+        let deadline = tokio::time::Instant::now() + drain + KILL_WAIT;
         self.stop.cancel();
         self.tracker.close();
+        self.lifetime_tracker.close();
         match tokio::time::timeout(drain, self.tracker.wait()).await {
-            Ok(()) => return Ok(()),
-            Err(_elapsed) => tracing::warn!(
-                drain_ms = millis(drain),
-                "hook commands still running; ending them"
-            ),
+            Ok(()) => {}
+            Err(_elapsed) => {
+                tracing::warn!(
+                    drain_ms = millis(drain),
+                    "hook commands still running; ending them"
+                );
+                self.kill.cancel();
+            }
         }
-        self.kill.cancel();
-        tokio::time::timeout(KILL_WAIT, self.tracker.wait())
-            .await
-            .map_err(HooksError::StopTimeout)
+        tokio::time::timeout_at(deadline, async {
+            self.tracker.wait().await;
+            self.lifetime_tracker.wait().await;
+        })
+        .await
+        .map_err(HooksError::StopTimeout)
     }
 }
 
@@ -201,11 +247,12 @@ impl Hooks {
 #[derive(Debug, Clone)]
 pub struct HookSender {
     queues: Arc<[Queue]>,
+    pub(crate) lifetimes: Lifetimes,
 }
 
 impl HookSender {
-    /// Queues a run of every hook that `event` with placeholder `values`
-    /// applies to, and returns how many were queued.
+    /// Queues a run of every hook without `until` that `event` with
+    /// placeholder `values` applies to, and returns how many were queued.
     ///
     /// A hook whose queue is full misses the newest event, with a warning
     /// rate-limited per hook; after [`Hooks::shutdown`] began, every hook
@@ -213,7 +260,8 @@ impl HookSender {
     pub fn fire(&self, event: HookEvent, values: &BTreeMap<String, String>) -> usize {
         let mut env = None;
         let mut queued = 0;
-        for (index, queue) in self.queues.iter().enumerate() {
+        for queue in self.queues.iter() {
+            let index = queue.index;
             if !queue.hook.applies(event, values) {
                 continue;
             }
@@ -245,6 +293,26 @@ impl HookSender {
             }
         }
         queued
+    }
+
+    /// Queues a change of request `id` for the hooks with `until`: the
+    /// hook `events` it fired, its placeholder `values`, and its rendered
+    /// `prompt`, `None` while a rule suppresses it or once it ended. The
+    /// process gets the title, and the body with the outcome appended as
+    /// the popup shows it.
+    ///
+    /// A hook with `until` starts a process for the request when one of
+    /// `events` is in its `on` and `values` match, and the prompt is shown;
+    /// the process is stopped when the prompt is suppressed and when the
+    /// request ends, which [`HookEvent::Ended`] in `events` marks.
+    pub fn request(
+        &self,
+        id: RequestId,
+        events: &[HookEvent],
+        values: &BTreeMap<String, String>,
+        prompt: Option<PromptText<'_>>,
+    ) {
+        self.lifetimes.request(id, events, values, prompt);
     }
 }
 
@@ -424,7 +492,7 @@ fn log_output(stream: &'static str, bytes: &[u8]) {
 }
 
 /// Returns `duration` in whole milliseconds, saturating at `u64::MAX`.
-fn millis(duration: Duration) -> u64 {
+pub(crate) fn millis(duration: Duration) -> u64 {
     duration
         .as_secs()
         .saturating_mul(1000)
@@ -465,6 +533,7 @@ mod tests {
             ],
             timeout_ms: 10_000,
             concurrency: 4,
+            lifetime: None,
         }
     }
 
@@ -477,6 +546,7 @@ mod tests {
             command: vec!["/nonexistent/touchcue-hook".to_owned()],
             timeout_ms: 10_000,
             concurrency: 4,
+            lifetime: None,
         }
     }
 
@@ -620,6 +690,44 @@ mod tests {
         }
         assert_eq!(lines.len(), 10);
         assert_eq!(most, 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn plain_and_until_hooks_run_side_by_side() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let until_out = dir.path().join("until");
+        let plain_out = dir.path().join("plain");
+        let mut until = hook(
+            &[HookEvent::Started],
+            "echo until >> \"$0\"; exec sleep 30",
+            &until_out,
+        );
+        until.lifetime = Some(touchcue_core::Lifetime {
+            on_change: touchcue_core::OnChange::Restart,
+            stop_signal: StopSignal::Term,
+            stop_grace_ms: 1000,
+            restart_interval_ms: 0,
+        });
+        let plain = hook(&[HookEvent::Started], "echo plain >> \"$0\"", &plain_out);
+        let hooks = Hooks::spawn(vec![until, plain]);
+        let sender = hooks.sender();
+        let indexes: Vec<usize> = sender.queues.iter().map(|queue| queue.index).collect();
+        assert_eq!(indexes, [1], "the plain hook keeps its configuration index");
+        assert_eq!(sender.fire(HookEvent::Started, &BTreeMap::new()), 1);
+        sender.request(
+            RequestId(1),
+            &[HookEvent::Started],
+            &BTreeMap::new(),
+            Some(PromptText {
+                title: "t",
+                body: "b",
+                state: touchcue_core::RequestState::Waiting,
+            }),
+        );
+        assert_eq!(wait_for_lines(&plain_out, 1).await?, ["plain"]);
+        assert_eq!(wait_for_lines(&until_out, 1).await?, ["until"]);
+        hooks.shutdown(Duration::from_secs(2)).await?;
         Ok(())
     }
 
