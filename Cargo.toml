@@ -13,7 +13,6 @@ repository = "https://github.com/theaifam5/touchcue"
 anyhow = "1.0.104"
 fontdb = { version = "0.24.0", default-features = false, features = ["std", "fs", "fontconfig", "memmap"] }
 freedesktop-desktop-entry = { version = "0.8.3", default-features = false }
-freedesktop-icons = "0.4.0"
 miette = { version = "7.6.0", default-features = false, features = ["derive"] }
 png = { version = "0.18.1", default-features = false }
 resvg = { version = "0.48.1", default-features = false }

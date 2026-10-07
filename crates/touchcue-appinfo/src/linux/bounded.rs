@@ -30,6 +30,38 @@ pub(crate) fn read_bounded(path: &Path, max: usize) -> Option<String> {
     }
 }
 
+/// Failure of [`read_text`].
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ReadError {
+    #[error("cannot read the file")]
+    Io(#[from] io::Error),
+    #[error("not a regular file")]
+    NotRegular,
+    #[error("file exceeds {max} bytes")]
+    TooLarge { max: usize },
+    #[error("file is not UTF-8")]
+    NotUtf8(#[from] std::string::FromUtf8Error),
+}
+
+impl ReadError {
+    /// Returns whether the file does not exist.
+    pub(crate) fn is_not_found(&self) -> bool {
+        matches!(self, Self::Io(error) if error.kind() == io::ErrorKind::NotFound)
+    }
+}
+
+/// Returns the UTF-8 content of the regular file at `path`, at most `max` bytes.
+///
+/// Opens like [`read_bounded`], so it never blocks on a FIFO.
+pub(crate) fn read_text(path: &Path, max: usize) -> Result<String, ReadError> {
+    let limit = max.saturating_add(1);
+    let bytes = try_read_prefix(path, limit)?.ok_or(ReadError::NotRegular)?;
+    if bytes.len() > max {
+        return Err(ReadError::TooLarge { max });
+    }
+    Ok(String::from_utf8(bytes)?)
+}
+
 /// Returns the first `max` bytes of the regular file at `path`, decoded lossily.
 ///
 /// The result is at most `max` bytes, cut on a char boundary. Fails like

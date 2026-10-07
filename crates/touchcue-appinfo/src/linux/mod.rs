@@ -3,10 +3,13 @@
 mod bounded;
 pub mod desktop;
 pub mod icon;
+mod ini;
 pub mod procfs;
+pub mod settings;
 #[cfg(test)]
 mod test_error;
 
+use std::env;
 use std::path::{Path, PathBuf};
 
 use touchcue_core::skip::{self, SkipList};
@@ -18,6 +21,7 @@ use touchcue_core::text::sanitize;
 use crate::TEXT_MAX;
 use crate::unit::{self, UnitApp};
 use desktop::ExeIndex;
+use icon::IconLookup;
 
 /// Maximum number of processes visited from a pid up its ancestry.
 const MAX_ANCESTRY: usize = 32;
@@ -34,7 +38,7 @@ const CHAIN_SEPARATOR: char = '←';
 pub struct Resolver {
     proc_root: PathBuf,
     data_dirs: Vec<PathBuf>,
-    icon_size: u16,
+    icons: IconLookup,
     locales: Vec<String>,
     skip: SkipList,
 }
@@ -86,16 +90,40 @@ struct Found {
 }
 
 impl Resolver {
-    /// Creates a resolver; desktop entry names are localized from the current locale environment.
+    /// Creates a resolver; desktop entry names are localized from the current
+    /// locale environment, and icons are looked up in the hicolor theme in
+    /// `~/.icons`, the `icons` directory of each of `data_dirs` and
+    /// `/usr/share/pixmaps`, with the home directory taken from `$HOME`.
     #[must_use]
     pub fn new(proc_root: PathBuf, data_dirs: Vec<PathBuf>, icon_size: u16) -> Self {
+        let home = env::var_os("HOME")
+            .map(PathBuf::from)
+            .filter(|home| home.is_absolute());
+        let icons = IconLookup::new(
+            icon::base_dirs(home.as_deref(), &data_dirs),
+            home,
+            icon::DEFAULT_THEME.to_owned(),
+            icon_size,
+        );
         Self {
             proc_root,
             data_dirs,
-            icon_size,
+            icons,
             locales: desktop::locales(),
             skip: SkipList::default(),
         }
+    }
+
+    /// Returns the resolver with application icons looked up by `icons`.
+    #[must_use]
+    pub fn with_icons(self, icons: IconLookup) -> Self {
+        Self { icons, ..self }
+    }
+
+    /// Returns the icon lookup used for application icons.
+    #[must_use]
+    pub fn icons(&self) -> &IconLookup {
+        &self.icons
     }
 
     /// Returns the resolver with `skip` used by [`Self::origin`] in place of the defaults.
@@ -458,9 +486,7 @@ impl Resolver {
         AppInfo {
             name: entry.name,
             id: Some(id),
-            icon: entry
-                .icon
-                .and_then(|icon| icon::resolve_icon(&icon, self.icon_size)),
+            icon: entry.icon.and_then(|icon| self.icons.resolve(&icon)),
             exe,
             pid: Some(pid),
             cmdline: None,
@@ -591,7 +617,7 @@ mod tests {
             Resolver {
                 proc_root: self.dir.path().join("proc"),
                 data_dirs: vec![self.dir.path().join("share")],
-                icon_size: 64,
+                icons: IconLookup::new(Vec::new(), None, icon::DEFAULT_THEME.to_owned(), 64),
                 locales: Vec::new(),
                 skip: SkipList::default(),
             }
