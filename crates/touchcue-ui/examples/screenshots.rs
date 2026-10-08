@@ -59,9 +59,9 @@ mod linux {
     const MAKO_NAMESPACE: &str = "notifications";
 
     const WAITING_TITLE: &str = "Touch your security key";
-    const BROWSER: &str = "Browser is waiting for fido2";
-    const SSH: &str = "ssh in Terminal is waiting for fido2";
-    const AGENT: &str = "claude in Terminal is waiting for openpgp";
+    const BROWSER: &str = "Browser is waiting for a passkey";
+    const SSH: &str = "ssh in Terminal is waiting for an SSH login";
+    const AGENT: &str = "claude in Terminal is waiting for a GPG signature";
 
     /// A screenshot example failure.
     #[derive(Debug, thiserror::Error)]
@@ -206,7 +206,7 @@ mod linux {
             shots: &[Shot {
                 title: "Touch your security key to approve the release signature \
                         requested by the build container running in the background",
-                body: "release-tool in Terminal is waiting for openpgp to sign \
+                body: "release-tool in Terminal is waiting for a GPG signature on \
                        the tag of version 4.2.0 of the example project, its source \
                        archive, the checksum file and the detached signatures of \
                        every binary built for the six supported targets, which \
@@ -226,7 +226,7 @@ mod linux {
                 waiting(SSH, "terminal.svg"),
                 Shot {
                     title: "Touch your key to sign the commit",
-                    body: "git in Terminal is waiting for openpgp",
+                    body: "git in Terminal is waiting for a GPG signature",
                     icon: Some("key.svg"),
                     end: None,
                 },
