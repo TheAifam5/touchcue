@@ -4,7 +4,7 @@ layout: home
 hero:
   name: touchcue
   text: Shows who is waiting for your security key touch
-  tagline: Early development. v0.1.1 works on Linux for FIDO2/U2F keys and OpenPGP cards through gpg-agent.
+  tagline: Early development. Works on Linux for FIDO2/U2F keys and OpenPGP cards through gpg-agent.
   image:
     src: /screenshots/stacked.png
     alt: Two stacked touchcue popups

@@ -18,8 +18,8 @@ When a hardware authenticator waits for a physical touch, touchcue shows a popup
 Each [release](https://github.com/theaifam5/touchcue/releases) has a `touchcue-<target>.tar.gz` archive per platform and a `SHA256SUMS` file. For x86_64 Linux with glibc:
 
 ```sh
-curl -LO https://github.com/theaifam5/touchcue/releases/download/v0.1.1/touchcue-x86_64-unknown-linux-gnu.tar.gz
-curl -LO https://github.com/theaifam5/touchcue/releases/download/v0.1.1/SHA256SUMS
+curl -LO https://github.com/theaifam5/touchcue/releases/latest/download/touchcue-x86_64-unknown-linux-gnu.tar.gz
+curl -LO https://github.com/theaifam5/touchcue/releases/latest/download/SHA256SUMS
 sha256sum -c --ignore-missing SHA256SUMS
 tar -xzf touchcue-x86_64-unknown-linux-gnu.tar.gz
 cd touchcue-x86_64-unknown-linux-gnu
@@ -84,12 +84,12 @@ touchcue run -v
 
 ### As a systemd user service
 
-The archives do not include the systemd unit. Download it from the repository, at the tag of your release:
+Each release also has the systemd unit, `touchcue.service`:
 
 ```sh
 mkdir -p ~/.config/systemd/user
 curl -Lo ~/.config/systemd/user/touchcue.service \
-  https://raw.githubusercontent.com/theaifam5/touchcue/v0.1.1/packaging/systemd/touchcue.service
+  https://github.com/theaifam5/touchcue/releases/latest/download/touchcue.service
 ```
 
 The unit runs `touchcue run`, which systemd finds only in `/usr/local/bin` and `/usr/bin`. For any other install path, override the command with `systemctl --user edit touchcue.service`, for example for `~/.local/bin`:
