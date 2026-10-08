@@ -10,6 +10,7 @@ git_tag_name = "v{{ version }}"
 release = false
 release_always = false
 semver_check = false
+features_always_increment_minor = true
 pr_labels = ["release"]
 
 [[package]]
