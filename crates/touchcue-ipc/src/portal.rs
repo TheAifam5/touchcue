@@ -50,7 +50,7 @@ impl Portal {
     /// [`PortalError::NoPortal`] when no portal runs or can be started by the
     /// bus, and
     /// [`PortalError::TimedOut`] when the bus does not answer in time.
-    #[tracing::instrument(name = "portal_connect", skip_all, err)]
+    #[tracing::instrument(name = "portal_connect", skip_all, err(level = "debug"))]
     pub async fn connect() -> Result<Self, PortalError> {
         timeout(PORTAL_TIMEOUT, Self::setup())
             .await
@@ -89,7 +89,7 @@ impl Portal {
     /// `ReadOne` or the setting, [`PortalError::TimedOut`] after
     /// [`PORTAL_TIMEOUT`], and [`PortalError::NotString`] for a value of
     /// another type.
-    #[tracing::instrument(name = "portal_read", skip_all, fields(namespace = %namespace, key = %key), err)]
+    #[tracing::instrument(name = "portal_read", skip_all, fields(namespace = %namespace, key = %key), err(level = "debug"))]
     pub async fn read_string(
         &self,
         namespace: &str,
