@@ -22,7 +22,7 @@ touchcue is a daemon and CLI. When a hardware authenticator waits for a physical
 | HMAC/OTP | planned | yes |
 | Shows the requesting application | yes, name and icon | no |
 | Output | own popup on Wayland and X11 (placement, monitor choice, optional modal dim), or desktop notifications | desktop notifications |
-| Message templates | placeholders for app, requester, process, device and request | `{{.Reasons}}` |
+| Message templates | Jinja templates with placeholders for app, requester, process, device and request | `{{.Reasons}}` |
 | Integration | JSON socket, D-Bus, the yubikey-touch-detector socket, and command hooks, including launchers such as rofi and fuzzel | yubikey-touch-detector socket, stdout |
 | Packages | GitHub releases, mise | Arch Linux, Nix flake, GitHub releases, `go install` |
 

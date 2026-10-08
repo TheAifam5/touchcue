@@ -1,6 +1,8 @@
 # OpenSSH security keys
 
-For `ed25519-sk` and `ecdsa-sk` keys, the FIDO source already shows the touch popup. `touchcue askpass` adds which key is being used and, when ssh-agent signs, for which remote user. The text is available in templates as `{request.detail}`, for example `ED25519-SK SHA256:… → user git`. OpenSSH does not report the destination host.
+::: v-pre
+For `ed25519-sk` and `ecdsa-sk` keys, the FIDO source already shows the touch popup. `touchcue askpass` adds which key is being used and, when ssh-agent signs, for which remote user. The text is available in templates as `{{ request.detail }}`, for example `ED25519-SK SHA256:… → user git`. OpenSSH does not report the destination host.
+:::
 
 `touchcue askpass` never creates a popup of its own: it only adds detail to the FIDO popup for the same touch.
 

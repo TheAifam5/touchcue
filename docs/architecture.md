@@ -5,7 +5,7 @@
 | Crate | Responsibility |
 | --- | --- |
 | `touchcue` | The `touchcue` binary: CLI, daemon loop, `check`, `gpg install`, the scdaemon wrapper and `askpass`. |
-| `touchcue-core` | Domain model, request state machine, CTAPHID and Assuan parsing, template engine and configuration, with no OS dependencies. |
+| `touchcue-core` | Domain model, request state machine, CTAPHID and Assuan parsing, prompt templates (MiniJinja) and configuration, with no OS dependencies. |
 | `touchcue-detect` | Sources of touch requests: the Linux hidraw watcher for FIDO keys. |
 | `touchcue-appinfo` | Resolves a process id to an application name, id and icon, and to the requester among its ancestors; looks up icons in icon themes and reads the icon theme from desktop settings files. |
 | `touchcue-ui` | Popup and notification backends. |

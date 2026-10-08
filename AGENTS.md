@@ -40,7 +40,7 @@ Cargo runs through mr-boxington (mbx) via mise. Set `MBX_DISABLE=1` to disable i
 ## Structure
 
 - `touchcue`: command-line interface (usage-rs definitions) and the tokio daemon.
-- `touchcue-core`: domain model, request state machine, template engine and configuration; no OS dependencies.
+- `touchcue-core`: domain model, request state machine, prompt templates (MiniJinja) and configuration; no OS dependencies.
 - `touchcue-detect`: platform sources of touch requests.
 - `touchcue-appinfo`: resolves a process id to an application name, id and icon; icon theme lookup and the icon theme of desktop settings files.
 - `touchcue-ui`: popup and notification backends.

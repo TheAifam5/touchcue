@@ -30,8 +30,8 @@ safety_timeout_s = 60
 # theme is detected when unset
 
 [templates]
-title = 'Touch {device.vendor|"your security key"}'
-body = '{requester.label|process.name|"An application"} is waiting for {request.method}'
+title = 'Touch {{ device.vendor or "your security key" }}'
+body = '{{ requester.label or process.name or "An application" }} is waiting for {{ request.method }}'
 
 [sources.fido]
 enabled = true
@@ -140,14 +140,16 @@ Without `theme`, `touchcue run` detects the theme once at start, from the first 
 
 ## `[templates]`
 
+::: v-pre
 | Key | Default |
 | --- | --- |
-| `title` | `Touch {device.vendor\|"your security key"}` |
-| `body` | `{requester.label\|process.name\|"An application"} is waiting for {request.method}` |
+| `title` | `Touch {{ device.vendor or "your security key" }}` |
+| `body` | `{{ requester.label or process.name or "An application" }} is waiting for {{ request.method }}` |
+:::
 
 The default body names the requester and its application through [`requester.label`](./placeholders#requester): `claude in Kitty is waiting for openpgp`, or `Firefox is waiting for fido2` when the application asks itself.
 
-Templates use [placeholders](./placeholders). A request that ended without a touch keeps its prompt briefly, with `(cancelled)` or `(timed out)` appended to the body.
+Templates use Jinja syntax with [placeholders](./placeholders#template-syntax). A template that fails while rendering is replaced by the next of: the matching rule's template, the `[templates]` template, the default above, and an empty text. A request that ended without a touch keeps its prompt briefly, with `(cancelled)` or `(timed out)` appended to the body.
 
 ## `[[rules]]`
 
@@ -157,6 +159,7 @@ Rules change the prompt for matching requests. The first rule whose `match` entr
 [[rules]]
 match = { "process.name" = "ssh", "request.method" = "fido2" }
 title = "Touch your key for ssh"
+body = '{{ requester.label or "ssh" }} is signing in{% if request.detail %}: {{ request.detail }}{% endif %}'
 icon = "utilities-terminal"
 
 [[rules]]

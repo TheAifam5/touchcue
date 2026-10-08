@@ -2,15 +2,38 @@
 
 Templates in `[templates]` and `[[rules]]` substitute values from the current touch request. `[[rules]]` match on the same names.
 
-## Grammar
+## Template syntax
+
+Templates use Jinja syntax, rendered by [MiniJinja](https://docs.rs/minijinja/2/minijinja/syntax/index.html). Earlier versions of touchcue used single braces, as in `{app.name|"An application"}`; such a template is now a configuration error. A placeholder `namespace.field` from the table below is written as an attribute, such as `app.name`:
 
 ```text
-{path}               value at path
-{a|b|"literal"}      first of a, b that has a non-empty value, otherwise the literal
-{{ and }}            a literal { and }
+{{ request.method }}                               the value of a placeholder
+{{ app.name or process.name or "An application" }} the first value that is not empty, else the literal
+{{ requester.name }}{% if app.name %} ({{ app.name }}){% endif %}
+                                                   text only when a value is not empty
+{% if request.method == "openpgp" %}…{% else %}…{% endif %}
+                                                   a branch
+{{ requester.name | upper }}                       a filter
+{%- if app.name %} … {% endif -%}                  - removes the whitespace before or after a block
+{% raw %}{{ }}{% endraw %}                         literal braces
 ```
 
-Inside a literal, `\"` and `\\` are the only escapes. An unknown name or a syntax error is a configuration error.
+::: v-pre
+- Every value is a string. A value that is not known is undefined: it renders empty and is false, and so is an empty string. `app.name` renders empty when there is no application.
+- Comparisons compare strings, as in `request.count == "2"`. Convert with `int` to compare numbers: `request.count | int > 1`. A comparison printed directly renders `True` or `False`.
+- The built-in [filters](https://docs.rs/minijinja/2/minijinja/filters/index.html) and [tests](https://docs.rs/minijinja/2/minijinja/tests/index.html) are available, for example the filters `upper`, `lower`, `title`, `capitalize`, `trim`, `replace`, `default`, `first`, `length` and `int`, and the tests `defined`, `startingwith`, `endingwith` and `in`. The filters `format`, `indent`, `slice` and `batch` are not available. Of the global functions, `range`, `dict` and `namespace` are available. Methods, as in `app.name.upper()`, are not: use a filter.
+- `{% set %}`, `{% with %}`, `{% for %}` and `{% filter %}` work. Macros, `include`, `extends` and `import` do not: they are syntax errors.
+- Whitespace is kept as written, except that one trailing newline of the template is removed. A `-` inside a block's delimiter, as in `{%-`, `-%}`, `{{-` or `-}}`, removes the whitespace, newlines included, on that side of the block; this helps in templates written as multi-line TOML strings.
+- The output is plain text and is not HTML-escaped.
+:::
+
+::: v-pre
+When the configuration is loaded, a syntax error or an unknown name is a configuration error that points at the offending text. A name is known when it is a placeholder written `namespace.field`, a name the template sets with `set`, `with` or `for`, or one of the global functions above. A whole namespace, as in `{{ app }}` or `app["name"]`, is unknown: write `app.name`.
+:::
+
+A failure that only shows while rendering does not lose the prompt. Such failures are an unknown filter or test, an operation on values of the wrong type as in `request.count + 1`, a render that runs more than 1,000 instructions or writes more than 64 KiB, and a render that takes longer than 200 ms. A failed rule template is replaced by the `[templates]` template, and that by the built-in default; a render that takes too long uses the built-in defaults. The daemon logs the failed template's name and the error, at most once a minute per template.
+
+Templates are trusted configuration, written by the owner of the configuration file. The limits above bound the number of instructions and the output of a render, not the time or memory a single instruction takes: an expression such as `"x" * 100000000` builds a string of 100 MB, and joining strings with `~` in a loop can double one at each step. A render that does not finish keeps running in the background; until it ends, every prompt uses the built-in templates and the daemon logs a warning at most once a minute.
 
 ## Names
 
@@ -22,7 +45,9 @@ Inside a literal, `\"` and `\\` are the only escapes. An unknown name or a synta
 | `device` | `vendor`, `model`, `product`, `vid`, `pid`, `kind`, `transport` |
 | `request` | `method`, `op`, `source`, `class`, `confidence`, `elapsed`, `count`, `state`, `detail` |
 
-`process` is the client process that talks to the device or to gpg-agent, such as `gpg` or `ssh-sk-helper`. `requester` is the program that asked it to, such as `claude` running `git commit -S`. `app` is the desktop application they run in, such as Kitty. A value that is not known is empty, so give a fallback, as in `{requester.label|process.name|"An application"}`.
+::: v-pre
+`process` is the client process that talks to the device or to gpg-agent, such as `gpg` or `ssh-sk-helper`. `requester` is the program that asked it to, such as `claude` running `git commit -S`. `app` is the desktop application they run in, such as Kitty. A value that is not known is empty, so give a fallback, as in `{{ requester.label or process.name or "An application" }}`.
+:::
 
 `process.name` is the client's `comm`. `requester.name` and the names in `process.chain` are the process's `comm`, else its executable's file name. `process.chain` lists the names from the client up to the application's process, client first, for example `gpg ← git ← bash ← claude ← nu ← kitty`: at most 8 names of at most 32 characters each. A longer chain keeps the first 7 names and the last, with `…` between them, as in `gpg ← git ← bash ← claude ← nu ← herdr ← herdr ← … ← kitty`.
 
