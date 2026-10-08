@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/TheAifam5/touchcue/compare/v0.1.1...v0.2.0) - 2026-10-08
+
+### Added
+
+- *(ipc)* read desktop settings from the portal
+
+### Fixed
+
+- *(ipc)* log expected portal misses at debug
+
+### Other
+
+- *(ipc)* list the requester and chain placeholders as published
+
 ## [0.1.1](https://github.com/TheAifam5/touchcue/compare/v0.1.0...v0.1.1) - 2026-10-06
 
 ### Added

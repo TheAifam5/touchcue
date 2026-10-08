@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/TheAifam5/touchcue/compare/v0.1.1...v0.2.0) - 2026-10-08
+
+### Added
+
+- *(core)* render templates with MiniJinja
+- *(core)* configure rule icons and the icon theme
+- *(core)* configure hooks that last for a request
+- *(core)* name the process that requested the touch
+
 ## [0.1.1](https://github.com/TheAifam5/touchcue/compare/v0.1.0...v0.1.1) - 2026-10-06
 
 ### Added

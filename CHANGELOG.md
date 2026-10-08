@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/TheAifam5/touchcue/compare/v0.1.1...v0.2.0) - 2026-10-08
+
+### Added
+
+- *(cli)* render prompts off the async runtime
+- *(cli)* use the detected icon theme for app and rule icons
+- *(cli)* run hooks that last for a request
+- *(core)* name the process that requested the touch
+- *(core)* render templates with MiniJinja
+- *(core)* configure rule icons and the icon theme
+- *(core)* configure hooks that last for a request
+- *(appinfo)* look up icons in the user's icon theme
+- *(ipc)* read desktop settings from the portal
+- *(hooks)* keep a command running while a request waits
+
+### Fixed
+
+- *(ipc)* log expected portal misses at debug
+
+### Other
+
+- *(ui)* use the shared outcome suffix
+- point the install steps at v0.1.1 and fix stale text
+- *(ipc)* list the requester and chain placeholders as published
+- *(hooks)* treat ESRCH as an ended process
+
 ## [0.1.1](https://github.com/TheAifam5/touchcue/compare/v0.1.0...v0.1.1) - 2026-10-06
 
 ### Added
