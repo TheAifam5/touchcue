@@ -1381,7 +1381,7 @@ checksum = "7d56353a2a665ad0f41a421187180aab746c8c325620617ad883a99a1cbe66d2"
 
 [[package]]
 name = "touchcue"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "miette",
@@ -1403,7 +1403,7 @@ dependencies = [
 
 [[package]]
 name = "touchcue-appinfo"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "freedesktop-desktop-entry",
  "rustix",
@@ -1415,7 +1415,7 @@ dependencies = [
 
 [[package]]
 name = "touchcue-core"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "miette",
  "minijinja",
@@ -1426,7 +1426,7 @@ dependencies = [
 
 [[package]]
 name = "touchcue-detect"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "rustix",
  "tempfile",
@@ -1439,11 +1439,11 @@ dependencies = [
 
 [[package]]
 name = "touchcue-helper"
-version = "0.2.1"
+version = "0.2.2"
 
 [[package]]
 name = "touchcue-hooks"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "rustix",
  "serde_json",
@@ -1457,7 +1457,7 @@ dependencies = [
 
 [[package]]
 name = "touchcue-ipc"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "rustix",
  "serde",
@@ -1473,7 +1473,7 @@ dependencies = [
 
 [[package]]
 name = "touchcue-ui"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "fontdb",
  "png",
@@ -1901,7 +1901,7 @@ checksum = "b9cc00251562a284751c9973bace760d86c0276c471b4be569fe6b068ee97a56"
 
 [[package]]
 name = "xtask"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "touchcue",

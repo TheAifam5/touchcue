@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2](https://github.com/TheAifam5/touchcue/compare/v0.2.1...v0.2.2) - 2026-10-08
+
+### Other
+
+- update Cargo.lock dependencies
+
 ## [0.1.0](https://github.com/TheAifam5/touchcue/releases/tag/v0.1.0) - 2026-10-06
 
 ### Added
