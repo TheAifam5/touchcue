@@ -1489,6 +1489,7 @@ dependencies = [
  "tokio-util",
  "touchcue-core",
  "tracing",
+ "tracing-subscriber",
  "x11rb",
  "zbus",
 ]
