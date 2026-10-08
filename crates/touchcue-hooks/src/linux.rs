@@ -264,7 +264,13 @@ mod tests {
             Ok(stat) => Ok(stat
                 .rsplit_once(") ")
                 .is_some_and(|(_, rest)| rest.starts_with('Z'))),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+            // A process that exits during the read makes it fail with ESRCH.
+            Err(error)
+                if error.kind() == io::ErrorKind::NotFound
+                    || error.raw_os_error() == Some(rustix::io::Errno::SRCH.raw_os_error()) =>
+            {
+                Ok(true)
+            }
             Err(error) => Err(error.into()),
         }
     }
