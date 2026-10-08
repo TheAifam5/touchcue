@@ -6,7 +6,7 @@ use std::io;
 use std::os::fd::{AsFd, AsRawFd, RawFd};
 use std::time::{Duration, Instant};
 
-use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState, Region};
+use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState, Region, SurfaceData};
 use smithay_client_toolkit::output::{OutputHandler, OutputState};
 use smithay_client_toolkit::reexports::client::backend::WaylandError;
 use smithay_client_toolkit::reexports::client::globals::{GlobalList, registry_queue_init};
@@ -703,8 +703,9 @@ impl Popups {
     fn restack(&mut self) {
         let mut groups: Vec<Option<wl_output::WlOutput>> = Vec::new();
         for surface in self.surfaces.values().flatten() {
-            if !groups.contains(&surface.output) {
-                groups.push(surface.output.clone());
+            let group = surface.stack_output();
+            if !groups.contains(&group) {
+                groups.push(group);
             }
         }
         for group in groups {
@@ -712,7 +713,7 @@ impl Popups {
                 .surfaces
                 .values_mut()
                 .flatten()
-                .filter(|surface| surface.output == group)
+                .filter(|surface| surface.stack_output() == group)
                 .collect();
             let heights: Vec<i32> = members
                 .iter()
@@ -730,6 +731,20 @@ impl Popups {
                 );
             }
         }
+    }
+}
+
+impl Surface {
+    /// Returns the output whose stack the surface belongs to: the requested
+    /// one, else the first output the compositor reports the surface on, so
+    /// a popup left to the compositor's choice joins the popups there.
+    fn stack_output(&self) -> Option<wl_output::WlOutput> {
+        self.output.clone().or_else(|| {
+            self.layer
+                .wl_surface()
+                .data::<SurfaceData<()>>()
+                .and_then(|data| data.outputs().next())
+        })
     }
 }
 
@@ -1005,18 +1020,37 @@ impl CompositorHandler for Popups {
         &mut self,
         _: &Connection,
         _: &QueueHandle<Self>,
-        _: &wl_surface::WlSurface,
+        surface: &wl_surface::WlSurface,
         _: &wl_output::WlOutput,
     ) {
+        self.outputs_changed(surface);
     }
 
     fn surface_leave(
         &mut self,
         _: &Connection,
         _: &QueueHandle<Self>,
-        _: &wl_surface::WlSurface,
+        surface: &wl_surface::WlSurface,
         _: &wl_output::WlOutput,
     ) {
+        self.outputs_changed(surface);
+    }
+}
+
+impl Popups {
+    /// Restacks after the compositor moved the surface of a popup without a
+    /// requested output, which may move it to another output's stack.
+    fn outputs_changed(&mut self, surface: &wl_surface::WlSurface) {
+        let moved = self.surfaces.iter().find_map(|(id, popups)| {
+            popups
+                .iter()
+                .any(|popup| popup.output.is_none() && popup.layer.wl_surface() == surface)
+                .then_some(*id)
+        });
+        if let Some(id) = moved {
+            debug!(%id, "popup output changed; restacking");
+            self.restack();
+        }
     }
 }
 
