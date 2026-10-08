@@ -1107,7 +1107,7 @@ mod tests {
         );
         let prompt = prompt.ok_or(TestError::NoPrompt)?;
         assert_eq!(prompt.title, "Touch Yubico");
-        assert_eq!(prompt.body, "Firefox is waiting for fido2");
+        assert_eq!(prompt.body, "Firefox is waiting for a passkey");
         assert_eq!(prompt.icon, Some(PathBuf::from("/icons/firefox.png")));
         Ok(())
     }
@@ -1150,7 +1150,7 @@ mod tests {
             .await;
             let prompt = prompt.ok_or(TestError::NoPrompt)?;
             assert_eq!(prompt.title, "Touch Yubico");
-            assert_eq!(prompt.body, "Firefox is waiting for fido2");
+            assert_eq!(prompt.body, "Firefox is waiting for a passkey");
         }
         // Each template logged its first failure and held back the second.
         let later = now + TEMPLATE_WARN_INTERVAL;
@@ -1179,7 +1179,7 @@ mod tests {
         )
         .await;
         let prompt = prompt.ok_or(TestError::NoPrompt)?;
-        assert_eq!(prompt.body, "Firefox is waiting for fido2");
+        assert_eq!(prompt.body, "Firefox is waiting for a passkey");
         assert_eq!(prompt.icon, Some(PathBuf::from("/icons/fixture.svg")));
         // Logged at `now` under its reason only.
         let busy = renderer.unfinished_limits.get_mut("busy");
@@ -1204,7 +1204,7 @@ mod tests {
         )
         .await;
         let prompt = prompt.ok_or(TestError::NoPrompt)?;
-        assert_eq!(prompt.body, "Firefox is waiting for fido2");
+        assert_eq!(prompt.body, "Firefox is waiting for a passkey");
         assert_eq!(prompt.icon, Some(PathBuf::from("/icons/fixture.svg")));
         let panicked = renderer.unfinished_limits.get_mut("panicked");
         assert_eq!(panicked.and_then(|limit| limit.check(now)), None);
@@ -1280,7 +1280,7 @@ mod tests {
             Some("low")
         );
         let prompt = prompt.ok_or(TestError::NoPrompt)?;
-        assert_eq!(prompt.body, "An application is waiting for fido2");
+        assert_eq!(prompt.body, "An application is waiting for a passkey");
         assert_eq!(prompt.icon, None);
         Ok(())
     }
@@ -1306,7 +1306,7 @@ mod tests {
         .await;
         assert_eq!(
             prompt.ok_or(TestError::NoPrompt)?.body,
-            "claude in Firefox is waiting for fido2"
+            "claude in Firefox is waiting for a passkey"
         );
         assert_eq!(
             values.get("process.chain").map(String::as_str),
@@ -1428,7 +1428,7 @@ mod tests {
         assert_eq!(
             d.into_sink().out,
             [
-                Out::Show(id, "Firefox is waiting for fido2".to_owned()),
+                Out::Show(id, "Firefox is waiting for a passkey".to_owned()),
                 Out::Publish("started", id, high.clone()),
                 Out::Update(
                     id,
@@ -1634,7 +1634,7 @@ mod tests {
             d.into_sink().out,
             [
                 Out::Publish("started", id, high.clone()),
-                Out::Show(id, "Firefox is waiting for fido2".to_owned()),
+                Out::Show(id, "Firefox is waiting for a passkey".to_owned()),
                 Out::Publish("updated", id, high),
             ]
         );
@@ -1735,11 +1735,11 @@ mod tests {
         assert_eq!(
             d.into_sink().out,
             [
-                Out::Show(first, "Firefox is waiting for openpgp".to_owned()),
+                Out::Show(first, "Firefox is waiting for a GPG signature".to_owned()),
                 Out::Publish("started", first, high.clone()),
                 Out::Hide(first),
                 Out::Publish("ended", first, high.clone()),
-                Out::Show(second, "Firefox is waiting for openpgp".to_owned()),
+                Out::Show(second, "Firefox is waiting for a GPG signature".to_owned()),
                 Out::Publish("started", second, high.clone()),
                 Out::Hide(second),
                 Out::Publish("ended", second, high),

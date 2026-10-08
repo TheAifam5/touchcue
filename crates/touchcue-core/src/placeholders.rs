@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use crate::machine::Request;
-use crate::model::Device;
+use crate::model::{Device, Method, Op, Source};
 use crate::text::sanitize;
 
 /// Every key a template may reference.
@@ -37,6 +37,7 @@ pub const KNOWN: &[&str] = &[
     "device.transport",
     "request.method",
     "request.op",
+    "request.action",
     "request.source",
     "request.class",
     "request.confidence",
@@ -198,6 +199,10 @@ pub fn values(
 
     put("request.method", Some(request.method.as_str().to_owned()));
     put("request.op", request.op.map(|op| op.as_str().to_owned()));
+    put(
+        "request.action",
+        Some(action(request.method, request.op, request.source).to_owned()),
+    );
     put("request.source", Some(request.source.as_str().to_owned()));
     put("request.class", Some(request.class.as_str().to_owned()));
     put("request.confidence", Some(confidence.as_str().to_owned()));
@@ -213,6 +218,33 @@ pub fn values(
             .and_then(|detail| sanitize(detail, DETAIL_MAX)),
     );
     out
+}
+
+/// Returns `request.action`: what the request waits for, worded for people,
+/// such as `a passkey sign-in` or `a GPG signature`.
+///
+/// A request from gpg-agent's ssh socket reads `an SSH login` whatever its
+/// method; an operation without its own wording reads as its method's.
+#[must_use]
+pub fn action(method: Method, op: Option<Op>, source: Source) -> &'static str {
+    if source == Source::Ssh {
+        return "an SSH login";
+    }
+    match (method, op) {
+        (Method::Fido2 | Method::U2f, Some(Op::Assert)) => "a passkey sign-in",
+        (Method::Fido2 | Method::U2f, Some(Op::Register)) => "a new passkey",
+        (Method::Fido2 | Method::U2f, _) => "a passkey",
+        (Method::OpenPgp, Some(Op::Sign)) => "a GPG signature",
+        (Method::OpenPgp, Some(Op::Decrypt)) => "GPG decryption",
+        (Method::OpenPgp, Some(Op::Auth)) => "GPG authentication",
+        (Method::OpenPgp, _) => "a GPG operation",
+        (Method::Ssh, _) => "an SSH login",
+        (Method::Piv, _) => "a smart card (PIV) operation",
+        (Method::Oath, _) => "a one-time code",
+        (Method::Hmac, _) => "a challenge-response",
+        (Method::Fingerprint, _) => "a fingerprint",
+        (Method::Wallet, _) => "a wallet confirmation",
+    }
 }
 
 /// Longest `requester.label`, in chars: two 128-char names and ` in `.
@@ -317,6 +349,7 @@ mod tests {
         assert_eq!(get(&v, "request.class"), Some("disappearance"));
         assert_eq!(get(&v, "request.method"), Some("fido2"));
         assert_eq!(get(&v, "request.op"), Some("assert"));
+        assert_eq!(get(&v, "request.action"), Some("a passkey sign-in"));
         assert_eq!(get(&v, "request.count"), Some("2"));
         assert_eq!(get(&v, "request.confidence"), Some("low"));
         assert_eq!(get(&v, "request.state"), Some("waiting"));
@@ -481,6 +514,63 @@ mod tests {
             r.state = state;
             let v = values(&r, None, None, None, None, Confidence::High, base);
             assert_eq!(get(&v, "request.state"), Some(name));
+        }
+    }
+
+    #[test]
+    fn action_words_method_and_op() {
+        let cases = [
+            (Method::Fido2, None, Source::Fido, "a passkey"),
+            (
+                Method::Fido2,
+                Some(Op::Assert),
+                Source::Fido,
+                "a passkey sign-in",
+            ),
+            (
+                Method::U2f,
+                Some(Op::Register),
+                Source::Fido,
+                "a new passkey",
+            ),
+            (
+                Method::OpenPgp,
+                Some(Op::Sign),
+                Source::Gpg,
+                "a GPG signature",
+            ),
+            (
+                Method::OpenPgp,
+                Some(Op::Decrypt),
+                Source::Gpg,
+                "GPG decryption",
+            ),
+            (
+                Method::OpenPgp,
+                Some(Op::Auth),
+                Source::Gpg,
+                "GPG authentication",
+            ),
+            (Method::OpenPgp, Some(Op::Auth), Source::Ssh, "an SSH login"),
+            (
+                Method::OpenPgp,
+                Some(Op::Verify),
+                Source::Gpg,
+                "a GPG operation",
+            ),
+            (
+                Method::Piv,
+                Some(Op::Sign),
+                Source::Ccid,
+                "a smart card (PIV) operation",
+            ),
+        ];
+        for (method, op, source, expected) in cases {
+            assert_eq!(
+                action(method, op, source),
+                expected,
+                "{method:?} {op:?} {source:?}"
+            );
         }
     }
 }

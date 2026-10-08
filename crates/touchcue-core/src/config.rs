@@ -40,7 +40,7 @@ const MAX_STOP_GRACE_MS: u64 = 2000;
 pub const LIFETIME_PROCESSES: usize = 8;
 /// Default of `hooks.restart_interval_ms`.
 const DEFAULT_RESTART_INTERVAL_MS: u64 = 200;
-const DEFAULT_BODY: &str = "{{ requester.label or process.name or \"An application\" }} is waiting for {{ request.method }}";
+const DEFAULT_BODY: &str = "{{ requester.label or process.name or \"An application\" }} is waiting for {{ request.action }}";
 
 /// Where touch prompts are shown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
@@ -1439,10 +1439,13 @@ mod tests {
         assert_eq!(Template::parse(BODY, DEFAULT_BODY)?.source(), DEFAULT_BODY);
         let cfg = Config::default();
         let rendered = cfg
-            .rendered(&values(&[("request.method", "fido2")]))
+            .rendered(&values(&[
+                ("request.method", "fido2"),
+                ("request.action", "a passkey"),
+            ]))
             .ok_or("suppressed")?;
         assert_eq!(rendered.title, "Touch your security key");
-        assert_eq!(rendered.body, "An application is waiting for fido2");
+        assert_eq!(rendered.body, "An application is waiting for a passkey");
         assert_eq!(rendered.icon, None);
         assert_eq!(rendered.errors, []);
         let rendered = cfg
@@ -1459,7 +1462,10 @@ mod tests {
     fn default_body_names_label_then_process() {
         let cfg = Config::default();
         let body = |pairs: &[(&str, &str)]| {
-            let mut all = vec![("request.method", "openpgp")];
+            let mut all = vec![
+                ("request.method", "openpgp"),
+                ("request.action", "a GPG signature"),
+            ];
             all.extend_from_slice(pairs);
             cfg.rendered(&values(&all)).map(|rendered| rendered.body)
         };
@@ -1469,23 +1475,26 @@ mod tests {
         ];
         assert_eq!(
             body(&claude).as_deref(),
-            Some("claude in Kitty is waiting for openpgp")
+            Some("claude in Kitty is waiting for a GPG signature")
         );
         let firefox = [("requester.label", "Firefox"), ("process.name", "firefox")];
         assert_eq!(
             body(&firefox).as_deref(),
-            Some("Firefox is waiting for openpgp")
+            Some("Firefox is waiting for a GPG signature")
         );
         let unnamed = [("process.name", "gpg")];
         assert_eq!(
             body(&unnamed).as_deref(),
-            Some("gpg is waiting for openpgp")
+            Some("gpg is waiting for a GPG signature")
         );
         let empty = [("requester.label", ""), ("process.name", "gpg")];
-        assert_eq!(body(&empty).as_deref(), Some("gpg is waiting for openpgp"));
+        assert_eq!(
+            body(&empty).as_deref(),
+            Some("gpg is waiting for a GPG signature")
+        );
         assert_eq!(
             body(&[]).as_deref(),
-            Some("An application is waiting for openpgp")
+            Some("An application is waiting for a GPG signature")
         );
     }
 
@@ -1872,13 +1881,14 @@ mod tests {
             .rendered(&values(&[
                 ("process.name", "ssh"),
                 ("request.method", "fido2"),
+                ("request.action", "a passkey"),
             ]))
             .ok_or("suppressed")?;
         assert_eq!(
             both,
             Rendered {
                 title: "SSH key".to_owned(),
-                body: "ssh is waiting for fido2".to_owned(),
+                body: "ssh is waiting for a passkey".to_owned(),
                 icon: Some("ssh-icon".to_owned()),
                 errors: Vec::new(),
             }
@@ -1921,11 +1931,12 @@ mod tests {
             .rendered(&values(&[
                 ("process.name", "ssh"),
                 ("request.method", "fido2"),
+                ("request.action", "a passkey"),
                 ("request.count", "1"),
             ]))
             .ok_or("suppressed")?;
         assert_eq!(rendered.title, "Touch your security key");
-        assert_eq!(rendered.body, "ssh is waiting for fido2");
+        assert_eq!(rendered.body, "ssh is waiting for a passkey");
         let failed: Vec<_> = rendered
             .errors
             .iter()
@@ -1954,7 +1965,11 @@ mod tests {
             icon = "ssh-icon"
             "#,
         )?;
-        let request = values(&[("process.name", "ssh"), ("request.method", "fido2")]);
+        let request = values(&[
+            ("process.name", "ssh"),
+            ("request.method", "fido2"),
+            ("request.action", "a passkey"),
+        ]);
         let rendered = cfg.rendered(&request).ok_or("suppressed")?;
         assert_eq!(rendered.body, "ssh wants fido2");
         assert_eq!(rendered.errors.len(), 1);
@@ -1963,7 +1978,7 @@ mod tests {
             fallback,
             Rendered {
                 title: "Touch your security key".to_owned(),
-                body: "ssh is waiting for fido2".to_owned(),
+                body: "ssh is waiting for a passkey".to_owned(),
                 icon: Some("ssh-icon".to_owned()),
                 errors: Vec::new(),
             }
