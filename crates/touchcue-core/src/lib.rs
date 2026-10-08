@@ -1,4 +1,4 @@
-//! Domain model, request state machine, template engine and configuration, with no OS dependencies.
+//! Domain model, request state machine, prompt templates and configuration, with no OS dependencies.
 
 pub mod assuan;
 pub mod config;
@@ -23,4 +23,4 @@ pub use model::{
     Transport,
 };
 pub use placeholders::{AppInfo, Confidence, ProcessInfo, Requester};
-pub use template::{Template, TemplateError, TemplateErrorKind};
+pub use template::{RenderError, Template, TemplateError};

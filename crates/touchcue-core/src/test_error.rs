@@ -3,7 +3,7 @@
 use thiserror::Error;
 
 use crate::config::ConfigError;
-use crate::template::TemplateError;
+use crate::template::{RenderError, TemplateError};
 
 /// Failure of a test step.
 #[derive(Debug, Error)]
@@ -12,6 +12,8 @@ pub(crate) enum TestError {
     Config(#[from] ConfigError),
     #[error(transparent)]
     Template(#[from] TemplateError),
+    #[error(transparent)]
+    Render(#[from] RenderError),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error("{0}")]

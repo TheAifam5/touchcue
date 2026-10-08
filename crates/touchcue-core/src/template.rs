@@ -1,268 +1,464 @@
-//! Text templates with placeholder fallback chains.
+//! Prompt templates in Jinja syntax, rendered by minijinja.
 //!
-//! Grammar:
+//! Every placeholder key `a.b` of [`KNOWN`] is the attribute `b` of the
+//! variable `a`, and every value is a string, so comparisons compare
+//! strings. An absent value is undefined: it renders empty and is false,
+//! like an empty string. Built-in filters other than [`REMOVED_FILTERS`],
+//! built-in tests and the global functions `range`, `dict` and `namespace`
+//! are available; macros, `include`, `extends` and `import` are not. Output
+//! is not escaped, and one trailing newline of the template is removed.
 //!
-//! - `{path}` inserts the value of a key from [`KNOWN`]. A path is one or more
-//!   segments of `a-z`, `0-9` and `_`, separated by `.`.
-//! - `{a|b|"literal"}` inserts the first key with a non-empty value. A
-//!   double-quoted literal always applies when reached; inside it `\"` and
-//!   `\\` are the only escapes.
-//! - `{{` and `}}` insert `{` and `}`.
+//! Templates are trusted configuration. [`FUEL`] and [`OUTPUT_MAX`] bound a
+//! render's instructions and output, but not the strings it builds on the
+//! way: one `*` may build 100 MB, and `~` may double a string per
+//! instruction.
 
-use std::collections::BTreeMap;
-use std::iter::Peekable;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+use std::io;
 use std::ops::Range;
-use std::str::CharIndices;
+use std::sync::Arc;
+
+use minijinja::{AutoEscape, Environment, ErrorKind, UndefinedBehavior};
 
 use crate::placeholders::KNOWN;
 
-/// A parsed template whose keys are all in [`KNOWN`].
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// Most instructions one render executes; a render that needs more fails.
+/// The default templates and the documented examples need at most 30.
+pub const FUEL: u64 = 1000;
+/// Longest rendered output, in bytes; a render that writes more fails.
+pub const OUTPUT_MAX: usize = 64 * 1024;
+/// Deepest nesting of blocks, loops and calls while rendering.
+pub const RECURSION_LIMIT: usize = 32;
+/// Built-in filters that are not available, because they allocate memory in
+/// proportion to an argument rather than to their input.
+pub const REMOVED_FILTERS: [&str; 4] = ["format", "indent", "slice", "batch"];
+
+/// A compiled template whose variables are all in [`KNOWN`].
+///
+/// Clones share the compiled form. Two templates are equal when their names
+/// and sources are equal.
+#[derive(Clone)]
 pub struct Template {
-    segments: Vec<Segment>,
+    name: String,
+    source: String,
+    env: Arc<Environment<'static>>,
+    /// Why `source` is not in `env`, for a template made by [`Template::uncompiled`].
+    error: Option<TemplateError>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Segment {
-    Text(String),
-    Slot(Vec<Choice>),
+/// A template that does not compile or names an unknown placeholder.
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum TemplateError {
+    #[error(transparent)]
+    Syntax { source: Arc<minijinja::Error> },
+    /// A variable or attribute outside [`KNOWN`]; `span` is its first
+    /// occurrence in the template text, preferring one inside a block.
+    #[error("unknown placeholder `{name}`")]
+    UnknownKey {
+        name: String,
+        span: Option<Range<usize>>,
+    },
+    /// A method call, such as `app.name.upper()`; `name` is the path
+    /// before the parentheses.
+    #[error("methods are not supported: `{name}()`; use filters such as `| upper`")]
+    MethodCall {
+        name: String,
+        span: Option<Range<usize>>,
+    },
+    /// Text with no Jinja block that holds a single-brace placeholder of the
+    /// previous template syntax, such as `{app.name|"x"}`; `span` is that
+    /// placeholder's `{` and namespace.
+    #[error(
+        "single braces are plain text; write placeholders as `{{{{ app.name }}}}` and fallbacks with `or` instead of `|`"
+    )]
+    OldSyntax { span: Range<usize> },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Choice {
-    Key(String),
-    Literal(String),
+/// A template that failed while rendering, such as for running out of
+/// [`FUEL`], exceeding [`OUTPUT_MAX`] or an operation on values of the
+/// wrong type.
+#[derive(Debug, thiserror::Error)]
+#[error("cannot render `{name}`")]
+pub struct RenderError {
+    /// Name of the template: the configuration field it comes from.
+    pub name: String,
+    source: minijinja::Error,
 }
 
-/// A template syntax error located by a byte range of the source.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("{kind} at bytes {}..{}", span.start, span.end)]
-pub struct TemplateError {
-    pub span: Range<usize>,
-    pub kind: TemplateErrorKind,
+impl TemplateError {
+    /// Returns what is wrong, without the template name and line.
+    #[must_use]
+    pub fn reason(&self) -> String {
+        match self {
+            Self::Syntax { source } => match source.detail() {
+                Some(detail) => detail.to_owned(),
+                None => source.kind().to_string(),
+            },
+            Self::UnknownKey { .. } | Self::MethodCall { .. } | Self::OldSyntax { .. } => {
+                self.to_string()
+            }
+        }
+    }
+
+    /// Returns the byte range of the template text the error points at.
+    #[must_use]
+    pub fn span(&self) -> Option<Range<usize>> {
+        match self {
+            Self::Syntax { source } => source.range(),
+            Self::UnknownKey { span, .. } | Self::MethodCall { span, .. } => span.clone(),
+            Self::OldSyntax { span } => Some(span.clone()),
+        }
+    }
 }
 
-/// Kind of a [`TemplateError`].
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum TemplateErrorKind {
-    #[error("unclosed `{{`")]
-    UnclosedBrace,
-    #[error("empty placeholder")]
-    EmptyPlaceholder,
-    #[error("invalid character {0:?} in placeholder")]
-    InvalidPathChar(char),
-    #[error("unknown placeholder key `{0}`")]
-    UnknownKey(String),
-    #[error("unterminated string literal")]
-    UnterminatedString,
-    #[error("invalid escape `\\{0}` in string literal")]
-    InvalidEscape(char),
-    #[error("unmatched `}}`; write `}}}}` for a literal brace")]
-    StrayCloseBrace,
+impl PartialEq for TemplateError {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Syntax { source: a }, Self::Syntax { source: b }) => {
+                a.kind() == b.kind() && a.detail() == b.detail() && a.range() == b.range()
+            }
+            (Self::UnknownKey { name: a, span: x }, Self::UnknownKey { name: b, span: y })
+            | (Self::MethodCall { name: a, span: x }, Self::MethodCall { name: b, span: y }) => {
+                a == b && x == y
+            }
+            (Self::OldSyntax { span: x }, Self::OldSyntax { span: y }) => x == y,
+            _ => false,
+        }
+    }
 }
 
-type Chars<'a> = Peekable<CharIndices<'a>>;
+impl Eq for TemplateError {}
+
+impl RenderError {
+    /// Returns the kind of the failure.
+    #[must_use]
+    pub fn kind(&self) -> ErrorKind {
+        self.source.kind()
+    }
+}
+
+impl PartialEq for RenderError {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name && self.kind() == other.kind()
+    }
+}
+
+impl Eq for RenderError {}
+
+impl fmt::Debug for Template {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Template")
+            .field("name", &self.name)
+            .field("source", &self.source)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for Template {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name && self.source == other.source
+    }
+}
+
+impl Eq for Template {}
 
 impl Template {
-    /// Parses a template.
+    /// Compiles `source` as the template `name`, which names it in render
+    /// errors.
     ///
     /// # Errors
     ///
-    /// Returns the first syntax error, or [`TemplateErrorKind::UnknownKey`]
-    /// for a key outside [`KNOWN`].
-    pub fn parse(src: &str) -> Result<Self, TemplateError> {
-        let mut segments = Vec::new();
-        let mut text = String::new();
-        let mut chars = src.char_indices().peekable();
-        while let Some((i, c)) = chars.next() {
-            match c {
-                '{' if chars.next_if(|&(_, n)| n == '{').is_some() => text.push('{'),
-                '}' if chars.next_if(|&(_, n)| n == '}').is_some() => text.push('}'),
-                '{' => {
-                    if !text.is_empty() {
-                        segments.push(Segment::Text(std::mem::take(&mut text)));
-                    }
-                    segments.push(Segment::Slot(parse_slot(src, i, &mut chars)?));
-                }
-                '}' => return Err(error(i..i + 1, TemplateErrorKind::StrayCloseBrace)),
-                _ => text.push(c),
-            }
+    /// Returns [`TemplateError::Syntax`] for a syntax error, including a
+    /// macro, `include`, `extends` or `import` statement,
+    /// [`TemplateError::OldSyntax`] for text in the previous template
+    /// syntax, [`TemplateError::MethodCall`] for a method call, and
+    /// [`TemplateError::UnknownKey`] for a variable that is neither a key
+    /// of [`KNOWN`] written as `a.b`, nor a global function, nor set by the
+    /// template.
+    pub fn parse(name: &str, source: &str) -> Result<Self, TemplateError> {
+        let mut env = Environment::new();
+        env.set_undefined_behavior(UndefinedBehavior::Chainable);
+        env.set_auto_escape_callback(|_| AutoEscape::None);
+        // Debug info would copy placeholder values into errors.
+        env.set_debug(false);
+        env.set_fuel(Some(FUEL));
+        env.set_recursion_limit(RECURSION_LIMIT);
+        // `debug()` prints every placeholder value.
+        env.remove_global("debug");
+        for filter in REMOVED_FILTERS {
+            env.remove_filter(filter);
         }
-        if !text.is_empty() {
-            segments.push(Segment::Text(text));
-        }
-        Ok(Self { segments })
-    }
-
-    /// Renders the template.
-    ///
-    /// Each placeholder takes the first key whose value is present and
-    /// non-empty, or the first literal reached; otherwise it renders empty.
-    /// The output is raw text: callers that display it as markup must escape it.
-    #[must_use]
-    pub fn render(&self, values: &BTreeMap<String, String>) -> String {
-        let mut out = String::new();
-        for segment in &self.segments {
-            match segment {
-                Segment::Text(text) => out.push_str(text),
-                Segment::Slot(choices) => {
-                    if let Some(value) = choices.iter().find_map(|choice| match choice {
-                        Choice::Key(key) => values.get(key).filter(|v| !v.is_empty()),
-                        Choice::Literal(literal) => Some(literal),
-                    }) {
-                        out.push_str(value);
-                    }
-                }
-            }
-        }
-        out
-    }
-
-    /// Returns every key referenced by the template, in source order.
-    pub fn keys(&self) -> impl Iterator<Item = &str> {
-        self.segments
-            .iter()
-            .flat_map(|segment| match segment {
-                Segment::Slot(choices) => choices.as_slice(),
-                Segment::Text(_) => &[],
-            })
-            .filter_map(|choice| match choice {
-                Choice::Key(key) => Some(key.as_str()),
-                Choice::Literal(_) => None,
-            })
-    }
-}
-
-/// Returns the parsed form of `Touch {device.vendor|"your security key"}`.
-pub(crate) fn default_title() -> Template {
-    Template {
-        segments: vec![
-            Segment::Text("Touch ".to_owned()),
-            Segment::Slot(vec![
-                Choice::Key("device.vendor".to_owned()),
-                Choice::Literal("your security key".to_owned()),
-            ]),
-        ],
-    }
-}
-
-/// Returns the parsed form of
-/// `{requester.label|process.name|"An application"} is waiting for {request.method}`.
-pub(crate) fn default_body() -> Template {
-    Template {
-        segments: vec![
-            Segment::Slot(vec![
-                Choice::Key("requester.label".to_owned()),
-                Choice::Key("process.name".to_owned()),
-                Choice::Literal("An application".to_owned()),
-            ]),
-            Segment::Text(" is waiting for ".to_owned()),
-            Segment::Slot(vec![Choice::Key("request.method".to_owned())]),
-        ],
-    }
-}
-
-fn error(span: Range<usize>, kind: TemplateErrorKind) -> TemplateError {
-    TemplateError { span, kind }
-}
-
-fn char_span(at: usize, c: char) -> Range<usize> {
-    at..at + c.len_utf8()
-}
-
-/// Parses the choices of a placeholder whose `{` is at byte `open`.
-fn parse_slot(src: &str, open: usize, chars: &mut Chars<'_>) -> Result<Vec<Choice>, TemplateError> {
-    let unclosed = || error(open..src.len(), TemplateErrorKind::UnclosedBrace);
-    let mut choices = Vec::new();
-    loop {
-        let &(start, first) = chars.peek().ok_or_else(unclosed)?;
-        let choice = if first == '"' {
-            chars.next();
-            parse_literal(src, start, chars)?
-        } else {
-            parse_path(src, open, start, chars)?
+        env.add_template_owned(name.to_owned(), source.to_owned())
+            .map_err(|error| TemplateError::Syntax {
+                source: Arc::new(error),
+            })?;
+        let template = Self {
+            name: name.to_owned(),
+            source: source.to_owned(),
+            env: Arc::new(env),
+            error: None,
         };
-        choices.push(choice);
-        match chars.next() {
-            None => return Err(unclosed()),
-            Some((_, '|')) => {}
-            Some((_, '}')) => return Ok(choices),
-            Some((at, c)) => {
-                return Err(error(
-                    char_span(at, c),
-                    TemplateErrorKind::InvalidPathChar(c),
-                ));
+        template.check_old_syntax()?;
+        template.check_variables()?;
+        Ok(template)
+    }
+
+    /// Rejects a template without `{{`, `{%` and `{#` that holds `{` followed
+    /// by a namespace of [`KNOWN`] and `.`.
+    fn check_old_syntax(&self) -> Result<(), TemplateError> {
+        let source = self.source.as_str();
+        if ["{{", "{%", "{#"].iter().any(|open| source.contains(open)) {
+            return Ok(());
+        }
+        let namespaces: BTreeSet<&str> = KNOWN
+            .iter()
+            .filter_map(|key| key.split_once('.').map(|(namespace, _)| namespace))
+            .collect();
+        let old = source.match_indices('{').find_map(|(start, _)| {
+            let rest = source.get(start + 1..)?;
+            namespaces.iter().find_map(|namespace| {
+                let after = rest.strip_prefix(namespace)?;
+                after
+                    .starts_with('.')
+                    .then_some(start..start + 1 + namespace.len())
+            })
+        });
+        match old {
+            Some(span) => Err(TemplateError::OldSyntax { span }),
+            None => Ok(()),
+        }
+    }
+
+    /// Rejects the first variable, by position in the source, that is
+    /// neither in [`KNOWN`], nor a global, nor set by the template.
+    fn check_variables(&self) -> Result<(), TemplateError> {
+        let compiled =
+            self.env
+                .get_template(&self.name)
+                .map_err(|error| TemplateError::Syntax {
+                    source: Arc::new(error),
+                })?;
+        let blocks = scan(&self.source);
+        let unknown = compiled
+            .undeclared_variables(true)
+            .into_iter()
+            .filter(|name| {
+                let root = name.split('.').next().unwrap_or_default();
+                !KNOWN.contains(&name.as_str())
+                    && !self.env.globals().any(|(global, _)| global == name)
+                    && !blocks.assigned.contains(root)
+            })
+            .map(|name| (blocks.find(&self.source, &name), name))
+            .min_by(|(a, x), (b, y)| {
+                let start =
+                    |span: &Option<Range<usize>>| span.as_ref().map_or(usize::MAX, |s| s.start);
+                start(a).cmp(&start(b)).then_with(|| x.cmp(y))
+            });
+        let Some((span, name)) = unknown else {
+            return Ok(());
+        };
+        let call = span.as_ref().is_some_and(|span| {
+            self.source
+                .get(span.end..)
+                .is_some_and(|rest| rest.trim_start().starts_with('('))
+        });
+        if call && name.contains('.') {
+            Err(TemplateError::MethodCall { name, span })
+        } else {
+            Err(TemplateError::UnknownKey { name, span })
+        }
+    }
+
+    /// Returns a template named `name` that failed to compile `source` with
+    /// `error`; rendering it fails with `error` as the source.
+    #[must_use]
+    pub(crate) fn uncompiled(name: &str, source: &str, error: TemplateError) -> Self {
+        Self {
+            name: name.to_owned(),
+            source: source.to_owned(),
+            env: Arc::new(Environment::empty()),
+            error: Some(error),
+        }
+    }
+
+    /// Returns the template text.
+    #[must_use]
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+
+    /// Returns the template name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Renders the template with placeholder `values` keyed by entries of
+    /// [`KNOWN`]; keys without a `.` are ignored.
+    ///
+    /// The output is raw text: callers that display it as markup must
+    /// escape it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RenderError`] when rendering fails, such as for running out
+    /// of [`FUEL`], writing more than [`OUTPUT_MAX`] bytes, an operation on
+    /// values of the wrong type, or an unknown filter or test.
+    pub fn render(&self, values: &BTreeMap<String, String>) -> Result<String, RenderError> {
+        self.render_counted(values).map(|(text, _)| text)
+    }
+
+    /// Renders as [`Template::render`] and returns the fuel used.
+    fn render_counted(
+        &self,
+        values: &BTreeMap<String, String>,
+    ) -> Result<(String, Option<u64>), RenderError> {
+        let mut context: BTreeMap<&str, BTreeMap<&str, &str>> = BTreeMap::new();
+        for (key, value) in values {
+            if let Some((namespace, attribute)) = key.split_once('.') {
+                context
+                    .entry(namespace)
+                    .or_default()
+                    .insert(attribute, value);
             }
         }
+        let error = |source| RenderError {
+            name: self.name.clone(),
+            source,
+        };
+        if let Some(cause) = &self.error {
+            return Err(error(
+                minijinja::Error::new(ErrorKind::SyntaxError, "template did not compile")
+                    .with_source(cause.clone()),
+            ));
+        }
+        let template = self.env.get_template(&self.name).map_err(error)?;
+        let mut output = Capped(Vec::new());
+        let captured = template
+            .render_captured_to(&context, &mut output)
+            .map_err(error)?;
+        let fuel = captured.state().fuel_levels().map(|(consumed, _)| consumed);
+        // Whole `&str` chunks are written, so the bytes are UTF-8.
+        let text = String::from_utf8(output.0).map_err(|utf8| {
+            error(
+                minijinja::Error::new(ErrorKind::WriteFailure, "output is not UTF-8")
+                    .with_source(utf8),
+            )
+        })?;
+        Ok((text, fuel))
     }
 }
 
-/// Parses a key starting at byte `start`, leaving the delimiter unconsumed.
-fn parse_path(
-    src: &str,
-    open: usize,
-    start: usize,
-    chars: &mut Chars<'_>,
-) -> Result<Choice, TemplateError> {
-    let mut end = start;
-    while let Some((at, c)) = chars
-        .next_if(|&(_, c)| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '.')
-    {
-        end = at + c.len_utf8();
-    }
-    match chars.peek() {
-        None => return Err(error(open..src.len(), TemplateErrorKind::UnclosedBrace)),
-        Some(&(at, c)) if c != '|' && c != '}' => {
-            return Err(error(
-                char_span(at, c),
-                TemplateErrorKind::InvalidPathChar(c),
-            ));
+/// Output buffer that rejects a write past [`OUTPUT_MAX`] bytes.
+struct Capped(Vec<u8>);
+
+impl io::Write for Capped {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.0.len().saturating_add(buf.len()) > OUTPUT_MAX {
+            return Err(io::Error::other("output exceeds the limit"));
         }
-        Some(&(at, c)) if start == end => {
-            return Err(error(
-                open..at + c.len_utf8(),
-                TemplateErrorKind::EmptyPlaceholder,
-            ));
-        }
-        Some(_) => {}
+        self.0.extend_from_slice(buf);
+        Ok(buf.len())
     }
-    let path = src.get(start..end).unwrap_or_default();
-    let bytes = path.as_bytes();
-    for (offset, &b) in bytes.iter().enumerate() {
-        let prev_dot = offset == 0 || bytes.get(offset - 1) == Some(&b'.');
-        let last = offset + 1 == bytes.len();
-        if b == b'.' && (prev_dot || last) {
-            let at = start + offset;
-            return Err(error(at..at + 1, TemplateErrorKind::InvalidPathChar('.')));
-        }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
-    if !KNOWN.contains(&path) {
-        return Err(error(
-            start..end,
-            TemplateErrorKind::UnknownKey(path.to_owned()),
-        ));
-    }
-    Ok(Choice::Key(path.to_owned()))
 }
 
-/// Parses a string literal whose opening quote at byte `quote` is consumed.
-fn parse_literal(src: &str, quote: usize, chars: &mut Chars<'_>) -> Result<Choice, TemplateError> {
-    let unterminated = || error(quote..src.len(), TemplateErrorKind::UnterminatedString);
-    let mut literal = String::new();
-    loop {
-        match chars.next().ok_or_else(unterminated)? {
-            (_, '"') => return Ok(Choice::Literal(literal)),
-            (at, '\\') => match chars.next().ok_or_else(unterminated)? {
-                (_, c @ ('"' | '\\')) => literal.push(c),
-                (next, c) => {
-                    return Err(error(
-                        at..next + c.len_utf8(),
-                        TemplateErrorKind::InvalidEscape(c),
-                    ));
+/// Blocks and assigned names found by reading the template text.
+struct Scan<'a> {
+    /// Byte ranges of `{{ … }}` and `{% … %}` blocks outside `raw` blocks.
+    blocks: Vec<Range<usize>>,
+    /// Names after `set`, which `undeclared_variables` misses when the
+    /// `set` is inside an `if` or loop body.
+    assigned: BTreeSet<&'a str>,
+}
+
+/// Reads the blocks and `set` targets of `source`, skipping comments and
+/// `raw` blocks.
+fn scan(source: &str) -> Scan<'_> {
+    let mut scan = Scan {
+        blocks: Vec::new(),
+        assigned: BTreeSet::new(),
+    };
+    let mut pos = 0;
+    while let Some(offset) = source.get(pos..).and_then(|rest| rest.find('{')) {
+        let start = pos + offset;
+        let rest = source.get(start..).unwrap_or_default();
+        let close = if rest.starts_with("{{") {
+            "}}"
+        } else if rest.starts_with("{%") {
+            "%}"
+        } else if rest.starts_with("{#") {
+            "#}"
+        } else {
+            pos = start + 1;
+            continue;
+        };
+        let end = match rest.get(2..).and_then(|inner| inner.find(close)) {
+            Some(at) => start + 2 + at + 2,
+            None => source.len(),
+        };
+        pos = end;
+        if close == "#}" {
+            continue;
+        }
+        scan.blocks.push(start..end);
+        if close != "%}" {
+            continue;
+        }
+        let inner = source.get(start + 2..end).unwrap_or_default();
+        let mut words = inner.trim_start_matches(['-', '+']).split_whitespace();
+        match words.next() {
+            Some("raw") => {
+                pos = source
+                    .get(end..)
+                    .and_then(|after| after.find("endraw"))
+                    .and_then(|at| {
+                        let from = end + at;
+                        source.get(from..)?.find("%}").map(|close| from + close + 2)
+                    })
+                    .unwrap_or(source.len());
+            }
+            Some("set") => {
+                if let Some(target) = words.next() {
+                    let len = target
+                        .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+                        .unwrap_or(target.len());
+                    if let Some(name) = target.get(..len).filter(|name| !name.is_empty()) {
+                        scan.assigned.insert(name);
+                    }
                 }
-            },
-            (_, c) => literal.push(c),
+            }
+            _ => {}
         }
+    }
+    scan
+}
+
+impl Scan<'_> {
+    /// Returns the bytes of the first occurrence of `name` in `source` that
+    /// is not part of a longer name, preferring one inside a block.
+    fn find(&self, source: &str, name: &str) -> Option<Range<usize>> {
+        let is_name = |c: char| c.is_alphanumeric() || c == '_' || c == '.';
+        let mut found = source.match_indices(name).filter_map(|(start, _)| {
+            let end = start + name.len();
+            let before = source.get(..start)?.chars().next_back();
+            let after = source.get(end..)?.chars().next();
+            (!before.is_some_and(is_name) && !after.is_some_and(is_name)).then_some(start..end)
+        });
+        let first = found.next()?;
+        let in_block = |span: &Range<usize>| {
+            self.blocks
+                .iter()
+                .any(|block| block.start <= span.start && span.end <= block.end)
+        };
+        if in_block(&first) {
+            return Some(first);
+        }
+        Some(found.find(in_block).unwrap_or(first))
     }
 }
 
@@ -279,211 +475,291 @@ mod tests {
             .collect()
     }
 
-    fn err(src: &str) -> Option<(Range<usize>, TemplateErrorKind)> {
-        match Template::parse(src) {
-            Ok(_) => None,
-            Err(TemplateError { span, kind }) => Some((span, kind)),
+    fn render(source: &str, pairs: &[(&str, &str)]) -> TestResult<String> {
+        Ok(Template::parse("t", source)?.render(&values(pairs))?)
+    }
+
+    fn rejected(source: &str) -> TestResult<TemplateError> {
+        match Template::parse("t", source) {
+            Ok(_) => Err(format!("{source:?} was accepted").into()),
+            Err(error) => Ok(error),
+        }
+    }
+
+    fn render_error(source: &str, pairs: &[(&str, &str)]) -> TestResult<ErrorKind> {
+        match Template::parse("t", source)?.render(&values(pairs)) {
+            Ok(_) => Err(format!("{source:?} rendered").into()),
+            Err(error) => Ok(error.kind()),
         }
     }
 
     #[test]
-    fn plain_text_and_placeholders_render() -> TestResult {
-        let t = Template::parse("Touch {device.vendor} now")?;
+    fn placeholders_render_and_absent_ones_are_empty() -> TestResult {
+        let source = "Touch {{ device.vendor }} now";
         assert_eq!(
-            t.render(&values(&[("device.vendor", "Yubico")])),
+            render(source, &[("device.vendor", "Yubico")])?,
             "Touch Yubico now"
         );
-        assert_eq!(t.render(&values(&[])), "Touch  now");
+        assert_eq!(render(source, &[])?, "Touch  now");
+        assert_eq!(render("[{{ app.name }}]", &[("process.name", "x")])?, "[]");
         Ok(())
     }
 
     #[test]
-    fn fallback_chain_takes_first_non_empty() -> TestResult {
-        let t = Template::parse("{app.name|process.name|\"An application\"}")?;
+    fn or_takes_the_first_non_empty_value() -> TestResult {
+        let source = "{{ app.name or process.name or \"An application\" }}";
+        let both = [("app.name", "Firefox"), ("process.name", "firefox")];
+        assert_eq!(render(source, &both)?, "Firefox");
         assert_eq!(
-            t.render(&values(&[
-                ("app.name", "Firefox"),
-                ("process.name", "firefox")
-            ])),
-            "Firefox"
-        );
-        assert_eq!(
-            t.render(&values(&[("app.name", ""), ("process.name", "ssh")])),
+            render(source, &[("app.name", ""), ("process.name", "ssh")])?,
             "ssh"
         );
-        assert_eq!(t.render(&values(&[])), "An application");
-        let keys: Vec<&str> = t.keys().collect();
-        assert_eq!(keys, ["app.name", "process.name"]);
+        assert_eq!(render(source, &[])?, "An application");
         Ok(())
     }
 
     #[test]
-    fn literal_wins_when_reached() -> TestResult {
-        let t = Template::parse("[{\"\"|app.name}]")?;
-        assert_eq!(t.render(&values(&[("app.name", "x")])), "[]");
-        Ok(())
-    }
-
-    #[test]
-    fn literal_only_slot() -> TestResult {
-        let t = Template::parse("a{\"b\"}c")?;
-        assert_eq!(t.render(&values(&[])), "abc");
-        assert_eq!(t.keys().count(), 0);
-        Ok(())
-    }
-
-    #[test]
-    fn doubled_brace_adjacent_to_slot() -> TestResult {
-        let t = Template::parse("{{{app.name}")?;
-        assert_eq!(t.render(&values(&[("app.name", "x")])), "{x");
-        let t = Template::parse("{app.name}}}")?;
-        assert_eq!(t.render(&values(&[("app.name", "x")])), "x}");
-        Ok(())
-    }
-
-    #[test]
-    fn unresolved_placeholder_renders_empty() -> TestResult {
-        let t = Template::parse("a{app.name|process.name}b")?;
-        assert_eq!(t.render(&values(&[("app.name", "")])), "ab");
-        Ok(())
-    }
-
-    #[test]
-    fn literal_escapes() -> TestResult {
-        let t = Template::parse(r#"{"say \"hi\" \\ {}|"}"#)?;
-        assert_eq!(t.render(&values(&[])), r#"say "hi" \ {}|"#);
-        Ok(())
-    }
-
-    #[test]
-    fn doubled_braces_are_literal() -> TestResult {
-        let t = Template::parse("{{{request.count}}}")?;
-        assert_eq!(t.render(&values(&[("request.count", "2")])), "{2}");
-        assert_eq!(Template::parse("}}{{")?.render(&values(&[])), "}{");
-        Ok(())
-    }
-
-    #[test]
-    fn multibyte_text_is_preserved() -> TestResult {
-        let t = Template::parse("Berühre {device.vendor}…")?;
+    fn conditions_and_filters() -> TestResult {
+        let optional = "{{ requester.name }}{% if app.name %} ({{ app.name }}){% endif %}";
+        let pairs = [("requester.name", "claude"), ("app.name", "kitty")];
+        assert_eq!(render(optional, &pairs)?, "claude (kitty)");
+        assert_eq!(render(optional, &[("requester.name", "claude")])?, "claude");
         assert_eq!(
-            t.render(&values(&[("device.vendor", "ключ")])),
-            "Berühre ключ…"
+            render(optional, &[("requester.name", "claude"), ("app.name", "")])?,
+            "claude"
+        );
+
+        let branch =
+            "{% if request.method == \"ssh\" %}SSH{% else %}{{ request.method }}{% endif %}";
+        assert_eq!(render(branch, &[("request.method", "ssh")])?, "SSH");
+        assert_eq!(render(branch, &[("request.method", "fido2")])?, "fido2");
+
+        assert_eq!(
+            render("{{ requester.name | upper }}", &[("requester.name", "gpg")])?,
+            "GPG"
+        );
+        assert_eq!(render("{{ app.name | default(\"none\") }}", &[])?, "none");
+        let count = "{% if request.count | int > 1 %}again{% endif %}";
+        assert_eq!(render(count, &[("request.count", "2")])?, "again");
+        assert_eq!(render(count, &[("request.count", "1")])?, "");
+        Ok(())
+    }
+
+    #[test]
+    fn comparisons_are_between_strings() -> TestResult {
+        let source = "{% if request.count == \"2\" %}two{% endif %}{% if request.count == 2 %}int{% endif %}";
+        assert_eq!(render(source, &[("request.count", "2")])?, "two");
+        Ok(())
+    }
+
+    #[test]
+    fn output_is_not_escaped_and_one_trailing_newline_is_removed() -> TestResult {
+        assert_eq!(
+            render("<b>{{ app.name }}</b>\n", &[("app.name", "a&b")])?,
+            "<b>a&b</b>"
         );
         Ok(())
     }
 
     #[test]
-    fn unclosed_brace() {
-        assert_eq!(
-            err("ab{app.name"),
-            Some((2..11, TemplateErrorKind::UnclosedBrace))
-        );
-        assert_eq!(err("{"), Some((0..1, TemplateErrorKind::UnclosedBrace)));
-        assert_eq!(
-            err("{app.name|"),
-            Some((0..10, TemplateErrorKind::UnclosedBrace))
-        );
-        assert_eq!(
-            err("{\"x\""),
-            Some((0..4, TemplateErrorKind::UnclosedBrace))
-        );
+    fn whitespace_control_trims_around_blocks() -> TestResult {
+        let source = "a\n{%- if app.name %}\n  {{- app.name }}\n{%- endif %}\nb";
+        assert_eq!(render(source, &[("app.name", "x")])?, "ax\nb");
+        Ok(())
     }
 
     #[test]
-    fn empty_placeholder() {
+    fn set_with_and_for_bind_their_own_names() -> TestResult {
+        let source =
+            "{% set n = requester.name %}{% with a = app.name %}{{ n }}/{{ a }}{% endwith %}";
         assert_eq!(
-            err("a{}"),
-            Some((1..3, TemplateErrorKind::EmptyPlaceholder))
+            render(source, &[("requester.name", "nu"), ("app.name", "foot")])?,
+            "nu/foot"
         );
-        assert_eq!(
-            err("{app.name|}"),
-            Some((0..11, TemplateErrorKind::EmptyPlaceholder))
-        );
-        assert_eq!(
-            err("{|app.name}"),
-            Some((0..2, TemplateErrorKind::EmptyPlaceholder))
-        );
+        let source = "{% if app.name %}{% set n = app.name %}{% endif %}[{{ n }}]";
+        assert_eq!(render(source, &[("app.name", "foot")])?, "[foot]");
+        assert_eq!(render(source, &[])?, "[]");
+        let source = "{% if app.name %}{% set n %}{{ app.name }}!{% endset %}{% endif %}{{ n }}";
+        assert_eq!(render(source, &[("app.name", "foot")])?, "foot!");
+        let source = "{% for c in request.method %}{{ loop.index }}{{ c }}{% endfor %}";
+        assert_eq!(render(source, &[("request.method", "ssh")])?, "1s2s3h");
+        let source = "{% for i in range(3) %}{{ i }}{% endfor %}";
+        assert_eq!(render(source, &[])?, "012");
+        let source = "{% filter upper %}{{ app.name }}{% endfilter %}{% raw %} {{ }}{% endraw %}";
+        assert_eq!(render(source, &[("app.name", "foot")])?, "FOOT {{ }}");
+        Ok(())
     }
 
     #[test]
-    fn invalid_path_character() {
-        assert_eq!(
-            err("{app.Name}"),
-            Some((5..6, TemplateErrorKind::InvalidPathChar('N')))
-        );
-        assert_eq!(
-            err("{app name}"),
-            Some((4..5, TemplateErrorKind::InvalidPathChar(' ')))
-        );
-        assert_eq!(
-            err("{app..name}"),
-            Some((5..6, TemplateErrorKind::InvalidPathChar('.')))
-        );
-        assert_eq!(
-            err("{.app}"),
-            Some((1..2, TemplateErrorKind::InvalidPathChar('.')))
-        );
-        assert_eq!(
-            err("{app.}"),
-            Some((4..5, TemplateErrorKind::InvalidPathChar('.')))
-        );
-        assert_eq!(
-            err("{\"x\"y}"),
-            Some((4..5, TemplateErrorKind::InvalidPathChar('y')))
-        );
-        assert_eq!(
-            err("{é}"),
-            Some((1..3, TemplateErrorKind::InvalidPathChar('é')))
-        );
+    fn unknown_names_are_rejected_at_their_first_occurrence() -> TestResult {
+        for (source, name, span) in [
+            ("x {{ app.title }}", "app.title", Some(5..14)),
+            ("{{ app.name }}{{ app.nope }}", "app.nope", Some(17..25)),
+            ("see app.nope {{ app.nope }}", "app.nope", Some(16..24)),
+            ("{{ app }}", "app", Some(3..6)),
+            ("{{ app[\"name\"] }}", "app", Some(3..6)),
+            ("{{ app.name.first }}", "app.name.first", Some(3..17)),
+            ("{{ colour }}", "colour", Some(3..9)),
+            ("{{ debug() }}", "debug", Some(3..8)),
+            ("{% set n = app.nope %}{{ n }}", "app.nope", Some(11..19)),
+            ("{{ app . nope }}", "app.nope", None),
+            (
+                "{% raw %}{% set fake = 1 %}{% endraw %}{{ fake }}",
+                "fake",
+                Some(42..46),
+            ),
+            ("{# {% set n = 1 %} #}{{ n }}", "n", Some(24..25)),
+        ] {
+            assert_eq!(
+                rejected(source)?,
+                TemplateError::UnknownKey {
+                    name: name.to_owned(),
+                    span,
+                },
+                "{source:?}"
+            );
+        }
+        Ok(())
     }
 
     #[test]
-    fn unknown_key_is_rejected() {
+    fn method_calls_are_rejected() -> TestResult {
+        let error = rejected("{{ app.name.upper() }}")?;
         assert_eq!(
-            err("x {app.title}"),
-            Some((3..12, TemplateErrorKind::UnknownKey("app.title".to_owned())))
+            error,
+            TemplateError::MethodCall {
+                name: "app.name.upper".to_owned(),
+                span: Some(3..17),
+            }
         );
+        assert_eq!(
+            error.reason(),
+            "methods are not supported: `app.name.upper()`; use filters such as `| upper`"
+        );
+        Ok(())
     }
 
     #[test]
-    fn unterminated_string() {
+    fn old_syntax_is_rejected() -> TestResult {
+        for (source, span) in [
+            ("Touch {device.vendor|\"your security key\"}", 6..13),
+            (
+                "{requester.label|process.name|\"An application\"} is waiting for {request.method}",
+                0..10,
+            ),
+            ("{app.name}", 0..4),
+        ] {
+            assert_eq!(
+                rejected(source)?,
+                TemplateError::OldSyntax { span },
+                "{source:?}"
+            );
+        }
+        assert_eq!(render("{x} {apps.y}", &[])?, "{x} {apps.y}");
         assert_eq!(
-            err("{\"abc"),
-            Some((1..5, TemplateErrorKind::UnterminatedString))
+            render("{app.name} {{ app.name }}", &[("app.name", "a")])?,
+            "{app.name} a"
         );
-        assert_eq!(
-            err("{\"abc\\"),
-            Some((1..6, TemplateErrorKind::UnterminatedString))
-        );
+        Ok(())
     }
 
     #[test]
-    fn invalid_escape() {
-        assert_eq!(
-            err(r#"{"a\n"}"#),
-            Some((3..5, TemplateErrorKind::InvalidEscape('n')))
-        );
+    fn syntax_errors_carry_a_span() -> TestResult {
+        for (source, span, message) in [
+            (
+                "{{ app.name }",
+                12..13,
+                "unexpected `}`, expected end of variable block",
+            ),
+            ("ab\ncd {% if %}", 12..14, "unexpected end of block"),
+            (
+                "{% macro m() %}{% endmacro %}",
+                3..8,
+                "unknown statement macro",
+            ),
+            ("{% include \"x\" %}", 3..10, "unknown statement include"),
+            ("{% extends \"x\" %}", 3..10, "unknown statement extends"),
+            ("{% import \"x\" as y %}", 3..9, "unknown statement import"),
+        ] {
+            let error = rejected(source)?;
+            assert!(matches!(error, TemplateError::Syntax { .. }), "{source:?}");
+            assert_eq!(error.span(), Some(span), "{source:?}");
+            assert_eq!(error.reason(), message, "{source:?}");
+        }
+        Ok(())
     }
 
     #[test]
-    fn stray_close_brace() {
-        assert_eq!(
-            err("ab}c"),
-            Some((2..3, TemplateErrorKind::StrayCloseBrace))
-        );
-        assert_eq!(err("}}}"), Some((2..3, TemplateErrorKind::StrayCloseBrace)));
-    }
-
-    #[test]
-    fn error_display_names_kind_and_span() -> TestResult {
-        let Err(error) = Template::parse("a}") else {
-            return Err("the template was accepted".into());
+    fn render_failures_are_errors() -> TestResult {
+        let template = Template::parse("templates.body", "{{ request.count + 1 }}")?;
+        let Err(error) = template.render(&values(&[("request.count", "2")])) else {
+            return Err("the template rendered".into());
         };
+        assert_eq!(error.name, "templates.body");
+        assert_eq!(error.kind(), ErrorKind::InvalidOperation);
         assert_eq!(
-            error.to_string(),
-            "unmatched `}`; write `}}` for a literal brace at bytes 1..2"
+            render_error("{{ app.name | nosuch }}", &[])?,
+            ErrorKind::UnknownFilter
         );
+        Ok(())
+    }
+
+    #[test]
+    fn allocating_filters_are_removed() -> TestResult {
+        for source in [
+            "{{ \"%999999999999s\" | format(\"a\") }}",
+            "{{ \"{:>999999999999}\" | format(\"a\") }}",
+            "{{ app.name | indent(999999999999) }}",
+            "{{ request.method | slice(999999999999) }}",
+            "{{ request.method | batch(999999999999) }}",
+        ] {
+            assert_eq!(
+                render_error(source, &[("app.name", "a"), ("request.method", "u2f")])?,
+                ErrorKind::UnknownFilter,
+                "{source:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn fuel_and_output_cap_stop_large_renders() -> TestResult {
+        let detail = "x".repeat(200);
+        let nested =
+            "{% for a in request.detail %}{% for b in request.detail %}.{% endfor %}{% endfor %}";
+        assert_eq!(
+            render_error(nested, &[("request.detail", &detail)])?,
+            ErrorKind::OutOfFuel
+        );
+        let doubled = "{% set ns = namespace(s=\"x\" * 1000) %}{% for i in range(10) %}{% set ns.s = ns.s ~ ns.s %}{% endfor %}{{ ns.s }}";
+        assert_eq!(render_error(doubled, &[])?, ErrorKind::WriteFailure);
+        let long_loop = "{% for i in range(1000) %}.{% endfor %}";
+        assert_eq!(render_error(long_loop, &[])?, ErrorKind::OutOfFuel);
+        let long = "{{ request.detail * 400 }}";
+        assert_eq!(
+            render_error(long, &[("request.detail", &detail)])?,
+            ErrorKind::WriteFailure
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn default_and_documented_templates_need_little_fuel() -> TestResult {
+        let all: Vec<(&str, String)> = KNOWN.iter().map(|key| (*key, "x".repeat(200))).collect();
+        let all: Vec<(&str, &str)> = all.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        for source in [
+            "Touch {{ device.vendor or \"your security key\" }}",
+            "{{ requester.label or process.name or \"An application\" }} is waiting for {{ request.method }}",
+            "{{ requester.label or \"ssh\" }} is signing in{% if request.detail %}: {{ request.detail }}{% endif %}",
+            "{{ requester.name }}{% if app.name %} ({{ app.name }}){% endif %}",
+            "{% if request.method == \"openpgp\" %}a{% else %}{{ requester.name | upper }}{% endif %}",
+        ] {
+            for pairs in [&all[..], &[]] {
+                let (_, fuel) = Template::parse("t", source)?.render_counted(&values(pairs))?;
+                let fuel = fuel.ok_or("no fuel tracking")?;
+                assert!(fuel <= 30, "{source:?} used {fuel}");
+            }
+        }
         Ok(())
     }
 }

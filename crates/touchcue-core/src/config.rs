@@ -5,6 +5,7 @@
 
 use std::collections::BTreeMap;
 use std::ops::Range;
+use std::sync::OnceLock;
 
 use miette::SourceSpan;
 use serde::Deserialize;
@@ -12,9 +13,13 @@ use toml::Spanned;
 
 use crate::placeholders::KNOWN;
 use crate::skip::{self, SkipList};
-use crate::template::{self, Template, TemplateError};
+use crate::template::{RenderError, Template, TemplateError};
 
-const DEFAULT_TITLE: &str = "Touch {device.vendor|\"your security key\"}";
+/// Field name of the title template, naming it in render errors.
+const TITLE: &str = "templates.title";
+/// Field name of the body template, naming it in render errors.
+const BODY: &str = "templates.body";
+const DEFAULT_TITLE: &str = "Touch {{ device.vendor or \"your security key\" }}";
 /// Upper bound of every configured duration, in milliseconds.
 const MAX_MS: u64 = 600_000;
 /// Default of `hooks.timeout_ms`.
@@ -35,8 +40,7 @@ const MAX_STOP_GRACE_MS: u64 = 2000;
 pub const LIFETIME_PROCESSES: usize = 8;
 /// Default of `hooks.restart_interval_ms`.
 const DEFAULT_RESTART_INTERVAL_MS: u64 = 200;
-const DEFAULT_BODY: &str =
-    "{requester.label|process.name|\"An application\"} is waiting for {request.method}";
+const DEFAULT_BODY: &str = "{{ requester.label or process.name or \"An application\" }} is waiting for {{ request.method }}";
 
 /// Where touch prompts are shown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
@@ -541,23 +545,24 @@ pub enum ConfigError {
         #[label("here")]
         span: Option<SourceSpan>,
     },
-    /// A template does not parse. `span` is the byte range of the TOML
-    /// string value, quotes included, while `source.span` is the byte range
-    /// within the template text. `label` is the offending bytes in the TOML
-    /// source, or `span` when the TOML string has escapes or line breaks.
+    /// A template does not compile or names an unknown placeholder. `span`
+    /// is the byte range of the TOML string value, quotes included, while
+    /// `source.span()` is the byte range within the template text. `label`
+    /// is the offending bytes in the TOML source, or `span` when the TOML
+    /// string has escapes or line breaks or the offending bytes are unknown.
     #[error("invalid template in `{field}`")]
     #[diagnostic(
         code(touchcue::config::template),
         help(
-            "placeholders are `{{key}}` or `{{a|b|\"literal\"}}`; write `{{{{` and `}}}}` for literal braces"
+            "templates use Jinja syntax, such as `{{{{ app.name or \"An application\" }}}}`; placeholders are written `namespace.key`, such as `request.method`"
         )
     )]
     Template {
         field: String,
         span: Option<Range<usize>>,
-        #[label("{}", source.kind)]
+        #[label("{}", source.reason())]
         label: Option<SourceSpan>,
-        source: TemplateError,
+        source: Box<TemplateError>,
     },
     #[error("unknown match key `{key}` in `{field}`")]
     #[diagnostic(
@@ -708,11 +713,15 @@ fn range(span: SourceSpan) -> Range<usize> {
 }
 
 /// Prompt text produced by [`Config::rendered`]; the text is unescaped.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Rendered {
     pub title: String,
     pub body: String,
     pub icon: Option<String>,
+    /// Templates that failed to render, in the order tried; each was
+    /// replaced by the default template, or by an empty string when the
+    /// default failed as well.
+    pub errors: Vec<RenderError>,
 }
 
 /// A validated configuration with its templates parsed.
@@ -828,8 +837,8 @@ impl Default for Config {
             icons: Icons::default(),
             hooks: Vec::new(),
             templates: Templates::default(),
-            title: template::default_title(),
-            body: template::default_body(),
+            title: defaults().title.clone(),
+            body: defaults().body.clone(),
             rules: Vec::new(),
         }
     }
@@ -885,8 +894,14 @@ impl Config {
         let requester = compile_requester(raw.requester)?;
         let icons = compile_icons(raw.icons)?;
 
-        let (title_src, title) = compile(s, raw.templates.title, DEFAULT_TITLE, "templates.title")?;
-        let (body_src, body) = compile(s, raw.templates.body, DEFAULT_BODY, "templates.body")?;
+        let (title_src, title) = match raw.templates.title {
+            Some(value) => compile(s, value, TITLE)?,
+            None => (DEFAULT_TITLE.to_owned(), defaults().title.clone()),
+        };
+        let (body_src, body) = match raw.templates.body {
+            Some(value) => compile(s, value, BODY)?,
+            None => (DEFAULT_BODY.to_owned(), defaults().body.clone()),
+        };
         let rules = raw
             .rules
             .into_iter()
@@ -937,33 +952,107 @@ impl Config {
     /// The first rule whose `match` entries all equal entries of `values`
     /// overrides the title, body and icon it sets. Matching is exact and
     /// case-sensitive, and a key absent from `values` does not match.
+    /// A template that fails to render is replaced by the next of the
+    /// rule's template, the `[templates]` template and the built-in
+    /// default, or by an empty string when all fail; each failure is listed
+    /// in [`Rendered::errors`].
     /// Returns `None` when the matching rule suppresses output.
     #[must_use]
     pub fn rendered(&self, values: &BTreeMap<String, String>) -> Option<Rendered> {
+        self.render_with(values, false)
+    }
+
+    /// Renders as [`Config::rendered`] with the built-in default title and
+    /// body in place of the configured templates; the matching rule still
+    /// sets the icon and suppresses output.
+    #[must_use]
+    pub fn fallback(&self, values: &BTreeMap<String, String>) -> Option<Rendered> {
+        self.render_with(values, true)
+    }
+
+    fn render_with(&self, values: &BTreeMap<String, String>, builtin: bool) -> Option<Rendered> {
         let matched = self
             .rules
             .iter()
             .find(|compiled| matches_all(&compiled.rule.matches, values));
-        let Some(compiled) = matched else {
-            return Some(Rendered {
-                title: self.title.render(values),
-                body: self.body.render(values),
-                icon: None,
-            });
+        let (title, body, icon) = match matched {
+            Some(compiled) if compiled.rule.suppress => return None,
+            Some(compiled) => (
+                compiled.title.as_ref(),
+                compiled.body.as_ref(),
+                compiled.rule.icon.clone(),
+            ),
+            None => (None, None, None),
         };
-        if compiled.rule.suppress {
-            return None;
-        }
+        let defaults = defaults();
+        let (title, body) = if builtin {
+            (vec![&defaults.title], vec![&defaults.body])
+        } else {
+            (
+                title
+                    .into_iter()
+                    .chain([&self.title, &defaults.title])
+                    .collect(),
+                body.into_iter()
+                    .chain([&self.body, &defaults.body])
+                    .collect(),
+            )
+        };
+        let mut errors = Vec::new();
+        let title = render_first(&title, values, &mut errors);
+        let body = render_first(&body, values, &mut errors);
         Some(Rendered {
-            title: compiled
-                .title
-                .as_ref()
-                .unwrap_or(&self.title)
-                .render(values),
-            body: compiled.body.as_ref().unwrap_or(&self.body).render(values),
-            icon: compiled.rule.icon.clone(),
+            title,
+            body,
+            icon,
+            errors,
         })
     }
+}
+
+/// The built-in templates, compiled once.
+struct Defaults {
+    title: Template,
+    body: Template,
+}
+
+/// Returns the built-in templates.
+///
+/// The built-in sources compile, as the tests check; were one not to, the
+/// template would have no compiled form and render as an empty string with
+/// a [`RenderError`].
+fn defaults() -> &'static Defaults {
+    static DEFAULTS: OnceLock<Defaults> = OnceLock::new();
+    DEFAULTS.get_or_init(|| {
+        let builtin = |name: &str, source: &str| match Template::parse(name, source) {
+            Ok(template) => template,
+            Err(error) => Template::uncompiled(name, source, error),
+        };
+        Defaults {
+            title: builtin(TITLE, DEFAULT_TITLE),
+            body: builtin(BODY, DEFAULT_BODY),
+        }
+    })
+}
+
+/// Returns the output of the first template of `chain` that renders, or an
+/// empty string when none does; failures are appended to `errors`. A
+/// template equal to one tried before is skipped.
+fn render_first(
+    chain: &[&Template],
+    values: &BTreeMap<String, String>,
+    errors: &mut Vec<RenderError>,
+) -> String {
+    for (index, template) in chain.iter().enumerate() {
+        if chain.iter().take(index).any(|tried| tried == template) {
+            continue;
+        }
+        match template.render(values) {
+            Ok(text) => return text,
+            Err(error) => errors.push(error),
+        }
+    }
+    String::new()
 }
 
 /// Returns whether every entry of `matches` equals the entry of `values`
@@ -987,28 +1076,25 @@ fn check_range(field: &str, value: u64, min: u64, max: u64) -> Result<(), Config
     }
 }
 
-/// Parses the template `value` of the TOML document `toml`, or `default`
-/// when it is absent.
+/// Parses the template `value` of the TOML document `toml`.
 fn compile(
     toml: &str,
-    value: Option<Spanned<String>>,
-    default: &str,
+    value: Spanned<String>,
     field: &str,
 ) -> Result<(String, Template), ConfigError> {
-    let (src, span) = match value {
-        Some(spanned) => {
-            let span = spanned.span();
-            (spanned.into_inner(), Some(span))
+    let span = value.span();
+    let src = value.into_inner();
+    let template = Template::parse(field, &src).map_err(|source| {
+        let label = match source.span() {
+            Some(inner) => template_label(toml, &span, &src, &inner),
+            None => span.clone(),
+        };
+        ConfigError::Template {
+            field: field.to_owned(),
+            span: Some(span.clone()),
+            label: Some(label.into()),
+            source: Box::new(source),
         }
-        None => (default.to_owned(), None),
-    };
-    let template = Template::parse(&src).map_err(|source| ConfigError::Template {
-        field: field.to_owned(),
-        label: span
-            .as_ref()
-            .map(|span| template_label(toml, span, &src, &source.span).into()),
-        span,
-        source,
     })?;
     Ok((src, template))
 }
@@ -1047,7 +1133,7 @@ fn compile_optional(
 ) -> Result<(Option<String>, Option<Template>), ConfigError> {
     match value {
         Some(spanned) => {
-            let (src, template) = compile(toml, Some(spanned), "", field)?;
+            let (src, template) = compile(toml, spanned, field)?;
             Ok((Some(src), Some(template)))
         }
         None => Ok((None, None)),
@@ -1306,7 +1392,6 @@ fn compile_rule(toml: &str, index: usize, raw: RawRule) -> Result<CompiledRule, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::template::TemplateErrorKind;
     use crate::test_error::{TestError, TestResult};
 
     /// Returns the error of a document that must be rejected.
@@ -1347,8 +1432,11 @@ mod tests {
 
     #[test]
     fn default_templates_render() -> TestResult {
-        assert_eq!(Template::parse(DEFAULT_TITLE)?, template::default_title());
-        assert_eq!(Template::parse(DEFAULT_BODY)?, template::default_body());
+        assert_eq!(
+            Template::parse(TITLE, DEFAULT_TITLE)?.source(),
+            DEFAULT_TITLE
+        );
+        assert_eq!(Template::parse(BODY, DEFAULT_BODY)?.source(), DEFAULT_BODY);
         let cfg = Config::default();
         let rendered = cfg
             .rendered(&values(&[("request.method", "fido2")]))
@@ -1356,6 +1444,14 @@ mod tests {
         assert_eq!(rendered.title, "Touch your security key");
         assert_eq!(rendered.body, "An application is waiting for fido2");
         assert_eq!(rendered.icon, None);
+        assert_eq!(rendered.errors, []);
+        let rendered = cfg
+            .rendered(&values(&[
+                ("device.vendor", "Yubico"),
+                ("request.method", "u2f"),
+            ]))
+            .ok_or("suppressed")?;
+        assert_eq!(rendered.title, "Touch Yubico");
         Ok(())
     }
 
@@ -1384,6 +1480,12 @@ mod tests {
         assert_eq!(
             body(&unnamed).as_deref(),
             Some("gpg is waiting for openpgp")
+        );
+        let empty = [("requester.label", ""), ("process.name", "gpg")];
+        assert_eq!(body(&empty).as_deref(), Some("gpg is waiting for openpgp"));
+        assert_eq!(
+            body(&[]).as_deref(),
+            Some("An application is waiting for openpgp")
         );
     }
 
@@ -1535,7 +1637,7 @@ mod tests {
 
     #[test]
     fn bad_template_reports_field() -> TestResult {
-        let src = "[templates]\nbody = \"{app.nope}\"\n";
+        let src = "[templates]\nbody = \"{{ app.nope }}\"\n";
         let err = rejected(src)?;
         let ConfigError::Template {
             field,
@@ -1549,20 +1651,23 @@ mod tests {
         assert_eq!(field, "templates.body");
         assert_eq!(
             span.clone().and_then(|s| src.get(s)),
-            Some("\"{app.nope}\"")
+            Some("\"{{ app.nope }}\"")
         );
         assert_eq!(
-            source.kind,
-            TemplateErrorKind::UnknownKey("app.nope".to_owned())
+            **source,
+            TemplateError::UnknownKey {
+                name: "app.nope".to_owned(),
+                span: Some(3..11),
+            }
         );
 
-        let src = "[[rules]]\nmatch = { \"app.id\" = \"a\" }\n\n[[rules]]\nmatch = { \"app.id\" = \"b\" }\ntitle = \"ab{\"\n";
+        let src = "[[rules]]\nmatch = { \"app.id\" = \"a\" }\n\n[[rules]]\nmatch = { \"app.id\" = \"b\" }\ntitle = \"ab{{\"\n";
         let err = rejected(src)?;
         let ConfigError::Template { span, source, .. } = &err else {
             return Err(format!("expected a template error, got {err:?}").into());
         };
-        assert_eq!(span.clone().and_then(|s| src.get(s)), Some("\"ab{\""));
-        assert_eq!(source.span, 2..3);
+        assert_eq!(span.clone().and_then(|s| src.get(s)), Some("\"ab{{\""));
+        assert!(matches!(**source, TemplateError::Syntax { .. }));
         assert!(matches!(
             err,
             ConfigError::Template { ref field, .. } if field == "rules[1].title"
@@ -1666,14 +1771,22 @@ mod tests {
     #[test]
     fn template_labels_point_at_the_offending_bytes() -> TestResult {
         let cases = [
-            ("[templates]\nbody = \"x {app.nope} y\"\n", "app.nope"),
-            ("[templates]\ntitle = 'ab}'\n", "}"),
+            ("[templates]\nbody = \"x {{ app.nope }} y\"\n", "app.nope"),
+            ("[templates]\ntitle = '{{ app.name }'\n", "}"),
             (
-                "[[rules]]\nmatch = { \"app.id\" = \"a\" }\nbody = '''{}'''\n",
-                "{}",
+                "[[rules]]\nmatch = { \"app.id\" = \"a\" }\nbody = '''{% macro m() %}{% endmacro %}'''\n",
+                "macro",
             ),
             // An escape shifts the decoded text, so the whole value is labelled.
-            ("[templates]\nbody = \"\\u0041{\"\n", "\"\\u0041{\""),
+            (
+                "[templates]\nbody = \"\\u0041{{ x }}\"\n",
+                "\"\\u0041{{ x }}\"",
+            ),
+            // An unknown name not found in the text labels the whole value.
+            (
+                "[templates]\nbody = '{{ app . nope }}'\n",
+                "'{{ app . nope }}'",
+            ),
         ];
         for (src, expected) in cases {
             let err = rejected(src)?;
@@ -1692,7 +1805,7 @@ mod tests {
 
         let cases = [
             ("verbose = true", "touchcue::config::toml"),
-            ("[templates]\nbody = \"{\"", "touchcue::config::template"),
+            ("[templates]\nbody = \"{{\"", "touchcue::config::template"),
             (
                 "[[rules]]\nmatch = { \"app.colour\" = \"x\" }\n",
                 "touchcue::config::unknown_match_key",
@@ -1718,7 +1831,7 @@ mod tests {
                 "{src:?}"
             );
         }
-        let src = "[templates]\nbody = \"{app.nope}\"";
+        let src = "[templates]\nbody = \"{{ app.nope }}\"";
         let err = rejected(src)?;
         let labels: Vec<_> = err.labels().into_iter().flatten().collect();
         let [label] = labels.as_slice() else {
@@ -1728,7 +1841,7 @@ mod tests {
             src.get(label.offset()..label.offset() + label.len()),
             Some("app.nope")
         );
-        assert_eq!(label.label(), Some("unknown placeholder key `app.nope`"));
+        assert_eq!(label.label(), Some("unknown placeholder `app.nope`"));
         assert!(err.help().is_some());
         Ok(())
     }
@@ -1744,7 +1857,7 @@ mod tests {
 
             [[rules]]
             match = { "process.name" = "ssh" }
-            body = "ssh wants {request.method}"
+            body = "ssh wants {{ request.method }}"
 
             [[rules]]
             match = { "process.name" = "ssh" }
@@ -1767,6 +1880,7 @@ mod tests {
                 title: "SSH key".to_owned(),
                 body: "ssh is waiting for fido2".to_owned(),
                 icon: Some("ssh-icon".to_owned()),
+                errors: Vec::new(),
             }
         );
         let second = cfg
@@ -1781,12 +1895,100 @@ mod tests {
                 title: "Touch your security key".to_owned(),
                 body: "ssh wants u2f".to_owned(),
                 icon: None,
+                errors: Vec::new(),
             }
         );
         assert_eq!(cfg.rendered(&values(&[("app.id", "quiet")])), None);
         assert!(cfg.rendered(&values(&[("app.id", "QUIET")])).is_some());
         assert!(cfg.rendered(&values(&[])).is_some());
         assert_eq!(cfg.rules().count(), 4);
+        Ok(())
+    }
+
+    #[test]
+    fn failing_templates_fall_back_to_the_defaults() -> TestResult {
+        let cfg = Config::from_toml(
+            r#"
+            [templates]
+            title = "{{ request.count + 1 }}"
+
+            [[rules]]
+            match = { "process.name" = "ssh" }
+            body = "{{ request.method | int }}"
+            "#,
+        )?;
+        let rendered = cfg
+            .rendered(&values(&[
+                ("process.name", "ssh"),
+                ("request.method", "fido2"),
+                ("request.count", "1"),
+            ]))
+            .ok_or("suppressed")?;
+        assert_eq!(rendered.title, "Touch your security key");
+        assert_eq!(rendered.body, "ssh is waiting for fido2");
+        let failed: Vec<_> = rendered
+            .errors
+            .iter()
+            .map(|error| (error.name.as_str(), error.kind()))
+            .collect();
+        assert_eq!(
+            failed,
+            [
+                ("templates.title", minijinja::ErrorKind::InvalidOperation),
+                ("rules[0].body", minijinja::ErrorKind::InvalidOperation),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_failing_rule_template_falls_back_to_the_configured_one() -> TestResult {
+        let cfg = Config::from_toml(
+            r#"
+            [templates]
+            body = "{{ process.name }} wants {{ request.method }}"
+
+            [[rules]]
+            match = { "process.name" = "ssh" }
+            body = "{{ request.method | int }}"
+            icon = "ssh-icon"
+            "#,
+        )?;
+        let request = values(&[("process.name", "ssh"), ("request.method", "fido2")]);
+        let rendered = cfg.rendered(&request).ok_or("suppressed")?;
+        assert_eq!(rendered.body, "ssh wants fido2");
+        assert_eq!(rendered.errors.len(), 1);
+        let fallback = cfg.fallback(&request).ok_or("suppressed")?;
+        assert_eq!(
+            fallback,
+            Rendered {
+                title: "Touch your security key".to_owned(),
+                body: "ssh is waiting for fido2".to_owned(),
+                icon: Some("ssh-icon".to_owned()),
+                errors: Vec::new(),
+            }
+        );
+        let quiet =
+            Config::from_toml("[[rules]]\nmatch = { \"app.id\" = \"q\" }\nsuppress = true\n")?;
+        assert_eq!(quiet.fallback(&values(&[("app.id", "q")])), None);
+        Ok(())
+    }
+
+    #[test]
+    fn old_template_syntax_is_rejected_with_a_label() -> TestResult {
+        let src = "[templates]\nbody = '{requester.label|process.name|\"An application\"}'\n";
+        let err = rejected(src)?;
+        assert!(
+            matches!(
+                &err,
+                ConfigError::Template { source, .. } if matches!(**source, TemplateError::OldSyntax { .. })
+            ),
+            "{err:?}"
+        );
+        assert_eq!(
+            err.label_span().and_then(|s| src.get(s)),
+            Some("{requester")
+        );
         Ok(())
     }
 
