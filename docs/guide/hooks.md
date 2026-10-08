@@ -122,8 +122,8 @@ Other hooks get no `TOUCHCUE_TITLE` or `TOUCHCUE_BODY`: they also run for suppre
 The stdin of a process is a pipe that carries one JSON object per line:
 
 ```json
-{"op":"show","id":3,"title":"Touch Yubico","body":"Firefox is waiting for fido2","values":{"app.name":"Firefox","request.method":"fido2","request.state":"waiting"}}
-{"op":"update","id":3,"title":"Touch Yubico","body":"Firefox is waiting for fido2 (cancelled)","values":{"app.name":"Firefox","request.method":"fido2","request.state":"cancelled"}}
+{"op":"show","id":3,"title":"Touch Yubico","body":"Firefox is waiting for a passkey","values":{"app.name":"Firefox","request.method":"fido2","request.state":"waiting"}}
+{"op":"update","id":3,"title":"Touch Yubico","body":"Firefox is waiting for a passkey (cancelled)","values":{"app.name":"Firefox","request.method":"fido2","request.state":"cancelled"}}
 {"op":"hide","id":3}
 ```
 

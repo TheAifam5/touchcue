@@ -43,7 +43,7 @@ Templates are trusted configuration, written by the owner of the configuration f
 | `process` | `name`, `exe`, `pid`, `cmdline`, `uid`, `chain` |
 | `requester` | `name`, `exe`, `pid`, `label` |
 | `device` | `vendor`, `model`, `product`, `vid`, `pid`, `kind`, `transport` |
-| `request` | `method`, `op`, `source`, `class`, `confidence`, `elapsed`, `count`, `state`, `detail` |
+| `request` | `method`, `op`, `action`, `source`, `class`, `confidence`, `elapsed`, `count`, `state`, `detail` |
 
 ::: v-pre
 `process` is the client process that talks to the device or to gpg-agent, such as `gpg` or `ssh-sk-helper`. `requester` is the program that asked it to, such as `claude` running `git commit -S`. `app` is the desktop application they run in, such as Kitty. A value that is not known is empty, so give a fallback, as in `{{ requester.label or process.name or "An application" }}`.
@@ -87,6 +87,7 @@ Limits:
 | --- | --- |
 | `request.method` | `fido2`, `u2f`, `openpgp` |
 | `request.op` | `sign`, `decrypt`, `auth` for OpenPGP; empty for FIDO |
+| `request.action` | what the request waits for, worded for people; see below |
 | `request.source` | `fido`; for OpenPGP `ssh` when an `auth` operation runs while a client is connected to gpg-agent's ssh socket, else `gpg` |
 | `request.class` | `asserted` for FIDO, `activity` for OpenPGP |
 | `request.state` | `waiting`, `touched`, `cancelled`, `failed`, `timed_out` |
@@ -100,6 +101,19 @@ Limits:
 | `device.vendor` | vendor name, for example `Yubico`; for an OpenPGP card, its manufacturer |
 
 `request.confidence` is `high` when one process holds the FIDO device open, `medium` when several do or when the client is chosen among the clients of gpg-agent for an OpenPGP request, and `low` otherwise.
+
+`request.action` words `request.method` and `request.op` for the default body. Rules and hooks should compare `request.method`, `request.op` and `request.source`, whose values stay fixed; the wording of `request.action` may change.
+
+| Request | `request.action` |
+| --- | --- |
+| FIDO2 or U2F | `a passkey` |
+| OpenPGP `sign` | `a GPG signature` |
+| OpenPGP `decrypt` | `GPG decryption` |
+| OpenPGP `auth` | `GPG authentication` |
+| OpenPGP with `source` `ssh` | `an SSH login` |
+| other OpenPGP operations | `a GPG operation` |
+
+The FIDO source cannot tell a sign-in from a registration. An OpenSSH security key is a FIDO request too; a rule matching `requester.name = "ssh"` can word it differently.
 
 `request.detail` is empty unless a reporter sent it. `touchcue askpass` sets it for OpenSSH security keys, for example `ED25519-SK SHA256:… → user git`; see [OpenSSH security keys](./ssh-askpass).
 

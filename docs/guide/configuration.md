@@ -31,7 +31,7 @@ safety_timeout_s = 60
 
 [templates]
 title = 'Touch {{ device.vendor or "your security key" }}'
-body = '{{ requester.label or process.name or "An application" }} is waiting for {{ request.method }}'
+body = '{{ requester.label or process.name or "An application" }} is waiting for {{ request.action }}'
 
 [sources.fido]
 enabled = true
@@ -73,7 +73,7 @@ extend_skip = []
 - `popup` shows an overlay popup that takes no input focus. It uses Wayland layer-shell when `WAYLAND_DISPLAY` or `WAYLAND_SOCKET` is set and the compositor supports it, else X11 when `DISPLAY` is set, which includes XWayland.
 - `notification` sends a desktop notification over D-Bus; the notification server draws it, here mako:
 
-  ![A mako notification: Touch your security key, Browser is waiting for fido2](/screenshots/notification.png)
+  ![A mako notification: Touch your security key, Browser is waiting for a passkey](/screenshots/notification.png)
 - `both` shows the popup and a notification.
 - `none` shows nothing.
 - `command` is accepted, but skipped with a warning. To show prompts through programs such as rofi or fuzzel, use [hooks with `until`](./hooks#hooks-that-last-for-a-request); see [Launchers](./launchers).
@@ -94,7 +94,7 @@ extend_skip = []
 
 `min_display_ms` is the shortest time a shown popup stays visible. `show_delay_ms` is how long a request must wait before its popup appears.
 
-![The default popup, centred: Touch your security key, Browser is waiting for fido2](/screenshots/default.png)
+![The default popup, centred: Touch your security key, Browser is waiting for a passkey](/screenshots/default.png)
 
 Several popups on one output stack in the order the requests started: away from the screen edge, or vertically around the centre with `center`.
 
@@ -158,10 +158,10 @@ Without `theme`, `touchcue run` detects the theme once at start, from the first 
 | Key | Default |
 | --- | --- |
 | `title` | `Touch {{ device.vendor or "your security key" }}` |
-| `body` | `{{ requester.label or process.name or "An application" }} is waiting for {{ request.method }}` |
+| `body` | `{{ requester.label or process.name or "An application" }} is waiting for {{ request.action }}` |
 :::
 
-The default body names the requester and its application through [`requester.label`](./placeholders#requester): `claude in Kitty is waiting for openpgp`, or `Firefox is waiting for fido2` when the application asks itself.
+The default body names the requester and its application through [`requester.label`](./placeholders#requester): `claude in Kitty is waiting for a GPG signature`, or `Firefox is waiting for a passkey` when the application asks itself. [`request.action`](./placeholders#values) words what the request waits for.
 
 Templates use Jinja syntax with [placeholders](./placeholders#template-syntax). A template that fails while rendering is replaced by the next of: the matching rule's template, the `[templates]` template, the default above, and an empty text. A request that ended without a touch keeps its prompt briefly, with `(cancelled)` or `(timed out)` appended to the body.
 
