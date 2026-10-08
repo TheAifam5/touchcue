@@ -1021,8 +1021,9 @@ impl CompositorHandler for Popups {
         _: &Connection,
         _: &QueueHandle<Self>,
         surface: &wl_surface::WlSurface,
-        _: &wl_output::WlOutput,
+        output: &wl_output::WlOutput,
     ) {
+        self.overlay_entered(surface, output);
         self.outputs_changed(surface);
     }
 
@@ -1038,6 +1039,51 @@ impl CompositorHandler for Popups {
 }
 
 impl Popups {
+    /// Settles an overlay created without an output on the output it entered,
+    /// so each output has at most one overlay. Its requests join the overlay
+    /// already on that output; otherwise it stays there with its time limit,
+    /// unless that output cools down, which removes it.
+    fn overlay_entered(&mut self, surface: &wl_surface::WlSurface, output: &wl_output::WlOutput) {
+        let Some(index) = self
+            .overlays
+            .iter()
+            .position(|overlay| overlay.output.is_none() && overlay.layer.wl_surface() == surface)
+        else {
+            return;
+        };
+        let target = Some(output.clone());
+        if let Some(existing) = self
+            .overlays
+            .iter()
+            .position(|overlay| overlay.output == target)
+        {
+            let moved = self
+                .overlays
+                .get_mut(index)
+                .map(|overlay| std::mem::take(&mut overlay.holders))
+                .unwrap_or_default();
+            let holders = moved.len();
+            if let Some(overlay) = self.overlays.get_mut(existing) {
+                overlay.holders.extend(moved);
+            }
+            self.remove_overlays(|overlay| overlay.layer.wl_surface() == surface);
+            self.overlay_clock.ended(&None);
+            debug!(holders, "modal overlay joined the overlay on its output");
+            return;
+        }
+        if self
+            .overlay_clock
+            .rekey(&None, target.clone(), Instant::now())
+        {
+            if let Some(overlay) = self.overlays.get_mut(index) {
+                overlay.output = target;
+            }
+        } else {
+            self.remove_overlays(|overlay| overlay.layer.wl_surface() == surface);
+            debug!("output is cooling down; modal overlay removed");
+        }
+    }
+
     /// Restacks after the compositor moved the surface of a popup without a
     /// requested output, which may move it to another output's stack.
     fn outputs_changed(&mut self, surface: &wl_surface::WlSurface) {

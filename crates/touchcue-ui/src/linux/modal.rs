@@ -97,6 +97,30 @@ impl<K: Clone + PartialEq> OverlayClock<K> {
             .retain(|(other, slot)| other != key || matches!(slot, Slot::Cooling { .. }));
     }
 
+    /// Moves the overlay shown on `from` to `to`, keeping its time limit,
+    /// and reports whether it may stay; it may not while `to` cools down at
+    /// `now`, and `from` is then ended.
+    ///
+    /// The caller has no overlay on `to`. Without a shown overlay on `from`,
+    /// `to` gets a full [`MODAL_MAX`] from `now`.
+    pub(crate) fn rekey(&mut self, from: &K, to: K, now: Instant) -> bool {
+        let until = self.slots.iter().find_map(|(key, slot)| match slot {
+            Slot::Shown { until } if key == from => Some(*until),
+            Slot::Shown { .. } | Slot::Cooling { .. } => None,
+        });
+        self.ended(from);
+        let cooling = self.slots.iter().any(|(key, slot)| {
+            *key == to && matches!(slot, Slot::Cooling { until } if now < *until)
+        });
+        if cooling {
+            return false;
+        }
+        let until = until.unwrap_or_else(|| now.checked_add(MODAL_MAX).unwrap_or(now));
+        self.slots.retain(|(key, _)| *key != to);
+        self.slots.push((to, Slot::Shown { until }));
+        true
+    }
+
     /// Returns the outputs whose overlay reached [`MODAL_MAX`] at `now`,
     /// which then cool down, and forgets finished cooldowns.
     pub(crate) fn expire(&mut self, now: Instant) -> Vec<K> {
@@ -183,6 +207,22 @@ mod tests {
         assert!(!timer.sync(B, false));
         timer.clear();
         assert!(timer.sync(A, true));
+    }
+
+    #[test]
+    fn rekeyed_overlay_keeps_its_limit_and_respects_cooldown() {
+        let t0 = Instant::now();
+        let mut clock = OverlayClock::default();
+        assert!(clock.start(&None, t0));
+        assert!(clock.rekey(&None, Some("DP-1"), later(t0, 10)));
+        assert_eq!(clock.next_deadline(), Some(later(t0, 120)));
+        assert_eq!(clock.expire(later(t0, 120)), [Some("DP-1")]);
+        // DP-1 cools down: an overlay that lands there may not stay.
+        assert!(clock.start(&None, later(t0, 130)));
+        assert!(!clock.rekey(&None, Some("DP-1"), later(t0, 131)));
+        assert_eq!(clock.next_deadline(), None);
+        assert!(clock.start(&None, later(t0, 160)));
+        assert!(clock.rekey(&None, Some("DP-1"), later(t0, 161)));
     }
 
     /// A creates the overlay at 0 s; B at 100 s and C at 200 s would only
