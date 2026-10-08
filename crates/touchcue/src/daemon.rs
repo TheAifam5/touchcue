@@ -9,7 +9,9 @@ use tokio::sync::{Semaphore, TryAcquireError};
 use touchcue_appinfo::linux::Resolver;
 use touchcue_core::placeholders::{self, AppInfo, Confidence, ProcessInfo, Requester};
 use touchcue_core::text::sanitize;
-use touchcue_core::{Config, DeviceKind, Event, Machine, RateLimit, Request, RequestId, Signal};
+use touchcue_core::{
+    Config, DeviceKind, Event, Machine, RateLimit, Rendered, Request, RequestId, Signal,
+};
 use touchcue_ipc::agent::AgentPaths;
 use touchcue_ipc::helper::Notice;
 use touchcue_ipc::sockdiag;
@@ -32,6 +34,12 @@ pub const ICON_TIMEOUT: Duration = Duration::from_millis(500);
 const ICON_WARN_INTERVAL: Duration = Duration::from_secs(60);
 /// Longest rule icon text recorded in logs, in chars.
 const LOGGED_ICON_MAX: usize = 256;
+/// Shortest interval between two logged render failures of one template,
+/// and between two logged renders that did not finish.
+const TEMPLATE_WARN_INTERVAL: Duration = Duration::from_secs(60);
+/// Longest wait for rendering the templates of a prompt; a render not done in
+/// time is replaced by the built-in templates.
+pub const RENDER_TIMEOUT: Duration = Duration::from_millis(200);
 /// Process names never attributed as a gpg-agent client: the agent, its
 /// card daemon and touchcue's own `scdaemon` wrapper.
 const AGENT_SIDE: &[&str] = &["gpg-agent", "scdaemon", "touchcue"];
@@ -476,14 +484,15 @@ struct Cached {
 /// revives it. A prompt is shown while the configuration renders the request
 /// and hidden when a rule suppresses it or the request ends. Every event is
 /// published, suppressed or not. Events are handled one at a time, so a slow
-/// attribution delays later events by up to [`ATTRIBUTION_TIMEOUT`].
+/// attribution delays later events by up to [`ATTRIBUTION_TIMEOUT`], and a
+/// slow render by up to [`RENDER_TIMEOUT`].
 ///
 /// An askpass notice only enriches requests: a request whose attributed
 /// lineage contains the notice's pid gets the notice's detail, whether the
 /// notice arrives before or after the request is attributed.
 pub struct Daemon<A, S> {
     machine: Machine,
-    config: Config,
+    renderer: Renderer,
     attribute: A,
     sink: S,
     cache: BTreeMap<RequestId, Cached>,
@@ -495,7 +504,7 @@ impl<A: Attribute, S: Sink> Daemon<A, S> {
     pub fn new(machine: Machine, config: Config, attribute: A, sink: S) -> Self {
         Self {
             machine,
-            config,
+            renderer: Renderer::new(config),
             attribute,
             sink,
             cache: BTreeMap::new(),
@@ -686,7 +695,7 @@ impl<A: Attribute, S: Sink> Daemon<A, S> {
             return;
         };
         let (values, prompt) = render(
-            &self.config,
+            &mut self.renderer,
             request,
             &cached.attribution,
             now,
@@ -727,37 +736,154 @@ fn values(
     )
 }
 
+/// Renders the templates of a configuration on the blocking pool, one render
+/// at a time, and logs failed templates.
+///
+/// Templates are trusted configuration: fuel limits the number of
+/// instructions of a render, not the time or memory one instruction takes.
+/// A render that exceeds [`RENDER_TIMEOUT`] is abandoned and keeps its
+/// blocking thread and the render slot until it finishes, which may be
+/// never; until then, prompts use the built-in templates and each attempt
+/// logs a rate-limited warning. Failures are logged with the template name, the
+/// error kind and the error chain, never the placeholder values.
+pub struct Renderer {
+    config: Arc<Config>,
+    /// Held by the one running render.
+    busy: Arc<Semaphore>,
+    /// Per template name, so at most one per template of the configuration.
+    limits: BTreeMap<String, RateLimit>,
+    /// For renders that did not finish, per reason.
+    unfinished_limits: BTreeMap<&'static str, RateLimit>,
+}
+
+impl Renderer {
+    /// Creates a renderer of `config`.
+    pub fn new(config: Config) -> Self {
+        Self {
+            config: Arc::new(config),
+            busy: Arc::new(Semaphore::new(1)),
+            limits: BTreeMap::new(),
+            unfinished_limits: BTreeMap::new(),
+        }
+    }
+
+    /// Returns [`Config::rendered`] for `values`, or [`Config::fallback`]
+    /// when the render panics, is busy or times out; logs failures at
+    /// most once per [`TEMPLATE_WARN_INTERVAL`] per template or reason,
+    /// measured from `now`.
+    #[tracing::instrument(
+        name = "templates",
+        level = "debug",
+        skip_all,
+        fields(timeout_ms = millis(RENDER_TIMEOUT))
+    )]
+    async fn rendered(
+        &mut self,
+        values: &BTreeMap<String, String>,
+        now: Instant,
+    ) -> Option<Rendered> {
+        let (reason, failure) = match Arc::clone(&self.busy).try_acquire_owned() {
+            Ok(permit) => {
+                let config = Arc::clone(&self.config);
+                let owned = values.clone();
+                let started = Instant::now();
+                let task = tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
+                    config.rendered(&owned)
+                });
+                let result = tokio::time::timeout(RENDER_TIMEOUT, task).await;
+                tracing::debug!(elapsed_ms = millis(started.elapsed()), "rendered templates");
+                match result {
+                    Ok(Ok(rendered)) => {
+                        if let Some(rendered) = &rendered {
+                            self.warn_failed(rendered, now);
+                        }
+                        return rendered;
+                    }
+                    Ok(Err(error)) if error.is_panic() => ("panicked", Some(error)),
+                    Ok(Err(error)) => ("cancelled", Some(error)),
+                    Err(_) => ("timed_out", None),
+                }
+            }
+            Err(TryAcquireError::NoPermits) => ("busy", None),
+            Err(TryAcquireError::Closed) => ("closed", None),
+        };
+        let timeout_ms = millis(RENDER_TIMEOUT);
+        let limit = self
+            .unfinished_limits
+            .entry(reason)
+            .or_insert_with(|| RateLimit::new(TEMPLATE_WARN_INTERVAL));
+        limit.log(now, |suppressed| {
+            if let Some(error) = &failure {
+                tracing::warn!(
+                    reason,
+                    suppressed,
+                    error = error as &dyn std::error::Error,
+                    "templates not rendered; using the built-in templates"
+                );
+            } else {
+                tracing::warn!(
+                    reason,
+                    timeout_ms,
+                    suppressed,
+                    "templates not rendered; using the built-in templates"
+                );
+            }
+        });
+        self.config.fallback(values)
+    }
+
+    /// Logs each failed template of `rendered`.
+    fn warn_failed(&mut self, rendered: &Rendered, now: Instant) {
+        for error in &rendered.errors {
+            let limit = self
+                .limits
+                .entry(error.name.clone())
+                .or_insert_with(|| RateLimit::new(TEMPLATE_WARN_INTERVAL));
+            limit.log(now, |suppressed| {
+                tracing::warn!(
+                    template = error.name.as_str(),
+                    kind = %error.kind(),
+                    suppressed,
+                    error = error as &dyn std::error::Error,
+                    "template failed to render; using the next template"
+                );
+            });
+        }
+    }
+}
+
 /// Returns the placeholder values of `request` and its prompt, or `None` for
 /// the prompt when a rule suppresses it.
 ///
 /// Title and body are sanitized and capped at 120 and 400 chars. The icon is
 /// the file `icons` finds for the matching rule's icon, else the
-/// application's icon.
+/// application's icon. Templates are rendered by `renderer`.
 #[tracing::instrument(
     level = "debug",
     skip_all,
     fields(id = %request.id, state = request.state.as_str())
 )]
 pub async fn render(
-    config: &Config,
+    renderer: &mut Renderer,
     request: &Request,
     attribution: &Attribution,
     now: Instant,
     icons: &mut impl Attribute,
 ) -> (BTreeMap<String, String>, Option<Prompt>) {
     let values = values(request, Some(attribution), now);
-    let Some(rendered) = config.rendered(&values) else {
+    let Some(text) = renderer.rendered(&values, now).await else {
         tracing::debug!(suppressed = true, "rendered prompt");
         return (values, None);
     };
-    let rule_icon = match rendered.icon.as_deref() {
+    let rule_icon = match text.icon.as_deref() {
         Some(icon) => icons.icon(icon).await,
         None => None,
     };
     let prompt = Prompt {
         id: request.id,
-        title: sanitize(&rendered.title, TITLE_MAX).unwrap_or_default(),
-        body: sanitize(&rendered.body, BODY_MAX).unwrap_or_default(),
+        title: sanitize(&text.title, TITLE_MAX).unwrap_or_default(),
+        body: sanitize(&text.body, BODY_MAX).unwrap_or_default(),
         icon: rule_icon
             .or_else(|| attribution.app.as_ref().and_then(|app| app.icon.clone()))
             .map(PathBuf::from),
@@ -796,6 +922,10 @@ mod tests {
         TimedOut,
         #[error(transparent)]
         Elapsed(#[from] tokio::time::error::Elapsed),
+        #[error(transparent)]
+        Acquire(#[from] TryAcquireError),
+        #[error("no rate limit for `{0}`")]
+        NoLimit(&'static str),
     }
 
     type TestResult = Result<(), TestError>;
@@ -964,7 +1094,7 @@ mod tests {
     #[tokio::test]
     async fn render_sanitizes_and_prefers_app_icon() -> TestResult {
         let (values, prompt) = render(
-            &Config::default(),
+            &mut Renderer::new(Config::default()),
             &request(RequestState::Waiting),
             &firefox(),
             Instant::now(),
@@ -989,7 +1119,7 @@ mod tests {
             "[templates]\ntitle = \"{long}\"\nbody = \"{long}\"\n"
         ))?;
         let (_, prompt) = render(
-            &config,
+            &mut Renderer::new(config.clone()),
             &request(RequestState::Waiting),
             &firefox(),
             Instant::now(),
@@ -1003,6 +1133,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failing_templates_fall_back_and_warn_once_per_interval_each() -> TestResult {
+        let config = Config::from_toml(
+            "[templates]\ntitle = \"{{ request.count + 1 }}\"\nbody = \"{{ request.method | int }}\"\n",
+        )?;
+        let now = Instant::now();
+        let mut renderer = Renderer::new(config);
+        for _ in 0..2 {
+            let (_, prompt) = render(
+                &mut renderer,
+                &request(RequestState::Waiting),
+                &firefox(),
+                now,
+                &mut Fixed::default(),
+            )
+            .await;
+            let prompt = prompt.ok_or(TestError::NoPrompt)?;
+            assert_eq!(prompt.title, "Touch Yubico");
+            assert_eq!(prompt.body, "Firefox is waiting for fido2");
+        }
+        // Each template logged its first failure and held back the second.
+        let later = now + TEMPLATE_WARN_INTERVAL;
+        for name in ["templates.title", "templates.body"] {
+            let limit = renderer
+                .limits
+                .get_mut(name)
+                .ok_or(TestError::NoLimit(name))?;
+            assert_eq!(limit.check(later), Some(1), "{name}");
+        }
+        assert!(renderer.unfinished_limits.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn busy_renders_use_the_built_in_templates() -> TestResult {
+        let now = Instant::now();
+        let mut renderer = Renderer::new(icon_rule("{{ app.name }} only")?);
+        let _held = Arc::clone(&renderer.busy).try_acquire_owned()?;
+        let (_, prompt) = render(
+            &mut renderer,
+            &request(RequestState::Waiting),
+            &firefox(),
+            now,
+            &mut Fixed::default(),
+        )
+        .await;
+        let prompt = prompt.ok_or(TestError::NoPrompt)?;
+        assert_eq!(prompt.body, "Firefox is waiting for fido2");
+        assert_eq!(prompt.icon, Some(PathBuf::from("/icons/fixture.svg")));
+        // Logged at `now` under its reason only.
+        let busy = renderer.unfinished_limits.get_mut("busy");
+        assert_eq!(busy.and_then(|limit| limit.check(now)), None);
+        assert_eq!(renderer.unfinished_limits.len(), 1);
+        Ok(())
+    }
+
+    /// Relies on minijinja's unchecked `len * n` in sequence repetition,
+    /// which panics only when overflow checks are on.
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    async fn panicked_renders_use_the_built_in_templates() -> TestResult {
+        let now = Instant::now();
+        let mut renderer = Renderer::new(icon_rule("{{ (([1, 2] * 10**19) | length) }}")?);
+        let (_, prompt) = render(
+            &mut renderer,
+            &request(RequestState::Waiting),
+            &firefox(),
+            now,
+            &mut Fixed::default(),
+        )
+        .await;
+        let prompt = prompt.ok_or(TestError::NoPrompt)?;
+        assert_eq!(prompt.body, "Firefox is waiting for fido2");
+        assert_eq!(prompt.icon, Some(PathBuf::from("/icons/fixture.svg")));
+        let panicked = renderer.unfinished_limits.get_mut("panicked");
+        assert_eq!(panicked.and_then(|limit| limit.check(now)), None);
+        Ok(())
+    }
+
+    /// Returns a configuration with the body template `body` and a rule
+    /// giving waiting requests the icon `fixture-icon`.
+    fn icon_rule(body: &str) -> Result<Config, TestError> {
+        Ok(Config::from_toml(&format!(
+            "[templates]\nbody = \"{body}\"\n\n\
+             [[rules]]\nmatch = {{ \"request.state\" = \"waiting\" }}\nicon = \"fixture-icon\"\n"
+        ))?)
+    }
+
+    #[tokio::test]
     async fn rule_icon_precedes_app_icon_and_suppress_hides() -> TestResult {
         let config = Config::from_toml(
             "[[rules]]\nmatch = { \"request.state\" = \"waiting\" }\nicon = \"fixture-icon\"\n\
@@ -1010,7 +1228,7 @@ mod tests {
              [[rules]]\nmatch = { \"request.state\" = \"cancelled\" }\nsuppress = true\n",
         )?;
         let (_, waiting) = render(
-            &config,
+            &mut Renderer::new(config.clone()),
             &request(RequestState::Waiting),
             &firefox(),
             Instant::now(),
@@ -1022,7 +1240,7 @@ mod tests {
             Some(PathBuf::from("/icons/fixture.svg"))
         );
         let (_, touched) = render(
-            &config,
+            &mut Renderer::new(config.clone()),
             &request(RequestState::Lingering(touchcue_core::EndReason::Touched)),
             &firefox(),
             Instant::now(),
@@ -1035,7 +1253,7 @@ mod tests {
         );
         let cancelled = RequestState::Lingering(touchcue_core::EndReason::Cancelled);
         let (values, suppressed) = render(
-            &config,
+            &mut Renderer::new(config.clone()),
             &request(cancelled),
             &firefox(),
             Instant::now(),
@@ -1050,7 +1268,7 @@ mod tests {
     #[tokio::test]
     async fn render_without_holder_has_low_confidence() -> TestResult {
         let (values, prompt) = render(
-            &Config::default(),
+            &mut Renderer::new(Config::default()),
             &request(RequestState::Waiting),
             &Attribution::default(),
             Instant::now(),
@@ -1079,7 +1297,7 @@ mod tests {
             ..firefox()
         };
         let (values, prompt) = render(
-            &Config::default(),
+            &mut Renderer::new(Config::default()),
             &request(RequestState::Waiting),
             &attribution,
             Instant::now(),
@@ -1175,7 +1393,7 @@ mod tests {
         let resolver = Resolver::new(proc_root, vec![share], 64);
         let attribution = attribute(&resolver, &Target::Node(node.to_owned()));
         let (values, _) = render(
-            &Config::default(),
+            &mut Renderer::new(Config::default()),
             &request(RequestState::Waiting),
             &attribution,
             Instant::now(),
@@ -1366,7 +1584,7 @@ mod tests {
             "[[rules]]\nmatch = { \"request.state\" = \"waiting\" }\nicon = \"touchcue-fixture\"\n",
         )?;
         let (_, prompt) = render(
-            &config,
+            &mut Renderer::new(config.clone()),
             &request(RequestState::Waiting),
             &firefox(),
             Instant::now(),
