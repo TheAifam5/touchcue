@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/TheAifam5/touchcue/compare/v0.2.1...v0.3.0) - 2026-10-08
+
+### Added
+
+- *(core)* add the request.action placeholder for the default body
+
+### Fixed
+
+- *(ui)* share one modal overlay per output with fallback popups
+- *(ui)* stack fallback popups with the output they are on
+
+### Other
+
+- *(ui)* reword the screenshot example prompts
+
 ## [0.2.1](https://github.com/TheAifam5/touchcue/compare/v0.2.0...v0.2.1) - 2026-10-08
 
 ### Fixed
