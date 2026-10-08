@@ -1,8 +1,11 @@
 name: docs
 
+# The site shows the docs of the latest `v*` tag at `/` and of `main` under
+# `/next/`; every run rebuilds both. Path filters do not apply to tag pushes.
 on:
   push:
     branches: [main]
+    tags: ["v*"]
     paths:
       - "docs/**"
       - mise.toml
@@ -30,20 +33,62 @@ jobs:
     permissions:
       contents: read
     steps:
+      # A tag push would check out the tag; the next docs always come from main.
+      # The full history brings the tags along.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: main
+          fetch-depth: 0
           persist-credentials: false
       - uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
         with:
           version: 2026.10.2
           install_args: node
-      - name: Build with VitePress
+          cache: false
+      # The highest stable `vX.Y.Z` tag; prereleases and other tags are skipped.
+      - name: Find the latest release tag
+        id: latest
         run: |
-          mise run docs:build
-          touch docs/.vitepress/dist/.nojekyll
+          tag="$(git tag --list 'v*' --sort=-v:refname | grep -E -m1 '^v[0-9]+\.[0-9]+\.[0-9]+$' || true)"
+          if [ -n "$tag" ]; then
+            echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice title=No release tag::Publishing the main docs as the latest docs."
+            echo "tag=" >> "$GITHUB_OUTPUT"
+          fi
+      # The tag's docs are extracted inside the workspace, where main's
+      # mise.toml, and with it the installed node, applies.
+      - name: Build the latest docs
+        env:
+          DOCS_CHANNEL: latest
+          DOCS_BASE: /
+          DOCS_LATEST_VERSION: ${{ steps.latest.outputs.tag }}
+          TAG: ${{ steps.latest.outputs.tag }}
+        run: |
+          mkdir latest
+          git archive "${TAG:-HEAD}" docs | tar -x -C latest
+          # A tag from before the version switch builds with main's config, theme and packages.
+          if ! grep -q DOCS_CHANNEL latest/docs/.vitepress/config.mts; then
+            cp -r docs/.vitepress/config.mts docs/.vitepress/theme latest/docs/.vitepress/
+            cp docs/package.json docs/package-lock.json latest/docs/
+          fi
+          cd latest/docs
+          npm ci
+          npm run build
+      - name: Build the next docs
+        env:
+          DOCS_CHANNEL: next
+          DOCS_BASE: /next/
+          DOCS_LATEST_VERSION: ${{ steps.latest.outputs.tag }}
+        run: mise run docs:build
+      - name: Assemble the site
+        run: |
+          cp -r latest/docs/.vitepress/dist site
+          cp -r docs/.vitepress/dist site/next
+          touch site/.nojekyll
       - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:
-          path: docs/.vitepress/dist
+          path: site
 
   deploy:
     name: deploy
