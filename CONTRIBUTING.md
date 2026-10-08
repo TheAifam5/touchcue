@@ -48,6 +48,20 @@ The build reads three environment variables:
 
 Without them, as in `mise run docs:dev` and `mise run docs:build`, the build is the `main` docs at `/`, and the version switch links work only on the published site.
 
+## Screenshots
+
+The popup and notification images in `docs/public/screenshots/` are generated, not drawn by hand. Regenerate them with:
+
+```sh
+mise run screenshots                    # every scenario
+mise run screenshots stacked modal-dim  # only these
+mise run screenshots --dry-run          # print the plan; start nothing
+```
+
+The task builds the `screenshots` example of `touchcue-ui` (`crates/touchcue-ui/examples/screenshots.rs`), which holds each scenario's configuration and prompts; `cargo run -p touchcue-ui --example screenshots -- --list` names them. `scripts/screenshots.sh` then starts a nested Hyprland with its own Wayland socket and its own D-Bus session bus, captures each scenario with `grim`, and stops everything again. Each nested output is a window on your desktop; when your desktop is Hyprland, the script floats these windows and resizes them to 1280x720 so every run gives images of the same size. Nothing else is drawn on your desktop. The script sets `HYPRLAND_NO_SD_VARS=1` so the nested Hyprland does not export its variables to the systemd user environment, and it uses a private bus; to check, compare `systemctl --user show-environment` before and after a run. Pass `--headless` to capture 1280x720 headless outputs instead, with no windows; this fails on drivers that cannot allocate buffers for headless outputs, such as NVIDIA. Working files go to `target/screenshots/` and are kept there when a run fails.
+
+Requirements: a running Wayland session, and Hyprland 0.56 (Lua configuration) with `hyprctl`, `dbus-run-session`, `grim`, `jq` and ImageMagick (`magick`) from your system packages; `mako` and `makoctl` for the notification scenario. The script checks for them and is not part of the pinned toolchain.
+
 ## Commits and pull requests
 
 Commit format, history rules and PR expectations are in [AGENTS.md](AGENTS.md); they apply to everyone, not only to agents. Pull request text is filled in from the PR template.

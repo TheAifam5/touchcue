@@ -61,6 +61,16 @@ run = [
 description = "Type-check the workspace for Windows MSVC"
 run = "cargo xwin check --workspace --target x86_64-pc-windows-msvc"
 
+[tasks."screenshots:build"]
+description = "Build the example that shows the screenshot scenarios"
+hide = true
+run = "cargo build -p touchcue-ui --example screenshots --locked"
+
+[tasks.screenshots]
+description = "Regenerate docs/public/screenshots in a nested Hyprland session"
+depends = ["screenshots:build"]
+run = "scripts/screenshots.sh"
+
 [tasks."docs:dev"]
 description = "Serve the documentation site locally"
 dir = "docs"
