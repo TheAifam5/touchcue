@@ -8,6 +8,8 @@ Shows who is waiting for your security key touch.
 
 ## What it does
 
+![touchcue popup: Touch your security key, Browser is waiting for fido2](docs/public/screenshots/default.png)
+
 touchcue is a daemon and CLI. When a hardware authenticator waits for a physical touch, it shows a popup that does not take focus, centred by default, on the monitors you choose, or a desktop notification. An optional modal mode dims the screen and blocks clicks until you touch the key or dismiss the prompt. The prompt names the program that asked for the touch, such as the browser or the tool that ran `git`, and the device, using templates you define with placeholders. Other programs, such as status bars, can follow requests over a JSON socket, D-Bus, or the socket protocol of yubikey-touch-detector. Hooks run your own commands on events, for example to play a sound when a request starts, or for as long as a request lasts, to show the prompt in rofi, fuzzel or a status bar.
 
 ## touchcue and yubikey-touch-detector

@@ -71,7 +71,9 @@ extend_skip = []
 `mode` is used when the desktop supports it, else `fallback`, else nothing is shown.
 
 - `popup` shows an overlay popup that takes no input focus. It uses Wayland layer-shell when `WAYLAND_DISPLAY` or `WAYLAND_SOCKET` is set and the compositor supports it, else X11 when `DISPLAY` is set, which includes XWayland.
-- `notification` sends a desktop notification over D-Bus.
+- `notification` sends a desktop notification over D-Bus; the notification server draws it, here mako:
+
+  ![A mako notification: Touch your security key, Browser is waiting for fido2](/screenshots/notification.png)
 - `both` shows the popup and a notification.
 - `none` shows nothing.
 - `command` is accepted, but skipped with a warning. To show prompts through programs such as rofi or fuzzel, use [hooks with `until`](./hooks#hooks-that-last-for-a-request); see [Launchers](./launchers).
@@ -88,9 +90,15 @@ extend_skip = []
 | `modal_dim` | 0.0 to 1.0 | 0.4 |
 | `modal_dismiss` | `true`, `false` | `true` |
 
+![A popup in the top-right corner of an output, with position = "top-right"](/screenshots/corner.png)
+
 `min_display_ms` is the shortest time a shown popup stays visible. `show_delay_ms` is how long a request must wait before its popup appears.
 
+![The default popup, centred: Touch your security key, Browser is waiting for fido2](/screenshots/default.png)
+
 Several popups on one output stack in the order the requests started: away from the screen edge, or vertically around the centre with `center`.
+
+![Two stacked popups, one from the browser and one from claude in a terminal](/screenshots/stacked.png)
 
 ### Outputs
 
@@ -98,6 +106,8 @@ Several popups on one output stack in the order the requests started: away from 
 
 - `"focused"` lets the Wayland compositor pick, usually the focused monitor. On X11 it is the monitor under the mouse pointer.
 - `"all"` shows a popup on every output.
+
+  ![The same popup centred on each of two outputs](/screenshots/all-outputs.png)
 - `"cursor"` uses the output under the mouse pointer. On Wayland this works only on Hyprland, through its IPC socket. Elsewhere, or when the query fails, touchcue logs a warning and falls back to `"focused"`. On X11 it is the same as `"focused"`.
 - A list such as `["DP-1", "HDMI-A-1"]` shows a popup on each listed output that exists. Wayland names come from the compositor (`hyprctl monitors`, `swaymsg -t get_outputs`), X11 names from RandR (`xrandr --listmonitors`). When none of them exists, touchcue logs a warning and falls back to `"focused"`. An empty list or an empty name is an error.
 
@@ -105,7 +115,11 @@ Several popups on one output stack in the order the requests started: away from 
 
 With `modal = true`, a popup that waits for a touch also blocks clicks: on each of its outputs, a full-screen layer behind the popup takes every click. The keyboard is never grabbed, so typing still goes to the focused window. The overlay is removed when no request on that output waits any more, and after 120 seconds at most, even when requests still wait; requests that start while it is shown do not extend it. After those 120 seconds, that output gets no new overlay for 30 seconds.
 
-- `modal_dim` is how dark the overlay is, up to `1.0` (black). `0.0` blocks clicks without dimming.
+![A modal popup over a dimmed output](/screenshots/modal-dim.png)
+
+- `modal_dim` is how dark the overlay is, up to `1.0` (black). `0.0` blocks clicks without dimming:
+
+  ![A modal popup with modal_dim = 0.0: the output is not dimmed](/screenshots/modal-nodim.png)
 - With `modal_dismiss = true`, a click or touch on the overlay hides the popups and overlays of the requests on it. Only the display is hidden: the request keeps waiting for a touch. The next request on that output gets a new overlay right away. Only the left, middle and right buttons dismiss; scrolling and side buttons do not.
 - With `modal_dismiss = false`, requests that follow each other can keep an output dimmed for longer than 120 seconds: the limit applies to each overlay, and a new request gets a new overlay once the previous one ended, or 30 seconds after it reached the limit. The keyboard keeps working throughout.
 
@@ -151,6 +165,12 @@ The default body names the requester and its application through [`requester.lab
 
 Templates use Jinja syntax with [placeholders](./placeholders#template-syntax). A template that fails while rendering is replaced by the next of: the matching rule's template, the `[templates]` template, the default above, and an empty text. A request that ended without a touch keeps its prompt briefly, with `(cancelled)` or `(timed out)` appended to the body.
 
+The title wraps to at most two lines and the body to at most six; longer text ends with an ellipsis:
+
+![A popup whose long title and body wrap and end with an ellipsis](/screenshots/long-text.png)
+
+![Three popups: a touched request, which keeps its text, a cancelled one and a timed-out one](/screenshots/outcomes.png)
+
 ## `[[rules]]`
 
 Rules change the prompt for matching requests. The first rule whose `match` entries all equal the request's placeholder values applies; later rules are ignored.
@@ -180,6 +200,8 @@ suppress = true
 | `suppress` | boolean | Shows nothing for matching requests. IPC still publishes them. Default `false`. |
 
 An `icon` path must name a PNG or SVG file. A `~/` path must stay in your home directory: an absolute rest, as in `~//etc`, or a `..` part is a configuration error. A value without `/`, such as `utilities-terminal`, is an icon name, looked up in the [icon theme](#icons) like application icons. Other relative paths are a configuration error. The icon is looked up each time a prompt is shown or changes, within 0.5 s, so an icon path may name a file created after the daemon starts. An icon name that was not found stays unfound until the daemon restarts or more than 512 names have been looked up, as described under [`[icons]`](#icons). When no file is found in time, the prompt shows the application's icon and the daemon logs a warning.
+
+![A popup with a rule's title and key icon below a popup with the application's icon](/screenshots/rule-icon.png)
 
 The icon shown is not proof of which program asked for a touch: any program running as your user can put lookalike icons in `~/.icons` or `~/.local/share/icons`, or install desktop entries that name another application's icon.
 
