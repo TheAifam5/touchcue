@@ -193,6 +193,7 @@ jobs:
             /CHANGELOG.md
             /touchcue.usage.kdl
             /man/touchcue.1
+            /packaging/systemd/touchcue.service
           sparse-checkout-cone-mode: false
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -201,7 +202,7 @@ jobs:
           path: dist
       - name: Stage the release assets
         run: |
-          cp touchcue.usage.kdl man/touchcue.1 dist/
+          cp touchcue.usage.kdl man/touchcue.1 packaging/systemd/touchcue.service dist/
           # A convenience for manual downloads; the signed packslip manifest
           # is the authority for the archives' digests.
           (cd dist && sha256sum touchcue-*.tar.gz touchcue-*.zip > SHA256SUMS && cat SHA256SUMS)
