@@ -48,9 +48,11 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN || secrets.GITHUB_TOKEN }}
 
   # Opens or updates the release PR. A PR opened with GITHUB_TOKEN does not
-  # trigger ci.yml, so RELEASE_PLZ_TOKEN is what lets its checks run.
+  # trigger ci.yml, so RELEASE_PLZ_TOKEN is what lets its checks run. It runs
+  # after release, so a release that release just tagged is not proposed again.
   release-pr:
     name: release-pr
+    needs: release
     environment: release
     if: ${{ github.repository_owner == 'theaifam5' }}
     runs-on: ubuntu-latest
