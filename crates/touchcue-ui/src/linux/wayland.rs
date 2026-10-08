@@ -81,6 +81,8 @@ pub(crate) enum PopupError {
     Pool(#[from] smithay_client_toolkit::shm::CreatePoolError),
     #[error("failed to register the Wayland socket")]
     Register(#[from] io::Error),
+    #[error("failed to read the Wayland outputs")]
+    Outputs(#[source] DispatchError),
 }
 
 /// One shown popup on one output.
@@ -196,6 +198,18 @@ pub(crate) fn connect() -> Result<(Connection, GlobalList, EventQueue<Popups>), 
     let conn = Connection::connect_to_env()?;
     let (globals, queue) = registry_queue_init(&conn)?;
     Ok((conn, globals, queue))
+}
+
+/// Connects and binds the popup globals, then waits one roundtrip so the
+/// first popup can be placed on an output by name.
+#[instrument(skip_all)]
+pub(crate) fn open(
+    placement: Placement,
+) -> Result<(Connection, Popups, EventQueue<Popups>), PopupError> {
+    let (conn, globals, mut queue) = connect()?;
+    let mut popups = Popups::new(&globals, &queue, placement)?;
+    queue.roundtrip(&mut popups).map_err(PopupError::Outputs)?;
+    Ok((conn, popups, queue))
 }
 
 /// Why the Wayland connection stopped working.

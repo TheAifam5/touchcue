@@ -7,7 +7,7 @@ use tracing::{debug, instrument, warn};
 use x11rb::protocol::Event;
 
 use super::placement::Placement;
-use super::wayland::{self, Popups, WaylandIo, WaylandIoError};
+use super::wayland::{self, PopupError, Popups, WaylandIo, WaylandIoError};
 use super::x11::{self, DisplayServer, X11Error, X11Popups};
 use crate::{INIT_TIMEOUT, Prompt};
 
@@ -166,7 +166,7 @@ impl PopupOutput {
 }
 
 async fn open_wayland(placement: Placement) -> Option<PopupOutput> {
-    let connected = match tokio::task::spawn_blocking(wayland::connect).await {
+    let connected = match tokio::task::spawn_blocking(move || wayland::open(placement)).await {
         Ok(connected) => connected,
         Err(err) => {
             warn!(
@@ -176,8 +176,7 @@ async fn open_wayland(placement: Placement) -> Option<PopupOutput> {
             return None;
         }
     };
-    let opened = connected.and_then(|(conn, globals, queue)| {
-        let popups = Popups::new(&globals, &queue, placement)?;
+    let opened = connected.and_then(|(conn, popups, queue)| {
         let io = WaylandIo::new(conn, queue)?;
         Ok(PopupOutput::Wayland {
             popups: Box::new(popups),
@@ -186,6 +185,13 @@ async fn open_wayland(placement: Placement) -> Option<PopupOutput> {
     });
     match opened {
         Ok(opened) => Some(opened),
+        Err(err @ PopupError::Outputs(_)) => {
+            warn!(
+                error = &err as &dyn std::error::Error,
+                "Wayland popups unavailable"
+            );
+            None
+        }
         Err(err) => {
             debug!(
                 error = &err as &dyn std::error::Error,
