@@ -100,7 +100,7 @@ Limits:
 | `device.vid`, `device.pid` | USB vendor and product id, four lowercase hex digits |
 | `device.vendor` | vendor name, for example `Yubico`; for an OpenPGP card, its manufacturer |
 
-`request.confidence` is `high` when one process holds the FIDO device open, `medium` when several do or when the client is chosen among the clients of gpg-agent for an OpenPGP request, and `low` otherwise.
+`request.confidence` is `high` when one process holds the FIDO device open, or when an OpenPGP request is the next OpenPGP card operation within 30 s after a confirmed pinentry PIN or confirmation dialog whose client is still connected to gpg-agent (see [GPG](./gpg#pin-dialog-attribution)); `medium` when several processes hold the FIDO device open or when the client is otherwise chosen among the clients of gpg-agent for an OpenPGP request; and `low` otherwise.
 
 `request.action` words `request.method` and `request.op` for the default body. Rules and hooks should compare `request.method`, `request.op` and `request.source`, whose values stay fixed; the wording of `request.action` may change.
 

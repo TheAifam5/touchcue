@@ -52,6 +52,36 @@ The daemon shows a reported operation only when the card's touch policy (UIF) fo
 
 gpg-agent does not say which client asked for an operation. touchcue looks at the processes connected to gpg-agent's sockets, other than gpg-agent, scdaemon and touchcue, and takes the newest `gpg`, `gpg2`, `gpgsm`, `ssh`, `scp`, `sftp`, `ssh-add` or `ssh-keygen`, else the newest other process, with `request.confidence` `medium`. This keeps a program that holds an idle connection, such as an editor, from taking the place of the tool that asks. It is still a guess: the ranking trusts the process name, `comm`, which any process of the same user can set, for example to `gpg`; with two tools connected at once, the newer one is named. The requester is then found from that client as described in [Placeholders](./placeholders#requester), and its name is a claim in the same way. An `auth` operation while a client is connected to gpg-agent's ssh socket has `request.source` `ssh`, else operations have `gpg`. The proxy of yubikey-touch-detector is attributed, with `low` confidence, only when no other client is connected.
 
+## PIN dialog attribution
+
+On Linux, touchcue can also run as gpg-agent's pinentry wrapper. Create a link:
+
+```sh
+ln -s "$(command -v touchcue)" ~/.local/bin/touchcue-pinentry
+```
+
+Add this line to `gpg-agent.conf` by hand, replacing `/home/USER` with your home directory:
+
+```text
+pinentry-program /home/USER/.local/bin/touchcue-pinentry
+```
+
+Reload gpg-agent:
+
+```sh
+gpgconf --reload gpg-agent
+```
+
+The wrapper runs `pinentry` from `PATH`. Set `TOUCHCUE_PINENTRY` in gpg-agent's environment to an absolute path to select another pinentry program. A program that resolves to touchcue itself is refused. The wrapper sets `TOUCHCUE_PINENTRY_ACTIVE=1` for the real pinentry and refuses to start when that variable is already set. `touchcue pinentry [ARGS]...` also runs the wrapper and passes its arguments through unparsed; `pinentry` must be the first argument.
+
+The wrapper copies stdin and stdout byte for byte, inherits pinentry's stderr, forwards SIGTERM, SIGINT, SIGHUP, SIGUSR1 and SIGUSR2, and exits with pinentry's status. It never answers Assuan commands itself. It makes itself non-dumpable; this protects only the wrapper, not gpg-agent or the real pinentry.
+
+On a copy of the stream, it reads only `OPTION owner=<pid>/<uid>`, the `GETPIN` and `CONFIRM` verbs, and the reply class `OK` or `ERR`. Descriptions, prompts, PINs and data lines are forwarded but never interpreted, retained by the observer or logged. A gpg-agent line longer than 1002 bytes including its terminator stops observation; forwarding continues. Reports contain only the owner pid and uid, a sequence number and the dialog outcome. Without a running daemon, the wrapper only forwards.
+
+The next OpenPGP card operation within 30 s after a confirmed PIN or confirmation dialog is attributed to that dialog's client with `request.confidence` `high` while the client is still connected to gpg-agent. A cancelled or failed dialog attributes nothing. Without such a dialog, for example with a cached PIN, the existing client ranking applies.
+
+To remove the wrapper, remove its `pinentry-program` line or restore your previous pinentry setting by hand, then reload gpg-agent. `touchcue gpg uninstall` changes only the scdaemon setting.
+
 ## scdaemon's socket
 
 gpg-agent talks to scdaemon over two paths: the pipe it started scdaemon with, and scdaemon's own socket `S.scdaemon` in the gpg socket directory (`gpgconf --list-dirs socketdir`). gpg-agent uses the socket when another client needs the card while the pipe is in use.
