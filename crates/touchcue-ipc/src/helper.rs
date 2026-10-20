@@ -1,6 +1,6 @@
 //! The helper socket, `<runtime_dir>/touchcue/helper.sock`, through which
-//! `touchcue scdaemon` and `touchcue askpass` report operations, and their
-//! translation into `OpenPGP` signals and ssh notices.
+//! `touchcue scdaemon`, `touchcue askpass` and `touchcue pinentry` report
+//! operations, and their translation into `OpenPGP` signals and notices.
 //!
 //! Each connection sends [`touchcue_core::helper`] lines and never gets a
 //! reply. An operation is open from its `start` line to its `end` line;
@@ -19,6 +19,11 @@
 //! An askpass operation never becomes a request of its own: the FIDO
 //! source already detects the touch it announces. It becomes a [`Notice`]
 //! that lets the daemon add the operation's detail to that FIDO request.
+//!
+//! A pinentry dialog never becomes a request either. Its `owner` becomes a
+//! [`Notice::Owner`] when the owner's uid is the daemon's, and is dropped
+//! otherwise. Its `end` sends that owner's [`Notice::Owner`] again when the
+//! dialog ended `touched`, and a [`Notice::Disowned`] otherwise.
 
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -97,9 +102,9 @@ pub struct HelperConfig {
     pub keepalive: Duration,
 }
 
-/// An ssh user-presence notice reported by `touchcue askpass`.
+/// A notice for the daemon from `touchcue askpass` or `touchcue pinentry`.
 ///
-/// `pid` is the program that started askpass, ssh or ssh-agent.
+/// For askpass, `pid` is the program that started askpass, ssh or ssh-agent.
 #[derive(Clone, PartialEq, Eq)]
 pub enum Notice {
     /// `pid` waits for a touch for the operation `detail` describes.
@@ -108,6 +113,11 @@ pub enum Notice {
     Started { pid: u32, detail: String },
     /// The notice of `pid` ended.
     Ended { pid: u32 },
+    /// A pinentry dialog opened, or ended confirmed, for gpg-agent client
+    /// `pid` of this user, as named by gpg-agent's `OPTION owner`.
+    Owner { pid: u32 },
+    /// The pinentry dialog of owner `pid` ended without confirmation.
+    Disowned { pid: u32 },
 }
 
 impl fmt::Debug for Notice {
@@ -118,6 +128,8 @@ impl fmt::Debug for Notice {
                 .field("pid", pid)
                 .finish_non_exhaustive(),
             Self::Ended { pid } => f.debug_struct("Ended").field("pid", pid).finish(),
+            Self::Owner { pid } => f.debug_struct("Owner").field("pid", pid).finish(),
+            Self::Disowned { pid } => f.debug_struct("Disowned").field("pid", pid).finish(),
         }
     }
 }
@@ -175,7 +187,13 @@ impl Helper {
         let cancel = parent.child_token();
         let tracker = TaskTracker::new();
         let (reports, reports_rx) = mpsc::channel(REPORT_QUEUE);
-        let translator = Translator::new(cfg.agent, outputs, tracker.clone(), cancel.clone());
+        let translator = Translator::new(
+            cfg.agent,
+            outputs,
+            socket::euid(),
+            tracker.clone(),
+            cancel.clone(),
+        );
         let translator = tokio::spawn(
             translator
                 .run(reports_rx, cfg.keepalive)
@@ -461,46 +479,52 @@ impl Connection {
     /// Updates the open operations and reports whether `message` applies.
     fn track(&mut self, message: &Message) -> bool {
         match *message {
-            Message::Start { origin, seq, .. } => {
-                if self.open.contains(&(origin, seq)) {
-                    tracing::debug!(seq, "repeated start ignored");
-                    return false;
-                }
-                let now = Instant::now();
-                if now.saturating_duration_since(self.window) >= START_WINDOW {
-                    self.window = now;
-                    self.starts = 0;
-                }
-                if self.starts >= MAX_STARTS {
-                    warn_limited(&self.malformed, |suppressed| {
-                        tracing::warn!(
-                            limit = MAX_STARTS,
-                            suppressed,
-                            "reporter sends starts too fast, start dropped"
-                        );
-                    });
-                    return false;
-                }
-                self.starts = self.starts.saturating_add(1);
-                if self.open.len() >= MAX_OPEN_OPS {
-                    warn_limited(&self.malformed, |suppressed| {
-                        tracing::warn!(
-                            limit = MAX_OPEN_OPS,
-                            suppressed,
-                            "too many open operations, start dropped"
-                        );
-                    });
-                    return false;
-                }
-                self.open.push((origin, seq));
-                true
-            }
+            Message::Start { origin, seq, .. } => self.open_op(origin, seq),
+            Message::Owner { seq, .. } => self.open_op(Origin::Pinentry, seq),
             Message::End { origin, seq, .. } => {
                 let before = self.open.len();
                 self.open.retain(|&op| op != (origin, seq));
                 self.open.len() < before
             }
         }
+    }
+
+    /// Opens operation `seq` of `origin` unless it is open already, the
+    /// [`MAX_STARTS`] rate or the [`MAX_OPEN_OPS`] cap is reached; reports
+    /// whether it opened.
+    fn open_op(&mut self, origin: Origin, seq: u32) -> bool {
+        if self.open.contains(&(origin, seq)) {
+            tracing::debug!(seq, "repeated start ignored");
+            return false;
+        }
+        let now = Instant::now();
+        if now.saturating_duration_since(self.window) >= START_WINDOW {
+            self.window = now;
+            self.starts = 0;
+        }
+        if self.starts >= MAX_STARTS {
+            warn_limited(&self.malformed, |suppressed| {
+                tracing::warn!(
+                    limit = MAX_STARTS,
+                    suppressed,
+                    "reporter sends starts too fast, start dropped"
+                );
+            });
+            return false;
+        }
+        self.starts = self.starts.saturating_add(1);
+        if self.open.len() >= MAX_OPEN_OPS {
+            warn_limited(&self.malformed, |suppressed| {
+                tracing::warn!(
+                    limit = MAX_OPEN_OPS,
+                    suppressed,
+                    "too many open operations, start dropped"
+                );
+            });
+            return false;
+        }
+        self.open.push((origin, seq));
+        true
     }
 
     async fn forward(&self, message: Message, cancel: &CancellationToken) -> bool {
@@ -529,8 +553,10 @@ enum Opened {
     Signal(Signal),
     /// A notice for this pid.
     Notice(u32),
-    /// Nothing: its card slot needs no touch, or its askpass reporter has
-    /// no detail or no known parent.
+    /// A pinentry dialog for this owner pid of the daemon's user.
+    Owner(u32),
+    /// Nothing: its card slot needs no touch, its askpass reporter has no
+    /// detail or no known parent, or it is a pinentry dialog of another user.
     Nothing,
 }
 
@@ -552,6 +578,8 @@ struct Card {
 struct Translator {
     agent: Option<AgentPaths>,
     outputs: HelperOutputs,
+    /// Effective uid of the daemon; pinentry owners of another uid are dropped.
+    uid: u32,
     tracker: TaskTracker,
     cancel: CancellationToken,
     /// Keyed by connection, origin name and `seq`.
@@ -573,12 +601,14 @@ impl Translator {
     fn new(
         agent: Option<AgentPaths>,
         outputs: HelperOutputs,
+        uid: u32,
         tracker: TaskTracker,
         cancel: CancellationToken,
     ) -> Self {
         Self {
             agent,
             outputs,
+            uid,
             tracker,
             cancel,
             ops: BTreeMap::new(),
@@ -722,7 +752,7 @@ impl Translator {
                     kind: SignalKind::Progress,
                     ..signal.clone()
                 }),
-                Opened::Notice(_) | Opened::Nothing => None,
+                Opened::Notice(_) | Opened::Owner(_) | Opened::Nothing => None,
             })
             .collect();
         for signal in progress {
@@ -758,7 +788,7 @@ impl Translator {
                         let opened = self.scdaemon_start(op).await;
                         let sent = match &opened {
                             Opened::Signal(signal) => self.send(signal.clone()).await,
-                            Opened::Notice(_) | Opened::Nothing => true,
+                            Opened::Notice(_) | Opened::Owner(_) | Opened::Nothing => true,
                         };
                         (opened, sent)
                     }
@@ -766,11 +796,30 @@ impl Translator {
                         Some(notice @ Notice::Started { pid, .. }) => {
                             (Opened::Notice(pid), self.notify(notice).await)
                         }
-                        Some(Notice::Ended { .. }) | None => (Opened::Nothing, true),
+                        _ => (Opened::Nothing, true),
                     },
+                    // A pinentry `start` does not parse.
+                    Origin::Pinentry => (Opened::Nothing, true),
                 };
                 self.ops.insert(
                     (conn, origin.as_str(), seq),
+                    OpenOp {
+                        started: Instant::now(),
+                        opened,
+                    },
+                );
+                sent
+            }
+            Message::Owner { seq, pid, uid } => {
+                let (opened, sent) = if uid == self.uid {
+                    tracing::debug!(pid, "pinentry owner");
+                    (Opened::Owner(pid), self.notify(Notice::Owner { pid }).await)
+                } else {
+                    tracing::debug!(pid, "pinentry owner of another user dropped");
+                    (Opened::Nothing, true)
+                };
+                self.ops.insert(
+                    (conn, Origin::Pinentry.as_str(), seq),
                     OpenOp {
                         started: Instant::now(),
                         opened,
@@ -800,6 +849,10 @@ impl Translator {
                 .await
             }
             Opened::Notice(pid) => self.notify(Notice::Ended { pid }).await,
+            Opened::Owner(pid) if outcome == Outcome::Touched => {
+                self.notify(Notice::Owner { pid }).await
+            }
+            Opened::Owner(pid) => self.notify(Notice::Disowned { pid }).await,
             Opened::Nothing => true,
         }
     }
@@ -1155,6 +1208,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pinentry_owner_of_this_user_becomes_a_notice() -> TestResult {
+        let mut fx = Fixture::start(None, Duration::from_secs(60)).await?;
+        let mut client = fx.connect().await?;
+        let own = socket::euid();
+        let foreign = own ^ 1;
+        client
+            .write_all(format!("v1 owner pinentry 1 4242 {foreign}\n").as_bytes())
+            .await?;
+        client
+            .write_all(format!("v1 owner pinentry 2 4343 {own}\n").as_bytes())
+            .await?;
+        assert_eq!(fx.notice().await?, Notice::Owner { pid: 4343 });
+        client
+            .write_all(b"v1 end pinentry 1 cancelled\nv1 end pinentry 2 touched\n")
+            .await?;
+        assert_eq!(fx.notice().await?, Notice::Owner { pid: 4343 });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(fx.notices.try_recv(), Err(mpsc::error::TryRecvError::Empty));
+        assert_eq!(fx.rx.try_recv(), Err(mpsc::error::TryRecvError::Empty));
+        fx.helper.stop().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pinentry_end_refreshes_or_disowns_the_owner() {
+        for (outcome, notice) in [
+            (Outcome::Touched, Notice::Owner { pid: 4242 }),
+            (Outcome::Cancelled, Notice::Disowned { pid: 4242 }),
+            (Outcome::Failed, Notice::Disowned { pid: 4242 }),
+        ] {
+            let (signals, _signals_rx) = mpsc::channel(1);
+            let (notices, mut notices_rx) = mpsc::channel(1);
+            let mut translator = Translator::new(
+                None,
+                HelperOutputs { signals, notices },
+                1000,
+                TaskTracker::new(),
+                CancellationToken::new(),
+            );
+            let owner = Report {
+                conn: 1,
+                pid: None,
+                message: Message::Owner {
+                    seq: 3,
+                    pid: 4242,
+                    uid: 1000,
+                },
+            };
+            assert!(translator.report(owner).await);
+            assert_eq!(notices_rx.try_recv(), Ok(Notice::Owner { pid: 4242 }));
+            assert_eq!(translator.ops.len(), 1);
+            let end = Report {
+                conn: 1,
+                pid: None,
+                message: Message::End {
+                    origin: Origin::Pinentry,
+                    seq: 3,
+                    outcome,
+                },
+            };
+            assert!(translator.report(end).await);
+            assert!(translator.ops.is_empty());
+            assert_eq!(notices_rx.try_recv(), Ok(notice));
+        }
+    }
+
+    #[tokio::test]
     async fn open_operation_of_a_closed_connection_fails() -> TestResult {
         let mut fx = Fixture::start(None, Duration::from_secs(60)).await?;
         let mut first = fx.connect().await?;
@@ -1267,6 +1387,7 @@ mod tests {
                 homedir: PathBuf::from("/nonexistent"),
             }),
             HelperOutputs { signals, notices },
+            socket::euid(),
             TaskTracker::new(),
             CancellationToken::new(),
         );
