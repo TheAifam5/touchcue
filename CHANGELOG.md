@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0](https://github.com/TheAifam5/touchcue/compare/v0.3.0...v0.4.0) - 2026-10-20
+
+### Added
+
+- *(core)* localise the built-in prompt text
+- honor NO_COLOR
+- attribute gpg card operations through a pinentry wrapper
+- animate the popup state and show the touched outcome
+- *(core)* add pinentry owner messages to the helper protocol
+- *(core)* add popup.animations setting
+- *(ui)* render popup stacks offscreen for the docs
+- *(ui)* show request state over the popup icon
+- *(ipc)* forward pinentry owners from the helper socket
+- *(ipc)* read numeric and boolean portal settings
+
 ## [0.3.0](https://github.com/TheAifam5/touchcue/compare/v0.2.1...v0.3.0) - 2026-10-20
 
 ### Added
