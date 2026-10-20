@@ -29,7 +29,7 @@ use touchcue_ui::{Command, Prompt, Ui, UiConfig, UiError};
 
 use crate::check::backend_name;
 use crate::daemon::{Attribute, Daemon, Sink, SystemAttribution};
-use crate::icons;
+use crate::{icons, motion};
 
 /// sysfs mount point.
 pub const SYS_ROOT: &str = "/sys";
@@ -45,8 +45,7 @@ const HELPER_STOP_TIMEOUT: Duration = Duration::from_secs(3);
 const DEVICE_TEXT_MAX: usize = 128;
 /// Shortest interval between two logged UI send failures.
 const UI_WARN_INTERVAL: Duration = Duration::from_secs(10);
-/// Interval at which IPC clients receive the full set of active requests, so
-/// that a dropped event cannot leave them with stale state.
+/// Interval between full active-request snapshots sent to IPC clients.
 const RESYNC_INTERVAL: Duration = Duration::from_secs(5);
 /// Longest wait for queued and running hook commands at shutdown before
 /// they are ended.
@@ -156,17 +155,32 @@ fn now() -> Instant {
 }
 
 /// Returns the resolver of application and rule icons in the detected icon
-/// theme, or `None` when a stop signal arrives first.
-async fn resolver(config: &Config, signals: &mut StopSignals) -> Option<Resolver> {
+/// theme and whether the desktop asks for reduced motion, read only while
+/// `popup.animations` is on; `None` when a stop signal arrives first.
+#[tracing::instrument(skip_all)]
+async fn desktop(config: &Config, signals: &mut StopSignals) -> Option<(Resolver, bool)> {
     let resolver = Resolver::system().with_skip(config.requester.skip_list());
     let lookup = resolver.icons().clone();
+    let reduced_motion = async {
+        if config.popup.animations {
+            motion::detect().await
+        } else {
+            false
+        }
+    };
+    let detected = async {
+        tokio::join!(
+            icons::detect_system(config.icons.theme.as_deref(), lookup),
+            reduced_motion
+        )
+    };
     tokio::select! {
         name = signals.recv() => {
             tracing::info!(signal = name, "stopping during startup");
             None
         }
-        (_, icons) = icons::detect_system(config.icons.theme.as_deref(), lookup) => {
-            Some(resolver.with_icons(icons))
+        ((_, icons), reduced_motion) = detected => {
+            Some((resolver.with_icons(icons), reduced_motion))
         }
     }
 }
@@ -192,7 +206,7 @@ async fn resolver(config: &Config, signals: &mut StopSignals) -> Option<Resolver
 pub async fn run(config: Config) -> Result<(), Error> {
     let mut signals = StopSignals::register()?;
     let root = CancellationToken::new();
-    let Some(resolver) = resolver(&config, &mut signals).await else {
+    let Some((resolver, reduced_motion)) = desktop(&config, &mut signals).await else {
         return Ok(());
     };
     let fido = &config.sources.fido;
@@ -206,6 +220,7 @@ pub async fn run(config: Config) -> Result<(), Error> {
             output: config.output.clone(),
             popup: config.popup.clone(),
             notification: config.notification.clone(),
+            reduced_motion,
         },
         root.child_token(),
     );
@@ -266,8 +281,7 @@ pub async fn run(config: Config) -> Result<(), Error> {
         }
         started = spawn_helper(&config, helper_outputs, &root) => started,
     };
-    // Held while no detector runs so that the channel stays open; otherwise
-    // the channel closes once every running detector has stopped.
+    // Retains a sender while no detector runs. The channel closes after all remaining senders drop.
     let idle_tx = (watcher.is_none() && helper.is_none()).then_some(tx);
     tracing::info!(
         backend,
@@ -402,8 +416,7 @@ async fn finish(
     first.map_or(Ok(()), Err)
 }
 
-/// Stores `error` in `first` if it is empty, else logs it, so that every
-/// error is reported exactly once.
+/// Stores the first error and logs each later error.
 fn keep_first(first: &mut Option<Error>, error: Error) {
     if first.is_some() {
         tracing::error!(

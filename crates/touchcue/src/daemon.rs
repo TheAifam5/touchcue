@@ -10,7 +10,7 @@ use touchcue_appinfo::linux::Resolver;
 use touchcue_core::placeholders::{self, AppInfo, Confidence, ProcessInfo, Requester};
 use touchcue_core::text::sanitize;
 use touchcue_core::{
-    Config, DeviceKind, Event, Machine, RateLimit, Rendered, Request, RequestId, Signal,
+    Config, DeviceKind, EndReason, Event, Machine, RateLimit, Rendered, Request, RequestId, Signal,
 };
 use touchcue_ipc::agent::AgentPaths;
 use touchcue_ipc::helper::Notice;
@@ -665,7 +665,20 @@ impl<A: Attribute, S: Sink> Daemon<A, S> {
                 let cached = self.cache.remove(&request.id);
                 let attribution = cached.as_ref().map(|c| &c.attribution);
                 let values = values(&request, attribution, now);
-                if cached.is_some_and(|c| c.shown) {
+                if let Some(cached) = cached.filter(|c| c.shown) {
+                    if reason == EndReason::Touched {
+                        let (_, prompt) = render(
+                            &mut self.renderer,
+                            &request,
+                            &cached.attribution,
+                            now,
+                            &mut self.attribute,
+                        )
+                        .await;
+                        if let Some(prompt) = prompt {
+                            self.sink.ui(Command::Update(prompt)).await;
+                        }
+                    }
                     self.sink.ui(Command::Hide(request.id)).await;
                 }
                 self.sink
@@ -1441,6 +1454,7 @@ mod tests {
                 Out::Publish("updated", id, high.clone()),
                 Out::Update(id, RequestState::Waiting),
                 Out::Publish("updated", id, high.clone()),
+                Out::Update(id, RequestState::Lingering(EndReason::Touched)),
                 Out::Hide(id),
                 Out::Publish("ended", id, high),
             ]
@@ -1741,10 +1755,12 @@ mod tests {
             [
                 Out::Show(first, "Firefox is waiting for a GPG signature".to_owned()),
                 Out::Publish("started", first, high.clone()),
+                Out::Update(first, RequestState::Lingering(EndReason::Touched)),
                 Out::Hide(first),
                 Out::Publish("ended", first, high.clone()),
                 Out::Show(second, "Firefox is waiting for a GPG signature".to_owned()),
                 Out::Publish("started", second, high.clone()),
+                Out::Update(second, RequestState::Lingering(EndReason::Touched)),
                 Out::Hide(second),
                 Out::Publish("ended", second, high),
             ]

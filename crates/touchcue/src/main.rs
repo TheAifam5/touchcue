@@ -25,6 +25,8 @@ mod daemon;
 mod icons;
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(target_os = "linux")]
+mod motion;
 
 /// File name under which touchcue runs as OpenSSH's `SSH_ASKPASS` program.
 const ASKPASS_NAME: &str = "touchcue-askpass";
