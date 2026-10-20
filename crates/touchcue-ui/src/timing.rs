@@ -170,6 +170,7 @@ mod tests {
             body: body.to_owned(),
             icon: None,
             state: RequestState::Waiting,
+            language: touchcue_core::Language::English,
         }
     }
 

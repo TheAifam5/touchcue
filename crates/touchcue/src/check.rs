@@ -343,6 +343,7 @@ fn here_line(origin: Option<&Origin>) -> String {
     let label = touchcue_core::placeholders::requester_label(
         origin.requester.as_ref().and_then(|r| r.name.as_deref()),
         origin.app.as_ref().and_then(|a| a.name.as_deref()),
+        touchcue_core::Language::English,
     );
     match label {
         Some(label) => format!("{} → \"{label}\"", walk.join(" ← ")),

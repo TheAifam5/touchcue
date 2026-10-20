@@ -5,6 +5,7 @@ pub mod config;
 pub mod ctaphid;
 pub mod helper;
 pub mod limit;
+pub mod locale;
 pub mod machine;
 pub mod model;
 pub mod placeholders;
@@ -17,6 +18,7 @@ mod test_error;
 
 pub use config::{Config, ConfigError, Hook, HookEvent, Lifetime, OnChange, Rendered, StopSignal};
 pub use limit::RateLimit;
+pub use locale::Language;
 pub use machine::{EndReason, Event, Machine, MachineConfig, Request, RequestId, RequestState};
 pub use model::{
     Device, DeviceId, DeviceKind, Method, Op, Outcome, Signal, SignalClass, SignalKind, Source,

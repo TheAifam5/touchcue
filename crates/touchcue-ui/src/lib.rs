@@ -10,7 +10,7 @@ use std::time::Duration;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use touchcue_core::config::{Notification, Output, OutputMode, Popup};
-use touchcue_core::{RequestId, RequestState};
+use touchcue_core::{Language, RequestId, RequestState};
 use tracing::{debug, info, instrument, warn};
 
 #[cfg(target_os = "linux")]
@@ -46,6 +46,8 @@ pub struct Prompt {
     /// PNG or SVG file shown next to the text, or used as the notification icon.
     pub icon: Option<PathBuf>,
     pub state: RequestState,
+    /// Language of the outcome a notification appends to the body.
+    pub language: Language,
 }
 
 /// Instruction sent to the UI task.

@@ -706,6 +706,7 @@ mod tests {
         touchcue_core::placeholders::requester_label(
             origin.requester.as_ref().and_then(|r| r.name.as_deref()),
             origin.app.as_ref().and_then(|a| a.name.as_deref()),
+            touchcue_core::Language::English,
         )
     }
 

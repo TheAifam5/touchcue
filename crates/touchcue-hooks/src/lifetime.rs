@@ -26,7 +26,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use touchcue_core::text::{outcome_body, sanitize};
-use touchcue_core::{Hook, HookEvent, Lifetime, OnChange, RequestId, RequestState};
+use touchcue_core::{Hook, HookEvent, Language, Lifetime, OnChange, RequestId, RequestState};
 use tracing::Instrument as _;
 
 use crate::platform::{self, Stdin};
@@ -83,6 +83,8 @@ pub struct PromptText<'a> {
     /// The body without the outcome, which [`outcome_body`] adds for `state`.
     pub body: &'a str,
     pub state: RequestState,
+    /// Language of the outcome [`outcome_body`] adds.
+    pub language: Language,
 }
 
 impl Payload {
@@ -95,8 +97,12 @@ impl Payload {
             id,
             shown: prompt.is_some(),
             title: prompt.and_then(|prompt| sanitize(prompt.title, VALUE_MAX)),
-            body: prompt
-                .and_then(|prompt| sanitize(&outcome_body(prompt.body, prompt.state), VALUE_MAX)),
+            body: prompt.and_then(|prompt| {
+                sanitize(
+                    &outcome_body(prompt.body, prompt.state, prompt.language),
+                    VALUE_MAX,
+                )
+            }),
             values: published_values(values),
         }
     }
@@ -883,6 +889,7 @@ mod tests {
         title: "t",
         body: "b",
         state: RequestState::Waiting,
+        language: Language::English,
     });
 
     fn show(sender: &HookSender, id: u64, values: &BTreeMap<String, String>) {
@@ -1008,6 +1015,7 @@ mod tests {
                 title: "Touch",
                 body: &body,
                 state: RequestState::Waiting,
+                language: Language::English,
             }),
         );
         let env_path = dir.path().join("out.env");
@@ -1631,6 +1639,7 @@ mod tests {
                 title: "t",
                 body: "b",
                 state: cancelled,
+                language: Language::English,
             }),
         );
     }

@@ -1748,6 +1748,7 @@ mod tests {
                 .to_owned(),
             icon: None,
             state,
+            language: touchcue_core::Language::English,
         }
     }
 

@@ -723,6 +723,7 @@ mod tests {
                 title: "t",
                 body: "b",
                 state: touchcue_core::RequestState::Waiting,
+                language: touchcue_core::Language::English,
             }),
         );
         assert_eq!(wait_for_lines(&plain_out, 1).await?, ["plain"]);

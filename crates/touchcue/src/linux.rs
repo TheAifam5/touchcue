@@ -616,6 +616,7 @@ impl Sink for Outputs {
             title: &prompt.title,
             body: &prompt.body,
             state: prompt.state,
+            language: prompt.language,
         });
         self.hooks.request(request.id, &hook_events, values, prompt);
     }

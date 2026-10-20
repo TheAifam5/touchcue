@@ -823,6 +823,7 @@ mod tests {
             body: body.to_owned(),
             icon: None,
             state,
+            language: touchcue_core::Language::English,
         }
     }
 

@@ -10,7 +10,8 @@ use touchcue_appinfo::linux::Resolver;
 use touchcue_core::placeholders::{self, AppInfo, Confidence, ProcessInfo, Requester};
 use touchcue_core::text::sanitize;
 use touchcue_core::{
-    Config, DeviceKind, EndReason, Event, Machine, RateLimit, Rendered, Request, RequestId, Signal,
+    Config, DeviceKind, EndReason, Event, Language, Machine, RateLimit, Rendered, Request,
+    RequestId, Signal,
 };
 use touchcue_ipc::agent::AgentPaths;
 use touchcue_ipc::helper::Notice;
@@ -761,7 +762,7 @@ impl<A: Attribute, S: Sink> Daemon<A, S> {
             Event::Ended { request, reason } => {
                 let cached = self.cache.remove(&request.id);
                 let attribution = cached.as_ref().map(|c| &c.attribution);
-                let values = values(&request, attribution, now);
+                let values = values(&request, attribution, self.renderer.config.language, now);
                 if let Some(cached) = cached.filter(|c| c.shown) {
                     if reason == EndReason::Touched {
                         let (_, prompt) = render(
@@ -833,6 +834,7 @@ impl<A: Attribute, S: Sink> Daemon<A, S> {
 fn values(
     request: &Request,
     attribution: Option<&Attribution>,
+    language: Language,
     now: Instant,
 ) -> BTreeMap<String, String> {
     placeholders::values(
@@ -842,6 +844,7 @@ fn values(
         attribution.and_then(|a| a.requester.as_ref()),
         attribution.and_then(|a| a.chain.as_deref()),
         attribution.map_or(Confidence::Low, |a| a.confidence),
+        language,
         now,
     )
 }
@@ -985,7 +988,8 @@ pub async fn render(
     now: Instant,
     icons: &mut impl Attribute,
 ) -> (BTreeMap<String, String>, Option<Prompt>) {
-    let values = values(request, Some(attribution), now);
+    let language = renderer.config.language;
+    let values = values(request, Some(attribution), language, now);
     let Some(text) = renderer.rendered(&values, now).await else {
         tracing::debug!(suppressed = true, "rendered prompt");
         return (values, None);
@@ -1002,6 +1006,7 @@ pub async fn render(
             .or_else(|| attribution.app.as_ref().and_then(|app| app.icon.clone()))
             .map(PathBuf::from),
         state: request.state,
+        language,
     };
     tracing::debug!(suppressed = false, "rendered prompt");
     (values, Some(prompt))

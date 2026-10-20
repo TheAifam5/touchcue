@@ -92,10 +92,17 @@ fn main() -> Result<ExitCode> {
         }
         #[cfg(target_os = "linux")]
         Command::Run => {
-            let config = match config::load(config_path.as_ref()) {
+            let mut config = match config::load(config_path.as_ref()) {
                 Ok(loaded) => loaded.config,
                 Err(error) => return report_config_error(error),
             };
+            let locale = ["LC_ALL", "LC_MESSAGES", "LANG"].map(env::var_os);
+            config.language = touchcue_core::Language::detect(
+                config.locale.as_deref(),
+                locale
+                    .each_ref()
+                    .map(|value| value.as_deref().and_then(std::ffi::OsStr::to_str)),
+            );
             let runtime = runtime()?;
             let result = runtime.block_on(linux::run(config));
             runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);

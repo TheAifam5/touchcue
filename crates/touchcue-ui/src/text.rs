@@ -25,10 +25,10 @@ pub(crate) fn sanitize_command(cmd: Command) -> Command {
 }
 
 /// Returns the notification body, with the outcome of a cancelled, failed
-/// or timed-out request appended; see [`outcome_body`]. Popups show the
-/// outcome in the icon overlay instead.
+/// or timed-out request appended in the prompt's language; see
+/// [`outcome_body`]. Popups show the outcome in the icon overlay instead.
 pub(crate) fn display_body(prompt: &Prompt) -> String {
-    outcome_body(&prompt.body, prompt.state)
+    outcome_body(&prompt.body, prompt.state, prompt.language)
 }
 
 /// Escapes `&`, `<` and `>` for a notification server that parses body markup.
@@ -112,6 +112,7 @@ mod tests {
             body: body.to_owned(),
             icon: None,
             state,
+            language: touchcue_core::Language::English,
         }
     }
 
@@ -131,6 +132,13 @@ mod tests {
         assert_eq!(display_body(&failed), "ssh waits (cancelled)");
         let timed_out = prompt("", RequestState::Lingering(EndReason::TimedOut));
         assert_eq!(display_body(&timed_out), "(timed out)");
+    }
+
+    #[test]
+    fn body_shows_outcome_in_the_prompt_language() {
+        let mut cancelled = prompt("ssh", RequestState::Lingering(EndReason::Cancelled));
+        cancelled.language = touchcue_core::Language::German;
+        assert_eq!(display_body(&cancelled), "ssh (abgebrochen)");
     }
 
     #[test]

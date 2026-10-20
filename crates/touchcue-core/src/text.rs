@@ -3,6 +3,7 @@
 
 use std::ops::RangeInclusive;
 
+use crate::locale::Language;
 use crate::machine::{EndReason, RequestState};
 
 /// Invisible, bidirectional, format and separator characters, replaced so
@@ -46,12 +47,18 @@ pub fn sanitize(s: &str, max_chars: usize) -> Option<String> {
 
 /// Returns `body` as a prompt shows it for a request in `state`: with
 /// `(cancelled)` appended while a cancelled or failed request lingers, and
-/// `(timed out)` while a timed-out one lingers.
+/// `(timed out)` while a timed-out one lingers, both in `language`.
 #[must_use]
-pub fn outcome_body(body: &str, state: RequestState) -> String {
+pub fn outcome_body(body: &str, state: RequestState, language: Language) -> String {
     let suffix = match state {
-        RequestState::Lingering(EndReason::Cancelled | EndReason::Failed) => "(cancelled)",
-        RequestState::Lingering(EndReason::TimedOut) => "(timed out)",
+        RequestState::Lingering(EndReason::Cancelled | EndReason::Failed) => {
+            language.pick(["(cancelled)", "(anulowano)", "(abgebrochen)"])
+        }
+        RequestState::Lingering(EndReason::TimedOut) => language.pick([
+            "(timed out)",
+            "(upłynął limit czasu)",
+            "(Zeitüberschreitung)",
+        ]),
         RequestState::Waiting | RequestState::Lingering(EndReason::Touched) => {
             return body.to_owned();
         }
@@ -70,6 +77,7 @@ mod tests {
     #[test]
     fn body_shows_the_outcome_while_lingering() {
         let lingering = RequestState::Lingering;
+        let outcome_body = |body: &str, state| outcome_body(body, state, Language::English);
         assert_eq!(
             outcome_body("ssh waits", RequestState::Waiting),
             "ssh waits"
@@ -90,6 +98,41 @@ mod tests {
             outcome_body("", lingering(EndReason::TimedOut)),
             "(timed out)"
         );
+    }
+
+    #[test]
+    fn outcome_is_worded_in_the_language() {
+        let lingering = RequestState::Lingering;
+        let cases = [
+            (
+                Language::Polish,
+                "ssh (anulowano)",
+                "ssh (upłynął limit czasu)",
+            ),
+            (
+                Language::German,
+                "ssh (abgebrochen)",
+                "ssh (Zeitüberschreitung)",
+            ),
+        ];
+        for (language, cancelled, timed_out) in cases {
+            assert_eq!(
+                outcome_body("ssh", lingering(EndReason::Cancelled), language),
+                cancelled
+            );
+            assert_eq!(
+                outcome_body("ssh", lingering(EndReason::Failed), language),
+                cancelled
+            );
+            assert_eq!(
+                outcome_body("ssh", lingering(EndReason::TimedOut), language),
+                timed_out
+            );
+            assert_eq!(
+                outcome_body("ssh", lingering(EndReason::Touched), language),
+                "ssh"
+            );
+        }
     }
 
     #[test]

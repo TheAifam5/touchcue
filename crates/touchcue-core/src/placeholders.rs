@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Instant;
 
+use crate::locale::Language;
 use crate::machine::Request;
 use crate::model::{Device, Method, Op, Source};
 use crate::text::sanitize;
@@ -138,12 +139,17 @@ const DETAIL_MAX: usize = 200;
 ///
 /// Absent values are omitted. `chain` is the value of `process.chain`, and
 /// `requester.label` is composed from `requester.name` and `app.name`.
+/// `request.action` is worded in `language`.
 /// `request.detail` is sanitized and capped at
 /// 200 chars. `device.vid` and `device.pid` are four-digit
 /// lowercase hex, `request.elapsed` is whole seconds since the request
 /// started, or 0 when `now` is earlier, and `request.state` is
 /// [`RequestState::as_str`](crate::machine::RequestState::as_str).
 #[must_use]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument is an independent input of the values"
+)]
 pub fn values(
     request: &Request,
     app: Option<&AppInfo>,
@@ -151,6 +157,7 @@ pub fn values(
     requester: Option<&Requester>,
     chain: Option<&str>,
     confidence: Confidence,
+    language: Language,
     now: Instant,
 ) -> BTreeMap<String, String> {
     let mut out = device_values(&request.device);
@@ -194,6 +201,7 @@ pub fn values(
         requester_label(
             requester.and_then(|r| r.name.as_deref()),
             app.and_then(|a| a.name.as_deref()),
+            language,
         ),
     );
 
@@ -201,7 +209,7 @@ pub fn values(
     put("request.op", request.op.map(|op| op.as_str().to_owned()));
     put(
         "request.action",
-        Some(action(request.method, request.op, request.source).to_owned()),
+        Some(action(request.method, request.op, request.source, language).to_owned()),
     );
     put("request.source", Some(request.source.as_str().to_owned()));
     put("request.class", Some(request.class.as_str().to_owned()));
@@ -220,46 +228,86 @@ pub fn values(
     out
 }
 
-/// Returns `request.action`: what the request waits for, worded for people,
-/// such as `a passkey sign-in` or `a GPG signature`.
+/// Returns `request.action`: what the request waits for, worded for people
+/// in `language`, such as `a passkey sign-in` or `a GPG signature`. The
+/// Polish and German wordings are the objects of `czeka na` and `wartet auf`.
 ///
 /// A request from gpg-agent's ssh socket reads `an SSH login` whatever its
 /// method; an operation without its own wording reads as its method's.
 #[must_use]
-pub fn action(method: Method, op: Option<Op>, source: Source) -> &'static str {
+pub fn action(method: Method, op: Option<Op>, source: Source, language: Language) -> &'static str {
+    const SSH_LOGIN: [&str; 3] = ["an SSH login", "logowanie przez SSH", "eine SSH-Anmeldung"];
     if source == Source::Ssh {
-        return "an SSH login";
+        return language.pick(SSH_LOGIN);
     }
-    match (method, op) {
-        (Method::Fido2 | Method::U2f, Some(Op::Assert)) => "a passkey sign-in",
-        (Method::Fido2 | Method::U2f, Some(Op::Register)) => "a new passkey",
-        (Method::Fido2 | Method::U2f, _) => "a passkey",
-        (Method::OpenPgp, Some(Op::Sign)) => "a GPG signature",
-        (Method::OpenPgp, Some(Op::Decrypt)) => "GPG decryption",
-        (Method::OpenPgp, Some(Op::Auth)) => "GPG authentication",
-        (Method::OpenPgp, _) => "a GPG operation",
-        (Method::Ssh, _) => "an SSH login",
-        (Method::Piv, _) => "a smart card (PIV) operation",
-        (Method::Oath, _) => "a one-time code",
-        (Method::Hmac, _) => "a challenge-response",
-        (Method::Fingerprint, _) => "a fingerprint",
-        (Method::Wallet, _) => "a wallet confirmation",
-    }
+    language.pick(match (method, op) {
+        (Method::Fido2 | Method::U2f, Some(Op::Assert)) => [
+            "a passkey sign-in",
+            "logowanie kluczem dostępu",
+            "eine Anmeldung per Passkey",
+        ],
+        (Method::Fido2 | Method::U2f, Some(Op::Register)) => [
+            "a new passkey",
+            "utworzenie klucza dostępu",
+            "das Anlegen eines Passkeys",
+        ],
+        (Method::Fido2 | Method::U2f, _) => [
+            "a passkey",
+            "potwierdzenie kluczem dostępu",
+            "eine Bestätigung per Passkey",
+        ],
+        (Method::OpenPgp, Some(Op::Sign)) => {
+            ["a GPG signature", "podpis GPG", "das Signieren mit GPG"]
+        }
+        (Method::OpenPgp, Some(Op::Decrypt)) => [
+            "GPG decryption",
+            "odszyfrowanie GPG",
+            "das Entschlüsseln mit GPG",
+        ],
+        (Method::OpenPgp, Some(Op::Auth)) => [
+            "GPG authentication",
+            "uwierzytelnienie GPG",
+            "die Authentifizierung mit GPG",
+        ],
+        (Method::OpenPgp, _) => ["a GPG operation", "operację GPG", "einen GPG-Vorgang"],
+        (Method::Ssh, _) => SSH_LOGIN,
+        (Method::Piv, _) => [
+            "a smart card (PIV) operation",
+            "operację na karcie inteligentnej (PIV)",
+            "einen Smartcard-Vorgang (PIV)",
+        ],
+        (Method::Oath, _) => ["a one-time code", "kod jednorazowy", "einen Einmalcode"],
+        (Method::Hmac, _) => [
+            "a challenge-response",
+            "uwierzytelnienie typu challenge-response",
+            "eine Challenge-Response-Abfrage",
+        ],
+        (Method::Fingerprint, _) => ["a fingerprint", "odcisk palca", "einen Fingerabdruck"],
+        (Method::Wallet, _) => [
+            "a wallet confirmation",
+            "potwierdzenie w portfelu",
+            "eine Bestätigung in der Wallet",
+        ],
+    })
 }
 
 /// Longest `requester.label`, in chars: two 128-char names and ` in `.
 const LABEL_MAX: usize = 260;
 
-/// Returns `requester.label`: `<requester> in <app>` when both names are
-/// present and differ other than in ASCII case, else whichever is present,
-/// preferring the application's; capped at 260 chars.
+/// Returns `requester.label`: `<requester> in <app>` (Polish `w`) when both
+/// names are present and differ other than in ASCII case, else whichever is
+/// present, preferring the application's; capped at 260 chars.
 #[must_use]
-pub fn requester_label(requester: Option<&str>, app: Option<&str>) -> Option<String> {
+pub fn requester_label(
+    requester: Option<&str>,
+    app: Option<&str>,
+    language: Language,
+) -> Option<String> {
     let requester = requester.filter(|name| !name.is_empty());
     let app = app.filter(|name| !name.is_empty());
     let label = match (requester, app) {
         (Some(requester), Some(app)) if !requester.eq_ignore_ascii_case(app) => {
-            format!("{requester} in {app}")
+            format!("{requester} {} {app}", language.pick(["in", "w", "in"]))
         }
         (_, Some(name)) | (Some(name), None) => name.to_owned(),
         (None, None) => return None,
@@ -338,6 +386,7 @@ mod tests {
             None,
             None,
             Confidence::Low,
+            Language::English,
             base + Duration::from_millis(2999),
         );
         assert_eq!(get(&v, "device.vid"), Some("1050"));
@@ -385,6 +434,7 @@ mod tests {
             None,
             None,
             Confidence::High,
+            Language::English,
             base,
         );
         assert_eq!(get(&v, "app.name"), Some("Firefox"));
@@ -414,6 +464,7 @@ mod tests {
             Some(&requester),
             Some(chain),
             Confidence::Medium,
+            Language::English,
             base,
         );
         assert_eq!(get(&v, "requester.name"), Some("claude"));
@@ -430,6 +481,14 @@ mod tests {
             identity,
             ["process.chain", "requester.label", "requester.name"]
         );
+    }
+
+    #[test]
+    fn label_joins_names_in_the_language() {
+        let label = |language| requester_label(Some("claude"), Some("Kitty"), language);
+        assert_eq!(label(Language::English).as_deref(), Some("claude in Kitty"));
+        assert_eq!(label(Language::Polish).as_deref(), Some("claude w Kitty"));
+        assert_eq!(label(Language::German).as_deref(), Some("claude in Kitty"));
     }
 
     #[test]
@@ -452,6 +511,7 @@ mod tests {
                 requester,
                 None,
                 Confidence::High,
+                Language::English,
                 base,
             );
             v.get("requester.label").cloned()
@@ -496,6 +556,7 @@ mod tests {
             None,
             None,
             Confidence::High,
+            Language::English,
             now,
         );
         assert_eq!(get(&v, "request.elapsed"), Some("0"));
@@ -512,7 +573,16 @@ mod tests {
             (RequestState::Lingering(EndReason::TimedOut), "timed_out"),
         ] {
             r.state = state;
-            let v = values(&r, None, None, None, None, Confidence::High, base);
+            let v = values(
+                &r,
+                None,
+                None,
+                None,
+                None,
+                Confidence::High,
+                Language::English,
+                base,
+            );
             assert_eq!(get(&v, "request.state"), Some(name));
         }
     }
@@ -567,10 +637,41 @@ mod tests {
         ];
         for (method, op, source, expected) in cases {
             assert_eq!(
-                action(method, op, source),
+                action(method, op, source, Language::English),
                 expected,
                 "{method:?} {op:?} {source:?}"
             );
+        }
+    }
+
+    #[test]
+    fn action_is_worded_in_the_language() {
+        let cases = [
+            (
+                Method::Fido2,
+                None,
+                Source::Fido,
+                "potwierdzenie kluczem dostępu",
+                "eine Bestätigung per Passkey",
+            ),
+            (
+                Method::OpenPgp,
+                Some(Op::Sign),
+                Source::Gpg,
+                "podpis GPG",
+                "das Signieren mit GPG",
+            ),
+            (
+                Method::OpenPgp,
+                Some(Op::Auth),
+                Source::Ssh,
+                "logowanie przez SSH",
+                "eine SSH-Anmeldung",
+            ),
+        ];
+        for (method, op, source, polish, german) in cases {
+            assert_eq!(action(method, op, source, Language::Polish), polish);
+            assert_eq!(action(method, op, source, Language::German), german);
         }
     }
 }

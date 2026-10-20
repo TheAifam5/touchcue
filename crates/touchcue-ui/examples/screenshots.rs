@@ -505,6 +505,7 @@ mod linux {
             body: shot.body.to_owned(),
             icon: shot.icon.map(|name| -> PathBuf { assets.join(name) }),
             state,
+            language: touchcue_core::Language::English,
         }
     }
 

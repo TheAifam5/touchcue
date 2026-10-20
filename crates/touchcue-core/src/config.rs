@@ -11,6 +11,7 @@ use miette::SourceSpan;
 use serde::Deserialize;
 use toml::Spanned;
 
+use crate::locale::Language;
 use crate::placeholders::KNOWN;
 use crate::skip::{self, SkipList};
 use crate::template::{RenderError, Template, TemplateError};
@@ -20,6 +21,12 @@ const TITLE: &str = "templates.title";
 /// Field name of the body template, naming it in render errors.
 const BODY: &str = "templates.body";
 const DEFAULT_TITLE: &str = "Touch {{ device.vendor or \"your security key\" }}";
+/// Built-in title templates in English, Polish and German.
+const DEFAULT_TITLES: [&str; 3] = [
+    DEFAULT_TITLE,
+    "Dotknij klucza {{ device.vendor or \"bezpieczeństwa\" }}",
+    "Bitte {{ device.vendor ~ \"-Schlüssel\" if device.vendor else \"Sicherheitsschlüssel\" }} berühren",
+];
 /// Upper bound of every configured duration, in milliseconds.
 const MAX_MS: u64 = 600_000;
 /// Default of `hooks.timeout_ms`.
@@ -41,6 +48,12 @@ pub const LIFETIME_PROCESSES: usize = 8;
 /// Default of `hooks.restart_interval_ms`.
 const DEFAULT_RESTART_INTERVAL_MS: u64 = 200;
 const DEFAULT_BODY: &str = "{{ requester.label or process.name or \"An application\" }} is waiting for {{ request.action }}";
+/// Built-in body templates in English, Polish and German.
+const DEFAULT_BODIES: [&str; 3] = [
+    DEFAULT_BODY,
+    "{{ requester.label or process.name or \"Aplikacja\" }} czeka na {{ request.action }}",
+    "{{ requester.label or process.name or \"Eine Anwendung\" }} wartet auf {{ request.action }}",
+];
 
 /// Where touch prompts are shown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
@@ -741,9 +754,17 @@ pub struct Config {
     pub icons: Icons,
     /// `[[hooks]]` entries in configuration order.
     pub hooks: Vec<Hook>,
+    /// The top-level `locale` key, such as `pl` or `de_DE.UTF-8`.
+    pub locale: Option<String>,
+    /// Language of the built-in templates and of `request.action`; from
+    /// `locale`, else English, until the caller sets it with
+    /// [`Language::detect`].
+    pub language: Language,
     templates: Templates,
-    title: Template,
-    body: Template,
+    /// `[templates]` title; `None` uses the built-in title of `language`.
+    title: Option<Template>,
+    /// `[templates]` body; `None` uses the built-in body of `language`.
+    body: Option<Template>,
     rules: Vec<CompiledRule>,
 }
 
@@ -757,6 +778,7 @@ struct CompiledRule {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct RawConfig {
+    locale: Option<String>,
     output: Output,
     popup: Popup,
     notification: Notification,
@@ -839,9 +861,11 @@ impl Default for Config {
             requester: RequesterConfig::default(),
             icons: Icons::default(),
             hooks: Vec::new(),
+            locale: None,
+            language: Language::English,
             templates: Templates::default(),
-            title: defaults().title.clone(),
-            body: defaults().body.clone(),
+            title: None,
+            body: None,
             rules: Vec::new(),
         }
     }
@@ -898,13 +922,20 @@ impl Config {
         let icons = compile_icons(raw.icons)?;
 
         let (title_src, title) = match raw.templates.title {
-            Some(value) => compile(s, value, TITLE)?,
-            None => (DEFAULT_TITLE.to_owned(), defaults().title.clone()),
+            Some(value) => {
+                let (source, template) = compile(s, value, TITLE)?;
+                (source, Some(template))
+            }
+            None => (DEFAULT_TITLE.to_owned(), None),
         };
         let (body_src, body) = match raw.templates.body {
-            Some(value) => compile(s, value, BODY)?,
-            None => (DEFAULT_BODY.to_owned(), defaults().body.clone()),
+            Some(value) => {
+                let (source, template) = compile(s, value, BODY)?;
+                (source, Some(template))
+            }
+            None => (DEFAULT_BODY.to_owned(), None),
         };
+        let language = Language::detect(raw.locale.as_deref(), [None; 3]);
         let rules = raw
             .rules
             .into_iter()
@@ -929,6 +960,8 @@ impl Config {
             requester,
             icons,
             hooks,
+            locale: raw.locale,
+            language,
             templates: Templates {
                 title: title_src,
                 body: body_src,
@@ -966,8 +999,8 @@ impl Config {
     }
 
     /// Renders as [`Config::rendered`] with the built-in default title and
-    /// body in place of the configured templates; the matching rule still
-    /// sets the icon and suppresses output.
+    /// body of [`Config::language`] in place of the configured templates;
+    /// the matching rule still sets the icon and suppresses output.
     #[must_use]
     pub fn fallback(&self, values: &BTreeMap<String, String>) -> Option<Rendered> {
         self.render_with(values, true)
@@ -987,17 +1020,19 @@ impl Config {
             ),
             None => (None, None, None),
         };
-        let defaults = defaults();
+        let defaults = defaults(self.language);
         let (title, body) = if builtin {
             (vec![&defaults.title], vec![&defaults.body])
         } else {
             (
                 title
                     .into_iter()
-                    .chain([&self.title, &defaults.title])
+                    .chain(self.title.as_ref())
+                    .chain([&defaults.title])
                     .collect(),
                 body.into_iter()
-                    .chain([&self.body, &defaults.body])
+                    .chain(self.body.as_ref())
+                    .chain([&defaults.body])
                     .collect(),
             )
         };
@@ -1019,23 +1054,28 @@ struct Defaults {
     body: Template,
 }
 
-/// Returns the built-in templates.
+/// Returns the built-in templates of `language`.
 ///
 /// The built-in sources compile, as the tests check; were one not to, the
 /// template would have no compiled form and render as an empty string with
 /// a [`RenderError`].
-fn defaults() -> &'static Defaults {
-    static DEFAULTS: OnceLock<Defaults> = OnceLock::new();
-    DEFAULTS.get_or_init(|| {
+fn defaults(language: Language) -> &'static Defaults {
+    static DEFAULTS: OnceLock<[Defaults; 3]> = OnceLock::new();
+    let [english, polish, german] = DEFAULTS.get_or_init(|| {
         let builtin = |name: &str, source: &str| match Template::parse(name, source) {
             Ok(template) => template,
             Err(error) => Template::uncompiled(name, source, error),
         };
-        Defaults {
-            title: builtin(TITLE, DEFAULT_TITLE),
-            body: builtin(BODY, DEFAULT_BODY),
-        }
-    })
+        [Language::English, Language::Polish, Language::German].map(|language| Defaults {
+            title: builtin(TITLE, language.pick(DEFAULT_TITLES)),
+            body: builtin(BODY, language.pick(DEFAULT_BODIES)),
+        })
+    });
+    match language {
+        Language::English => english,
+        Language::Polish => polish,
+        Language::German => german,
+    }
 }
 
 /// Returns the output of the first template of `chain` that renders, or an
@@ -1500,6 +1540,105 @@ mod tests {
             body(&[]).as_deref(),
             Some("An application is waiting for a GPG signature")
         );
+    }
+
+    #[test]
+    fn locale_key_sets_the_language() -> TestResult {
+        assert_eq!(Config::from_toml("")?.language, Language::English);
+        let polish = Config::from_toml("locale = \"pl_PL.UTF-8\"")?;
+        assert_eq!(polish.locale.as_deref(), Some("pl_PL.UTF-8"));
+        assert_eq!(polish.language, Language::Polish);
+        assert_eq!(
+            Config::from_toml("locale = \"de\"")?.language,
+            Language::German
+        );
+        assert_eq!(
+            Config::from_toml("locale = \"\"")?.language,
+            Language::English
+        );
+        assert_eq!(
+            Config::from_toml("locale = \"fr\"")?.language,
+            Language::English
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn default_templates_render_in_each_language() -> TestResult {
+        use crate::model::{Method, Op, Source};
+        use crate::placeholders::action;
+
+        let cases = [
+            (
+                Language::English,
+                "Touch your security key",
+                "Touch Yubico",
+                "An application is waiting for a passkey",
+                "claude in Kitty is waiting for a GPG signature",
+            ),
+            (
+                Language::Polish,
+                "Dotknij klucza bezpieczeństwa",
+                "Dotknij klucza Yubico",
+                "Aplikacja czeka na potwierdzenie kluczem dostępu",
+                "claude in Kitty czeka na podpis GPG",
+            ),
+            (
+                Language::German,
+                "Bitte Sicherheitsschlüssel berühren",
+                "Bitte Yubico-Schlüssel berühren",
+                "Eine Anwendung wartet auf eine Bestätigung per Passkey",
+                "claude in Kitty wartet auf das Signieren mit GPG",
+            ),
+        ];
+        for (language, title, vendor_title, fido_body, gpg_body) in cases {
+            let cfg = Config {
+                language,
+                ..Config::default()
+            };
+            let fido = action(Method::Fido2, None, Source::Fido, language);
+            let rendered = cfg
+                .rendered(&values(&[("request.action", fido)]))
+                .ok_or("suppressed")?;
+            assert_eq!(rendered.title, title);
+            assert_eq!(rendered.body, fido_body);
+            assert_eq!(rendered.errors, []);
+            let gpg = action(Method::OpenPgp, Some(Op::Sign), Source::Gpg, language);
+            let rendered = cfg
+                .rendered(&values(&[
+                    ("device.vendor", "Yubico"),
+                    ("requester.label", "claude in Kitty"),
+                    ("request.action", gpg),
+                ]))
+                .ok_or("suppressed")?;
+            assert_eq!(rendered.title, vendor_title);
+            assert_eq!(rendered.body, gpg_body);
+            assert_eq!(rendered.errors, []);
+            assert_eq!(
+                cfg.fallback(&values(&[("request.action", fido)]))
+                    .ok_or("suppressed")?
+                    .body,
+                fido_body
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn configured_templates_are_not_translated() -> TestResult {
+        let cfg = Config::from_toml("locale = \"de\"\n[templates]\ntitle = \"Touch it\"")?;
+        let rendered = cfg
+            .rendered(&values(&[(
+                "request.action",
+                "eine Bestätigung per Passkey",
+            )]))
+            .ok_or("suppressed")?;
+        assert_eq!(rendered.title, "Touch it");
+        assert_eq!(
+            rendered.body,
+            "Eine Anwendung wartet auf eine Bestätigung per Passkey"
+        );
+        Ok(())
     }
 
     #[test]
