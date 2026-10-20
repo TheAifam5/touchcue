@@ -1,0 +1,11 @@
+[files]
+extend-exclude = ["docs/pl/**", "docs/de/**", "xtask/i18n/*.toml"]
+
+[default.extend-words]
+# Polish and German UI labels in docs/.vitepress/config.mts.
+Konfiguration = "Konfiguration"
+Referenz = "Referenz"
+Symbole = "Symbole"
+
+[default.extend-identifiers]
+Sie = "Sie"

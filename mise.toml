@@ -44,7 +44,7 @@ description = "Check dependency licenses, advisories, bans and sources"
 run = "cargo deny check"
 
 [tasks.render]
-description = "Generate the usage spec, completions, man page and CLI reference"
+description = "Generate the usage spec, completions, man page and the English, Polish and German CLI reference"
 run = [
   "cargo --locked xtask render",
   "mkdir -p completions man docs/reference/cli",
@@ -55,6 +55,9 @@ run = [
   "usage generate completion powershell touchcue -f touchcue.usage.kdl > completions/touchcue.ps1",
   "usage generate manpage -f touchcue.usage.kdl -o man/touchcue.1",
   "usage generate markdown -f touchcue.usage.kdl --multi --out-dir docs/reference/cli --url-prefix /reference/cli",
+  "usage generate markdown -f target/usage/touchcue.pl.usage.kdl --multi --out-dir docs/pl/reference/cli --url-prefix /pl/reference/cli",
+  "usage generate markdown -f target/usage/touchcue.de.usage.kdl --multi --out-dir docs/de/reference/cli --url-prefix /de/reference/cli",
+  "cargo --locked xtask translate-markdown",
 ]
 
 [tasks.xwin-check]

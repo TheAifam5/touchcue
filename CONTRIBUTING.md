@@ -30,7 +30,7 @@ mise run docs:build
 
 ## Generated files
 
-`touchcue.usage.kdl`, `completions/`, `man/` and `docs/reference/cli/` are generated from the usage-rs definitions in `crates/touchcue/src/cli.rs`. Do not edit them by hand; run `mise run render`.
+`touchcue.usage.kdl`, `completions/`, `man/` and `docs/{,pl/,de/}reference/cli/` are generated from the usage-rs definitions in `crates/touchcue/src/cli.rs`. Do not edit them by hand; run `mise run render`. The Polish and German CLI reference use the translations in `xtask/i18n/pl.toml` and `xtask/i18n/de.toml`; a changed CLI help text needs matching entries in both, or `mise run render` fails and lists the missing and stale strings.
 
 ## Documentation
 
@@ -61,6 +61,8 @@ mise run screenshots --dry-run          # print the plan; start nothing
 The task builds the `screenshots` example of `touchcue-ui` (`crates/touchcue-ui/examples/screenshots.rs`), which holds each scenario's configuration and prompts; `cargo run -p touchcue-ui --example screenshots -- --list` names them. `scripts/screenshots.sh` starts a nested Hyprland with its own Wayland socket and D-Bus session bus, captures still scenarios as PNG images and `anim-*` scenarios as animated GIFs, and stops its processes. Each nested output is a window on your desktop. On a Hyprland host, the script floats the nested windows and resizes them to 1280×720. Nothing else is drawn on your desktop. The script sets `HYPRLAND_NO_SD_VARS=1`; the nested compositor does not export its variables to the systemd user environment. It uses a private bus; compare `systemctl --user show-environment` before and after a run to check. Pass `--headless` to capture 1280×720 headless outputs instead, with no windows; this fails on drivers that cannot allocate buffers for headless outputs, such as NVIDIA. Working files go to `target/screenshots/` and are kept there when a run fails.
 
 Requirements: a running Wayland session, and Hyprland 0.56 (Lua configuration) with `hyprctl`, `dbus-run-session`, `grim`, `jq` and ImageMagick (`magick`) from your system packages; `mako` and `makoctl` for the notification scenario; `ffmpeg`, coreutils `timeout`, and a `date` supporting nanoseconds (`%N`) for GIF scenarios. GIF frame capture is bounded by `GIF_LIMIT` (30 seconds); encoding runs separately after capture. The script checks its prerequisites and is not part of the pinned toolchain.
+
+The animated hero image of the landing page, `docs/public/screenshots/hero.webp`, needs no display: after `cargo build -p touchcue-ui --example screenshots`, `scripts/hero.sh` renders its frames with the popup renderer into `target/hero` and encodes them as a looping WebP with alpha, using `ffmpeg` with the `libwebp_anim` encoder or ImageMagick with WebP support.
 
 ## Commits and pull requests
 

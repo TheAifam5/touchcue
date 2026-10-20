@@ -29,7 +29,7 @@ Tools are pinned in `mise.toml`. Run `mise install` once, then `hk install --mis
 - `mise run lint`: `hk check --all` (rustfmt, clippy with `-D warnings`, taplo, actionlint, typos, newlines, trailing whitespace, gitleaks).
 - `mise run fix`: `hk fix --all`.
 - `mise run deny`: `cargo deny check` (licenses, advisories, bans, sources).
-- `mise run render`: regenerate the usage spec, completions, man page and CLI reference.
+- `mise run render`: regenerate the usage spec, completions, man page and the English, Polish and German CLI reference.
 - `mise run xwin-check`: type-check the workspace for `x86_64-pc-windows-msvc`.
 - `mise run docs:dev`: serve the documentation site locally.
 - `mise run docs:build`: build the documentation site into `docs/.vitepress/dist`.
@@ -49,7 +49,7 @@ Cargo runs through mr-boxington (mbx) via mise. Set `MBX_DISABLE=1` to disable i
 - `touchcue-helper`: optional privileged helper for data the unprivileged daemon cannot read.
 - `xtask`: build tooling invoked as `cargo xtask`.
 - Platform-specific code lives behind `cfg` modules.
-- Never hand-edit generated files (`touchcue.usage.kdl`, `completions/`, `man/`, `docs/reference/cli/`). Change the usage-rs definitions in `crates/touchcue/src/cli.rs` and run `mise run render`.
+- Never hand-edit generated files (`touchcue.usage.kdl`, `completions/`, `man/`, `docs/reference/cli/`, `docs/pl/reference/cli/`, `docs/de/reference/cli/`). Change the usage-rs definitions in `crates/touchcue/src/cli.rs`, update the translations in `xtask/i18n/*.toml`, and run `mise run render`.
 
 ## Conventions
 

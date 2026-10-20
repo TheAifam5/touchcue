@@ -2,7 +2,14 @@ amends "package://github.com/jdx/hk/releases/download/v2.6.0/hk@2.6.0#/Config.pk
 import "package://github.com/jdx/hk/releases/download/v2.6.0/hk@2.6.0#/Builtins.pkl"
 
 // Output of `mise run render`; regenerate it instead of linting or fixing it.
-exclude = List("touchcue.usage.kdl", "completions", "man", "docs/reference/cli")
+exclude = List(
+  "touchcue.usage.kdl",
+  "completions",
+  "man",
+  "docs/reference/cli",
+  "docs/pl/reference/cli",
+  "docs/de/reference/cli",
+)
 
 steps {
   ["cargo_fmt"] = Builtins.cargo_fmt

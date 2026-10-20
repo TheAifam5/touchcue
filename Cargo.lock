@@ -1796,7 +1796,11 @@ name = "xtask"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "serde",
+ "tempfile",
+ "toml",
  "touchcue",
+ "tracing",
 ]
 
 [[package]]
