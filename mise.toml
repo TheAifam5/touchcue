@@ -9,7 +9,7 @@ idiomatic_version_file_enable_tools = ["rust"]
 rust = { version = "1.99.1", components = "clippy,rustfmt", targets = "x86_64-pc-windows-msvc", mr_boxington = true }
 mr-boxington = { version = "1.23.0", os = ["linux", "macos/arm64", "windows"] }
 hk = { version = "2.6.0", os = ["linux", "macos/arm64", "windows"] }
-usage = "6.12.0"
+usage = "7.1.0"
 cargo-deny = "0.20.2"
 "aqua:nextest-rs/nextest/cargo-nextest" = "0.9.148"
 "github:rust-cross/cargo-xwin" = "0.23.1"

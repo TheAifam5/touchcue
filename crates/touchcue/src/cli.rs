@@ -5,6 +5,7 @@ use std::path::PathBuf;
 /// Shows who is waiting for your security key touch
 #[derive(Debug, usage::Cli)]
 #[usage(
+    crate = usage,
     bin = "touchcue",
     version,
     unknown_flags = "error",
@@ -33,6 +34,7 @@ pub struct Cli {
 
 /// Subcommands of the `touchcue` binary.
 #[derive(Debug, Clone, PartialEq, Eq, usage::Subcommands)]
+#[usage(crate = usage)]
 pub enum Command {
     /// Run the daemon in the foreground
     Run,
@@ -54,6 +56,7 @@ pub enum Command {
 /// it at a link to touchcue named `touchcue-askpass`. `touchcue askpass`
 /// passes every argument after it through unparsed.
 #[derive(Debug, Clone, PartialEq, Eq, usage::Args)]
+#[usage(crate = usage)]
 pub struct Askpass {
     #[usage(
         arg,
@@ -66,6 +69,7 @@ pub struct Askpass {
 
 /// Set up touch detection for gpg and ssh through gpg-agent
 #[derive(Debug, Clone, Copy, PartialEq, Eq, usage::Args)]
+#[usage(crate = usage)]
 pub struct Gpg {
     #[usage(subcommand)]
     pub command: GpgCommand,
@@ -73,6 +77,7 @@ pub struct Gpg {
 
 /// Subcommands of `touchcue gpg`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, usage::Subcommands)]
+#[usage(crate = usage)]
 pub enum GpgCommand {
     /// Make gpg-agent run touchcue as its scdaemon
     Install,
@@ -82,6 +87,7 @@ pub enum GpgCommand {
 
 /// Stop gpg-agent from running touchcue as its scdaemon
 #[derive(Debug, Clone, Copy, PartialEq, Eq, usage::Args)]
+#[usage(crate = usage)]
 pub struct Uninstall {
     #[usage(
         long,
