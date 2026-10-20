@@ -1,8 +1,9 @@
 //! Line protocol between the daemon and its in-process-tree reporters.
 //!
 //! A reporter is a short-lived touchcue process started by another program:
-//! `touchcue scdaemon` (gpg-agent's `scdaemon-program`) or `touchcue askpass`
-//! (OpenSSH's `SSH_ASKPASS`). It sends one line per event over the daemon's
+//! `touchcue scdaemon` (gpg-agent's `scdaemon-program`), `touchcue askpass`
+//! (OpenSSH's `SSH_ASKPASS`) or `touchcue pinentry` (gpg-agent's
+//! `pinentry-program`). It sends one line per event over the daemon's
 //! helper socket. The daemon never replies.
 //!
 //! Wire format, one message per line, at most [`MAX_LINE`] bytes including
@@ -10,12 +11,15 @@
 //!
 //! ```text
 //! v1 start <origin> <seq> <op> [<detail>]
+//! v1 owner pinentry <seq> <pid> <uid>
 //! v1 end <origin> <seq> <outcome>
 //! ```
 //!
 //! `seq` is a `u32` chosen by the reporter and unique within its connection.
 //! `detail` is percent-encoded: every byte outside printable ASCII, plus `%`
-//! and space, is written as `%XX`.
+//! and space, is written as `%XX`. `owner` names the gpg-agent client that a
+//! pinentry dialog serves; only the `pinentry` origin sends it, and its `end`
+//! closes it.
 
 use thiserror::Error;
 
@@ -41,6 +45,8 @@ pub enum Origin {
     Scdaemon,
     /// `touchcue askpass`, started by OpenSSH for a user-presence notice.
     Askpass,
+    /// `touchcue pinentry`, started by gpg-agent for a PIN dialog.
+    Pinentry,
 }
 
 impl Origin {
@@ -50,6 +56,7 @@ impl Origin {
         match self {
             Self::Scdaemon => "scdaemon",
             Self::Askpass => "askpass",
+            Self::Pinentry => "pinentry",
         }
     }
 
@@ -57,6 +64,7 @@ impl Origin {
         match s {
             "scdaemon" => Some(Self::Scdaemon),
             "askpass" => Some(Self::Askpass),
+            "pinentry" => Some(Self::Pinentry),
             _ => None,
         }
     }
@@ -74,7 +82,11 @@ pub enum Message {
         /// destination. Callers sanitize it before display.
         detail: Option<String>,
     },
-    /// The operation with this `seq` finished.
+    /// A pinentry dialog for the gpg-agent client `pid` of user `uid`
+    /// opened. The values come from gpg-agent's `OPTION owner` and are the
+    /// client's peer credentials as gpg-agent saw them.
+    Owner { seq: u32, pid: u32, uid: u32 },
+    /// The operation or dialog with this `seq` finished.
     End {
         origin: Origin,
         seq: u32,
@@ -93,6 +105,8 @@ pub enum ParseError {
     Malformed,
     #[error("invalid sequence number")]
     Seq(#[source] std::num::ParseIntError),
+    #[error("invalid pid or uid")]
+    Number(#[source] std::num::ParseIntError),
     #[error("detail is not UTF-8")]
     Utf8(#[source] std::string::FromUtf8Error),
 }
@@ -118,6 +132,12 @@ impl Message {
                 }
                 line.push('\n');
                 line
+            }
+            Self::Owner { seq, pid, uid } => {
+                format!(
+                    "{VERSION} owner {} {seq} {pid} {uid}\n",
+                    Origin::Pinentry.as_str()
+                )
             }
             Self::End {
                 origin,
@@ -157,7 +177,7 @@ impl Message {
             .parse::<u32>()
             .map_err(ParseError::Seq)?;
         let message = match kind {
-            "start" => {
+            "start" if origin != Origin::Pinentry => {
                 let op = fields
                     .next()
                     .and_then(parse_op)
@@ -169,6 +189,18 @@ impl Message {
                     op,
                     detail,
                 }
+            }
+            "owner" if origin == Origin::Pinentry => {
+                let mut number = || {
+                    fields
+                        .next()
+                        .ok_or(ParseError::Malformed)?
+                        .parse::<u32>()
+                        .map_err(ParseError::Number)
+                };
+                let pid = number()?;
+                let uid = number()?;
+                Self::Owner { seq, pid, uid }
             }
             "end" => {
                 let outcome = fields
@@ -285,6 +317,16 @@ mod tests {
                 seq: 7,
                 outcome: Outcome::TimedOut,
             },
+            Message::Owner {
+                seq: 2,
+                pid: 4242,
+                uid: 1000,
+            },
+            Message::End {
+                origin: Origin::Pinentry,
+                seq: 2,
+                outcome: Outcome::Cancelled,
+            },
         ];
         for message in messages {
             let line = message.encode();
@@ -324,6 +366,8 @@ mod tests {
         assert!(matches!(parsed, Err(ParseError::Seq(_))), "{parsed:?}");
         let parsed = Message::parse("v1 start askpass 1 auth %FF");
         assert!(matches!(parsed, Err(ParseError::Utf8(_))), "{parsed:?}");
+        let parsed = Message::parse("v1 owner pinentry 1 -4 1000");
+        assert!(matches!(parsed, Err(ParseError::Number(_))), "{parsed:?}");
     }
 
     #[test]
@@ -339,6 +383,10 @@ mod tests {
             ("v1 end scdaemon 1 touched extra", ParseError::Malformed),
             ("v1 start askpass 1 auth %G0", ParseError::Malformed),
             ("v1 stop scdaemon 1 touched", ParseError::Malformed),
+            ("v1 owner scdaemon 1 4242 1000", ParseError::Malformed),
+            ("v1 owner pinentry 1 4242", ParseError::Malformed),
+            ("v1 owner pinentry 1 4242 1000 x", ParseError::Malformed),
+            ("v1 start pinentry 1 sign", ParseError::Malformed),
         ];
         for (line, expected) in cases {
             assert_eq!(Message::parse(line), Err(expected), "{line:?}");
