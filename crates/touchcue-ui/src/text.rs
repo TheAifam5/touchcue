@@ -24,8 +24,9 @@ pub(crate) fn sanitize_command(cmd: Command) -> Command {
     }
 }
 
-/// Returns the body as shown, with the outcome of a cancelled, failed or
-/// timed-out request appended; see [`outcome_body`].
+/// Returns the notification body, with the outcome of a cancelled, failed
+/// or timed-out request appended; see [`outcome_body`]. Popups show the
+/// outcome in the icon overlay instead.
 pub(crate) fn display_body(prompt: &Prompt) -> String {
     outcome_body(&prompt.body, prompt.state)
 }

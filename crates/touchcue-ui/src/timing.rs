@@ -3,9 +3,12 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use touchcue_core::RequestId;
+use touchcue_core::{EndReason, RequestId, RequestState};
 
 use crate::{Command, Prompt};
+
+/// Least time a touched prompt stays visible after its hide is requested.
+const OUTCOME_HOLD: Duration = Duration::from_millis(600);
 
 /// Change an output backend applies.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,12 +82,24 @@ impl Timing {
             }
             Command::Hide(id) => {
                 let min_display = self.min_display;
-                match self.entries.get_mut(&id).map(|entry| &mut entry.phase) {
-                    Some(Phase::Pending { .. }) => {
+                match self.entries.get_mut(&id) {
+                    Some(Entry {
+                        phase: Phase::Pending { .. },
+                        ..
+                    }) => {
                         self.entries.remove(&id);
                     }
-                    Some(Phase::Visible { since, hide_at }) => {
-                        *hide_at = Some(since.checked_add(min_display).unwrap_or(*since));
+                    Some(Entry {
+                        prompt,
+                        phase: Phase::Visible { since, hide_at },
+                    }) => {
+                        let shown = since.checked_add(min_display).unwrap_or(*since);
+                        let held = if prompt.state == RequestState::Lingering(EndReason::Touched) {
+                            now.checked_add(OUTCOME_HOLD).unwrap_or(now)
+                        } else {
+                            now
+                        };
+                        *hide_at = Some(shown.max(held));
                     }
                     None => {}
                 }
@@ -146,8 +161,6 @@ fn update(entry: &mut Entry, prompt: Prompt) -> Vec<Action> {
 
 #[cfg(test)]
 mod tests {
-    use touchcue_core::{EndReason, RequestState};
-
     use super::*;
 
     fn prompt(id: u64, body: &str) -> Prompt {
@@ -294,5 +307,24 @@ mod tests {
         assert_eq!(timing.tick(t0 + ms(100)), [Action::Show(prompt(1, "a"))]);
         assert_eq!(timing.next_deadline(), Some(t0 + ms(150)));
         assert_eq!(timing.tick(t0 + ms(150)), [Action::Show(prompt(2, "b"))]);
+    }
+
+    #[test]
+    fn touched_prompt_is_held_after_its_hide() {
+        let t0 = Instant::now();
+        let mut timing = Timing::new(ms(0), ms(100));
+        timing.command(Command::Show(prompt(1, "a")), t0);
+        let mut touched = prompt(1, "a");
+        touched.state = RequestState::Lingering(EndReason::Touched);
+        timing.command(Command::Update(touched), t0 + ms(1000));
+        assert_eq!(
+            timing.command(Command::Hide(RequestId(1)), t0 + ms(1000)),
+            []
+        );
+        assert_eq!(timing.next_deadline(), Some(t0 + ms(1000) + OUTCOME_HOLD));
+        assert_eq!(
+            timing.tick(t0 + ms(1000) + OUTCOME_HOLD),
+            [Action::Hide(RequestId(1))]
+        );
     }
 }

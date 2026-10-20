@@ -6,7 +6,9 @@ use std::io;
 use std::os::fd::{AsRawFd, RawFd};
 use std::time::{Duration, Instant};
 
-use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState, Region, SurfaceData};
+use smithay_client_toolkit::compositor::{
+    CompositorHandler, CompositorState, FrameCallbackData, Region, SurfaceData,
+};
 use smithay_client_toolkit::output::{OutputHandler, OutputState};
 use smithay_client_toolkit::reexports::client::backend::WaylandError;
 use smithay_client_toolkit::reexports::client::globals::{GlobalList, registry_queue_init};
@@ -38,7 +40,6 @@ use smithay_client_toolkit::shell::wlr_layer::{
 use smithay_client_toolkit::shm::slot::{Buffer, SlotPool};
 use smithay_client_toolkit::shm::{Shm, ShmHandler};
 use smithay_client_toolkit::{delegate_dispatch2, delegate_registry, registry_handlers};
-use tiny_skia::Pixmap;
 use tokio::io::unix::AsyncFd;
 use touchcue_core::config::{OutputTarget, Position};
 use touchcue_core::{RateLimit, RequestId};
@@ -47,10 +48,10 @@ use tracing::{debug, instrument, warn};
 use super::WARN_INTERVAL;
 use super::icon::{ICON_DEADLINE, IconLoader, icon_pixels};
 use super::modal::OverlayClock;
+use super::motion::{Animations, Frame, Mark};
 use super::placement::{Placement, hyprland_cursor_output, matching, stack};
-use super::render::{FontState, Rendered, WIDTH, copy_to_argb8888, render};
+use super::render::{Canvas, FontState, Rendered, WIDTH, copy_to_argb8888, render};
 use crate::Prompt;
-use crate::text::display_body;
 
 const NAMESPACE: &str = "touchcue";
 const MODAL_NAMESPACE: &str = "touchcue-modal";
@@ -92,10 +93,8 @@ struct Surface {
     /// `None` lets the compositor pick the output.
     output: Option<wl_output::WlOutput>,
     layer: LayerSurface,
-    /// Drawn at `scale` device pixels per logical pixel.
-    pixmap: Pixmap,
-    /// Logical height of the popup in `pixmap`.
-    height: u32,
+    /// The popup at `scale` device pixels per logical pixel.
+    canvas: Canvas,
     scale: f64,
     /// Scale the compositor prefers; differs from `scale` until re-rendered.
     wanted: f64,
@@ -109,6 +108,12 @@ struct Surface {
     /// Row of the surface at which the pixmap is drawn.
     canvas_y: u32,
     configured: bool,
+    /// A frame callback is pending; animation frames wait for it.
+    frame_pending: bool,
+    /// `canvas` holds an animation frame not yet attached.
+    stale: bool,
+    /// Next submission attempt after a failed animation draw.
+    retry_at: Option<Instant>,
     margin: Option<i32>,
     /// Keeps the attached buffer until it is replaced.
     buffer: Option<Buffer>,
@@ -227,6 +232,8 @@ pub(crate) struct Popups {
     prompts: BTreeMap<RequestId, Prompt>,
     /// Requests with a popup whose preferred scale changed since it was drawn.
     rescale: BTreeSet<RequestId>,
+    /// State overlay of each request with popups.
+    animations: Animations,
     qh: QueueHandle<Self>,
     placement: Placement,
     font: FontState,
@@ -257,8 +264,7 @@ pub(crate) fn connect() -> Result<(Connection, GlobalList, EventQueue<Popups>), 
     Ok((conn, globals, queue))
 }
 
-/// Connects and binds the popup globals, then waits one roundtrip so the
-/// first popup can be placed on an output by name.
+/// Connects, binds the popup globals, and obtains output information in one roundtrip.
 #[instrument(skip_all)]
 pub(crate) fn open(
     placement: Placement,
@@ -447,6 +453,7 @@ impl Popups {
             fractional,
             prompts: BTreeMap::new(),
             rescale: BTreeSet::new(),
+            animations: Animations::new(placement.animate),
             qh,
             placement,
             font,
@@ -484,8 +491,11 @@ impl Popups {
             return;
         };
         self.prompts.insert(prompt.id, prompt.clone());
+        let frame = self
+            .animations
+            .show(prompt.id, prompt.state, Instant::now());
         if modal {
-            // Overlays are created first, so the popups stack above them.
+            // Popup surfaces stack above the modal overlays.
             for output in &targets {
                 self.hold_overlay(prompt.id, output.as_ref());
             }
@@ -495,7 +505,7 @@ impl Popups {
             let Some(popup) = pixmap_at(&rendered, scale) else {
                 continue;
             };
-            let (pixmap, height) = (popup.pixmap.clone(), popup.height);
+            let canvas = Canvas::new(popup.clone(), &frame);
             let surface = self.compositor.create_surface(&self.qh);
             let (fractional, viewport) = match &self.fractional {
                 Some(globals) => (
@@ -532,8 +542,7 @@ impl Popups {
             surfaces.push(Surface {
                 output,
                 layer,
-                pixmap,
-                height,
+                canvas,
                 scale,
                 wanted: scale,
                 fractional,
@@ -541,6 +550,9 @@ impl Popups {
                 size: (0, 0),
                 canvas_y: 0,
                 configured: false,
+                frame_pending: false,
+                stale: false,
+                retry_at: None,
                 margin: None,
                 buffer: None,
             });
@@ -569,6 +581,7 @@ impl Popups {
             return;
         }
         self.prompts.insert(prompt.id, prompt.clone());
+        let now = Instant::now();
         let scales: Vec<f64> = self
             .surfaces
             .get(&prompt.id)
@@ -588,17 +601,17 @@ impl Popups {
             scales = ?rendered.iter().map(|(scale, _)| scale).collect::<Vec<_>>(),
             "popup updated"
         );
+        let frame = self.animations.show(prompt.id, prompt.state, now);
         for surface in surfaces.iter_mut() {
             if let Some(popup) = pixmap_at(&rendered, surface.scale) {
-                surface.pixmap = popup.pixmap.clone();
-                surface.height = popup.height;
+                surface.canvas = Canvas::new(popup.clone(), &frame);
             }
         }
         // A new size takes effect with the next configure, which redraws.
         self.restack();
         if let Some(surfaces) = self.surfaces.get_mut(&prompt.id) {
             for surface in surfaces.iter_mut().filter(|surface| surface.configured) {
-                draw(&mut self.pool, &mut self.warn_limit, surface);
+                draw(&mut self.pool, &mut self.warn_limit, surface, None);
             }
         }
     }
@@ -609,6 +622,7 @@ impl Popups {
         self.release(id);
         self.prompts.remove(&id);
         self.rescale.remove(&id);
+        self.animations.remove(id);
         if self.surfaces.remove(&id).is_some() {
             debug!(id = %id, "popup hidden");
             self.restack();
@@ -625,6 +639,7 @@ impl Popups {
         self.surfaces.clear();
         self.prompts.clear();
         self.rescale.clear();
+        self.animations.clear();
         self.remove_overlays(|_| true);
         self.overlay_clock.clear();
     }
@@ -659,6 +674,47 @@ impl Popups {
     /// Returns the earliest time [`Popups::expire_overlays`] has work.
     pub(crate) fn next_overlay_deadline(&self) -> Option<Instant> {
         self.overlay_clock.next_deadline()
+    }
+
+    /// Draws the state overlay frames due at `now`; a popup whose last
+    /// frame the compositor has not shown yet gets the frame once it has.
+    #[tracing::instrument(level = "trace", skip_all, fields(backend = "wayland"))]
+    pub(crate) fn animate(&mut self, now: Instant) {
+        self.forget_hidden();
+        for (id, frame) in self.animations.due(now) {
+            let Some(surfaces) = self.surfaces.get_mut(&id) else {
+                continue;
+            };
+            for surface in surfaces.iter_mut() {
+                surface.canvas.draw(&frame);
+                surface.stale = true;
+            }
+        }
+        for surface in self.surfaces.values_mut().flatten() {
+            let retry_due = surface.retry_at.is_some_and(|deadline| deadline <= now);
+            if surface.configured
+                && surface.stale
+                && !surface.frame_pending
+                && (surface.retry_at.is_none() || retry_due)
+            {
+                draw_frame(&mut self.pool, &mut self.warn_limit, &self.qh, surface);
+            }
+        }
+    }
+
+    /// Returns when [`Popups::animate`] has a frame to draw; `None` while
+    /// no popup animates.
+    pub(crate) fn next_frame(&self) -> Option<Instant> {
+        self.animations
+            .next_deadline()
+            .into_iter()
+            .chain(
+                self.surfaces
+                    .values()
+                    .flatten()
+                    .filter_map(|surface| surface.retry_at),
+            )
+            .min()
     }
 
     /// Returns the overlays and how many of them have a buffer committed.
@@ -718,7 +774,7 @@ impl Popups {
         render(
             self.font.get(),
             &prompt.title,
-            &display_body(prompt),
+            &prompt.body,
             icon.as_ref(),
             scale,
         )
@@ -764,12 +820,13 @@ impl Popups {
         }
     }
 
-    /// Forgets the prompts and pending scale changes of requests whose
-    /// popups are gone.
+    /// Forgets the prompts, pending scale changes and overlay states of
+    /// requests whose popups are gone.
     fn forget_hidden(&mut self) {
         let surfaces = &self.surfaces;
         self.prompts.retain(|id, _| surfaces.contains_key(id));
         self.rescale.retain(|id| surfaces.contains_key(id));
+        self.animations.retain(|id| surfaces.contains_key(&id));
     }
 
     /// Reports whether a popup waits to be rendered at a new scale.
@@ -798,6 +855,10 @@ impl Popups {
                         .collect()
                 })
                 .unwrap_or_default();
+            let frame = self
+                .animations
+                .frame(id, Instant::now())
+                .unwrap_or_else(|| Frame::settled(Mark::of(prompt.state)));
             let Some(rendered) = self.render_scales(&prompt, &wanted).await else {
                 self.warn_limit.log(Instant::now(), |suppressed| {
                     warn!(%id, suppressed, "failed to render popup at a new scale");
@@ -809,8 +870,7 @@ impl Popups {
                     if !same_scale(surface.wanted, surface.scale)
                         && let Some(popup) = pixmap_at(&rendered, surface.wanted)
                     {
-                        surface.pixmap = popup.pixmap.clone();
-                        surface.height = popup.height;
+                        surface.canvas = Canvas::new(popup.clone(), &frame);
                         surface.scale = surface.wanted;
                         debug!(%id, scale = surface.scale, "popup rendered at a new scale");
                     }
@@ -822,7 +882,7 @@ impl Popups {
         for id in ids {
             if let Some(surfaces) = self.surfaces.get_mut(&id) {
                 for surface in surfaces.iter_mut().filter(|surface| surface.configured) {
-                    draw(&mut self.pool, &mut self.warn_limit, surface);
+                    draw(&mut self.pool, &mut self.warn_limit, surface, None);
                 }
             }
         }
@@ -934,6 +994,7 @@ impl Popups {
             self.release(id);
             self.surfaces.remove(&id);
             self.prompts.remove(&id);
+            self.animations.remove(id);
             debug!(%id, "modal popup dismissed");
             self.dismissed.push(id);
         }
@@ -979,12 +1040,10 @@ impl Popups {
 impl Surface {
     /// Returns the logical size of the popup the surface draws.
     fn logical(&self) -> (u32, u32) {
-        (WIDTH, self.height)
+        (WIDTH, self.canvas.height())
     }
 
-    /// Returns the output whose stack the surface belongs to: the requested
-    /// one, else the first output the compositor reports the surface on, so
-    /// a popup left to the compositor's choice joins the popups there.
+    /// Returns the requested output, or the first output containing the surface.
     fn stack_output(&self) -> Option<wl_output::WlOutput> {
         self.output.clone().or_else(|| {
             self.layer
@@ -1087,8 +1146,7 @@ fn place(
     limit: &mut RateLimit,
 ) {
     let (size, canvas_y, margin) = match position {
-        // Each surface spans the whole stack, so the compositor centres all
-        // of them in the same place and each popup is drawn at its offset.
+        // Centered surfaces share the full stack height; each popup is drawn at its stack offset.
         Position::Center => (
             (surface.logical().0, total.max(0).unsigned_abs()),
             offset.max(0).unsigned_abs(),
@@ -1116,7 +1174,7 @@ fn place(
     } else if surface.canvas_y != canvas_y {
         surface.canvas_y = canvas_y;
         if surface.configured {
-            draw(pool, limit, surface);
+            draw(pool, limit, surface, None);
         }
     }
     if commit {
@@ -1151,9 +1209,17 @@ fn anchor(position: Position) -> Anchor {
 
 /// Attaches the surface's pixmap at its canvas row in a new buffer of the
 /// surface's size and commits it.
-fn draw(pool: &mut SlotPool, limit: &mut RateLimit, surface: &mut Surface) {
+fn draw(
+    pool: &mut SlotPool,
+    limit: &mut RateLimit,
+    surface: &mut Surface,
+    frame: Option<&QueueHandle<Popups>>,
+) {
     let layout = Layout {
-        pixmap: (surface.pixmap.width(), surface.pixmap.height()),
+        pixmap: (
+            surface.canvas.pixmap().width(),
+            surface.canvas.pixmap().height(),
+        ),
         size: surface.size,
         canvas_y: surface.canvas_y,
         scale: surface.scale,
@@ -1181,7 +1247,7 @@ fn draw(pool: &mut SlotPool, limit: &mut RateLimit, surface: &mut Surface) {
         }
     };
     canvas.fill(0);
-    let data = surface.pixmap.data();
+    let data = surface.canvas.pixmap().data();
     let start = u64::from(canvas_y).saturating_mul(u64::from(stride.unsigned_abs()));
     let target = match usize::try_from(start) {
         Ok(start) => start
@@ -1213,8 +1279,32 @@ fn draw(pool: &mut SlotPool, limit: &mut RateLimit, surface: &mut Surface) {
         });
         return;
     }
+    if let Some(qh) = frame {
+        wl_surface.frame(qh, FrameCallbackData(wl_surface.clone()));
+        surface.frame_pending = true;
+    }
     surface.layer.commit();
     surface.buffer = Some(buffer);
+    surface.stale = false;
+    surface.retry_at = None;
+}
+
+/// Submits a stale animation frame. Successful draws request one callback;
+/// failed draws remain stale and retry after one frame interval.
+#[tracing::instrument(level = "trace", skip_all, fields(backend = "wayland"))]
+fn draw_frame(
+    pool: &mut SlotPool,
+    limit: &mut RateLimit,
+    qh: &QueueHandle<Popups>,
+    surface: &mut Surface,
+) {
+    if !surface.configured || surface.frame_pending {
+        return;
+    }
+    draw(pool, limit, surface, Some(qh));
+    if surface.stale {
+        surface.retry_at = Some(Instant::now() + super::motion::FRAME_INTERVAL);
+    }
 }
 
 /// Attaches one pixel of black at `alpha` to the overlay, scaled to
@@ -1353,7 +1443,26 @@ impl CompositorHandler for Popups {
     ) {
     }
 
-    fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: u32) {}
+    fn frame(
+        &mut self,
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+        surface: &wl_surface::WlSurface,
+        _: u32,
+    ) {
+        let (pool, limit) = (&mut self.pool, &mut self.warn_limit);
+        if let Some(popup) = self
+            .surfaces
+            .values_mut()
+            .flatten()
+            .find(|popup| popup.layer.wl_surface() == surface)
+        {
+            popup.frame_pending = false;
+            if popup.stale {
+                draw_frame(pool, limit, qh, popup);
+            }
+        }
+    }
 
     fn surface_enter(
         &mut self,
@@ -1378,10 +1487,8 @@ impl CompositorHandler for Popups {
 }
 
 impl Popups {
-    /// Settles an overlay created without an output on the output it entered,
-    /// so each output has at most one overlay. Its requests join the overlay
-    /// already on that output; otherwise it stays there with its time limit,
-    /// unless that output cools down, which removes it.
+    /// Assigns an unbound overlay to its entered output. Requests join an
+    /// existing overlay there; a cooling output removes the unbound overlay.
     fn overlay_entered(&mut self, surface: &wl_surface::WlSurface, output: &wl_output::WlOutput) {
         let Some(index) = self
             .overlays
@@ -1496,7 +1603,6 @@ impl LayerShellHandler for Popups {
         if closed {
             self.surfaces.retain(|_, surfaces| !surfaces.is_empty());
             self.forget_hidden();
-            self.forget_hidden();
             debug!("compositor closed a popup");
             self.restack();
         }
@@ -1552,7 +1658,7 @@ impl LayerShellHandler for Popups {
             .find(|surface| &surface.layer == layer)
         {
             surface.configured = true;
-            draw(pool, limit, surface);
+            draw(pool, limit, surface, None);
         }
     }
 }
@@ -1789,8 +1895,8 @@ mod tests {
     enum TestError {
         #[error("no buffer at scale {0}")]
         NoBuffer(f64),
-        #[error("pixmap not created")]
-        Pixmap,
+        #[error("popup not rendered")]
+        NotRendered,
     }
 
     /// A stack of popups `heights` logical pixels high, the last of them
@@ -1850,30 +1956,21 @@ mod tests {
 
     #[test]
     fn rendered_pixmaps_are_found_by_scale() -> Result<(), TestError> {
-        let one = Pixmap::new(1, 1);
-        let two = Pixmap::new(2, 2);
+        let one = render(None, "title", "body", None, 1.0);
+        let two = render(None, "title", "body", None, 1.5);
         let (Some(one), Some(two)) = (one, two) else {
-            return Err(TestError::Pixmap);
+            return Err(TestError::NotRendered);
         };
-        let rendered = [
-            (
-                1.0,
-                Rendered {
-                    pixmap: one,
-                    height: 1,
-                },
-            ),
-            (
-                1.5,
-                Rendered {
-                    pixmap: two,
-                    height: 1,
-                },
-            ),
-        ];
-        let width = |scale| pixmap_at(&rendered, scale).map(|popup| popup.pixmap.width());
-        assert_eq!(width(1.5), Some(2));
-        assert_eq!(width(1.0 + 1e-9), Some(1));
+        let rendered = [(1.0, one), (1.5, two)];
+        let width = |scale| {
+            pixmap_at(&rendered, scale).map(|popup| {
+                Canvas::new(popup.clone(), &Frame::settled(Mark::Spinner))
+                    .pixmap()
+                    .width()
+            })
+        };
+        assert_eq!(width(1.5), Some(540));
+        assert_eq!(width(1.0 + 1e-9), Some(360));
         assert!(pixmap_at(&rendered, 2.0).is_none());
         Ok(())
     }

@@ -18,7 +18,8 @@ const HYPRLAND_TIMEOUT: Duration = Duration::from_millis(500);
 /// Largest Hyprland IPC reply read, in bytes.
 const MAX_HYPRLAND_REPLY: u64 = 64 * 1024;
 
-/// Where popups are shown and how modal overlays behave.
+/// Where popups are shown, how modal overlays behave and whether the state
+/// overlay moves.
 #[derive(Debug, Clone)]
 pub(crate) struct Placement {
     pub(crate) position: Position,
@@ -29,16 +30,21 @@ pub(crate) struct Placement {
     pub(crate) modal: bool,
     /// A click on an overlay dismisses the requests that hold it.
     pub(crate) dismiss: bool,
+    /// The state overlay animates; otherwise every frame is still.
+    pub(crate) animate: bool,
 }
 
 impl Placement {
-    pub(crate) fn new(popup: &Popup) -> Self {
+    /// Returns the placement of `popup`; `reduced_motion` stills the state
+    /// overlay as `popup.animations = false` does.
+    pub(crate) fn new(popup: &Popup, reduced_motion: bool) -> Self {
         Self {
             position: popup.position,
             target: popup.output.clone(),
             dim_alpha: dim_alpha(popup.modal_dim.get()),
             modal: popup.modal,
             dismiss: popup.modal && popup.modal_dismiss,
+            animate: popup.animations && !reduced_motion,
         }
     }
 }
@@ -357,5 +363,18 @@ mod tests {
         assert_eq!(stack(&[100], 8), (vec![0], 100));
         assert_eq!(stack(&[100, 60, 80], 8), (vec![0, 108, 176], 256));
         assert_eq!(stack(&[i32::MAX, 10], 8), (vec![0, i32::MAX], i32::MAX));
+    }
+
+    #[test]
+    fn animations_need_the_setting_and_no_reduced_motion() {
+        let on = Popup::default();
+        let off = Popup {
+            animations: false,
+            ..Popup::default()
+        };
+        assert!(Placement::new(&on, false).animate);
+        assert!(!Placement::new(&on, true).animate);
+        assert!(!Placement::new(&off, false).animate);
+        assert!(!Placement::new(&off, true).animate);
     }
 }

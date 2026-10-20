@@ -8,6 +8,11 @@
 //! namespace to wait for, then holds them until stdin closes, `SIGTERM` or
 //! `SIGINT` arrives, or [`HOLD_LIMIT`] passes, and withdraws them.
 //!
+//! An animated scenario, named `anim-*`, starts its state changes when a
+//! line arrives on stdin after `ready`, times them from that line, prints
+//! `done` once the last change has lingered for [`ANIM_TAIL`], and then
+//! holds the prompts the same way.
+//!
 //! Popups are pinned to the output named by `TOUCHCUE_SCREENSHOT_OUTPUT`,
 //! `SHOT` by default, except where a scenario targets every output.
 //! `TOUCHCUE_LOG` sets the log filter, `warn` by default; logs go to stderr.
@@ -30,7 +35,7 @@ mod linux {
     use std::path::{Path, PathBuf};
     use std::time::Duration;
 
-    use tokio::io::AsyncReadExt as _;
+    use tokio::io::{AsyncReadExt as _, Stdin};
     use tokio::signal::unix::{Signal, SignalKind, signal};
     use tokio::time::Instant;
     use tokio_util::sync::CancellationToken;
@@ -46,11 +51,12 @@ mod linux {
     const LOG_ENV: &str = "TOUCHCUE_LOG";
     /// Longest time the prompts are held before the example gives up.
     const HOLD_LIMIT: Duration = Duration::from_secs(120);
-    /// Pause between two shows, so one icon decode ends before the next
-    /// starts; the icon loader skips icons while it is busy.
+    /// Delay between prompt shows. The icon loader skips new icon loads while busy.
     const SHOW_GAP: Duration = Duration::from_millis(300);
-    /// Pause after the last command, so every popup is drawn before `ready`.
+    /// Delay between the final show/update command and `ready`.
     const SETTLE: Duration = Duration::from_millis(500);
+    /// Time an animated scenario holds its last state before `done`.
+    const ANIM_TAIL: Duration = Duration::from_millis(1500);
     /// Layer-shell namespace of popups; matches the UI's Wayland backend.
     const POPUP_NAMESPACE: &str = "touchcue";
     /// Layer-shell namespace of modal overlays; matches the UI's Wayland backend.
@@ -62,6 +68,10 @@ mod linux {
     const BROWSER: &str = "Browser is waiting for a passkey";
     const SSH: &str = "ssh in Terminal is waiting for an SSH login";
     const AGENT: &str = "claude in Terminal is waiting for a GPG signature";
+
+    const TOUCHED: RequestState = RequestState::Lingering(EndReason::Touched);
+    const CANCELLED: RequestState = RequestState::Lingering(EndReason::Cancelled);
+    const TIMED_OUT: RequestState = RequestState::Lingering(EndReason::TimedOut);
 
     /// A screenshot example failure.
     #[derive(Debug, thiserror::Error)]
@@ -90,6 +100,8 @@ mod linux {
         Stdin(#[source] io::Error),
         #[error("failed to listen for signals")]
         Signal(#[source] io::Error),
+        #[error("scenario {0} must have steps exactly when its name starts with anim-")]
+        AnimatedName(&'static str),
         #[error("nothing released the prompts within {limit:?}")]
         HoldTimeout {
             limit: Duration,
@@ -99,13 +111,20 @@ mod linux {
     }
 
     /// One prompt of a scenario; it is shown waiting and then moved to
-    /// `end`, when set.
+    /// `end`, when set, before `ready`.
     struct Shot {
         title: &'static str,
         body: &'static str,
         /// File name in `examples/assets`.
         icon: Option<&'static str>,
         end: Option<EndReason>,
+    }
+
+    /// A state change of an animated scenario: `after` the previous change,
+    /// or the start line, every prompt moves to `state`.
+    struct Step {
+        after: Duration,
+        state: RequestState,
     }
 
     struct Scenario {
@@ -118,6 +137,8 @@ mod linux {
         backend: Backend,
         namespace: &'static str,
         shots: &'static [Shot],
+        /// State changes played after the start line; empty for stills.
+        steps: &'static [Step],
     }
 
     const fn waiting(body: &'static str, icon: &'static str) -> Shot {
@@ -136,6 +157,29 @@ mod linux {
         }
     }
 
+    const fn step(after_ms: u64, state: RequestState) -> Step {
+        Step {
+            after: Duration::from_millis(after_ms),
+            state,
+        }
+    }
+
+    /// The prompt of every animated scenario.
+    const ANIMATED_SHOTS: &[Shot] = &[waiting(BROWSER, "browser.svg")];
+
+    /// An animated popup of the browser prompt that plays `steps`.
+    const fn animated(name: &'static str, steps: &'static [Step]) -> Scenario {
+        Scenario {
+            name,
+            toml: POPUP_ONLY,
+            pin: true,
+            backend: Backend::Popup,
+            namespace: POPUP_NAMESPACE,
+            shots: ANIMATED_SHOTS,
+            steps,
+        }
+    }
+
     const POPUP_ONLY: &str = "[output]\nmode = \"popup\"\nfallback = \"none\"\n";
 
     const SCENARIOS: &[Scenario] = &[
@@ -146,6 +190,7 @@ mod linux {
             backend: Backend::Popup,
             namespace: POPUP_NAMESPACE,
             shots: &[waiting(BROWSER, "browser.svg")],
+            steps: &[],
         },
         Scenario {
             name: "corner",
@@ -155,6 +200,7 @@ mod linux {
             backend: Backend::Popup,
             namespace: POPUP_NAMESPACE,
             shots: &[waiting(SSH, "terminal.svg")],
+            steps: &[],
         },
         Scenario {
             name: "stacked",
@@ -166,6 +212,7 @@ mod linux {
                 waiting(BROWSER, "browser.svg"),
                 ended(AGENT, "terminal.svg", EndReason::Touched),
             ],
+            steps: &[],
         },
         Scenario {
             name: "outcomes",
@@ -178,7 +225,19 @@ mod linux {
                 ended(BROWSER, "browser.svg", EndReason::Cancelled),
                 ended(AGENT, "terminal.svg", EndReason::TimedOut),
             ],
+            steps: &[],
         },
+        animated("anim-touched", &[step(1500, TOUCHED)]),
+        animated("anim-cancelled", &[step(1500, CANCELLED)]),
+        animated("anim-timed-out", &[step(1500, TIMED_OUT)]),
+        animated(
+            "anim-retry",
+            &[
+                step(1200, TIMED_OUT),
+                step(1500, RequestState::Waiting),
+                step(1500, TOUCHED),
+            ],
+        ),
         Scenario {
             name: "modal-dim",
             toml: "[output]\nmode = \"popup\"\nfallback = \"none\"\n\
@@ -187,6 +246,7 @@ mod linux {
             backend: Backend::Popup,
             namespace: MODAL_NAMESPACE,
             shots: &[waiting(BROWSER, "browser.svg")],
+            steps: &[],
         },
         Scenario {
             name: "modal-nodim",
@@ -196,6 +256,7 @@ mod linux {
             backend: Backend::Popup,
             namespace: MODAL_NAMESPACE,
             shots: &[waiting(BROWSER, "browser.svg")],
+            steps: &[],
         },
         Scenario {
             name: "long-text",
@@ -215,6 +276,7 @@ mod linux {
                 icon: Some("terminal.svg"),
                 end: None,
             }],
+            steps: &[],
         },
         Scenario {
             name: "rule-icon",
@@ -231,6 +293,7 @@ mod linux {
                     end: None,
                 },
             ],
+            steps: &[],
         },
         Scenario {
             name: "all-outputs",
@@ -240,6 +303,7 @@ mod linux {
             backend: Backend::Popup,
             namespace: POPUP_NAMESPACE,
             shots: &[waiting(BROWSER, "browser.svg")],
+            steps: &[],
         },
         Scenario {
             name: "notification",
@@ -248,6 +312,7 @@ mod linux {
             backend: Backend::Notification,
             namespace: MAKO_NAMESPACE,
             shots: &[waiting(BROWSER, "browser.svg")],
+            steps: &[],
         },
     ];
 
@@ -259,10 +324,36 @@ mod linux {
         Interrupted,
     }
 
-    /// Signal streams that release the held prompts.
-    struct Signals {
+    /// Sources that release the held prompts: stdin and two signal streams.
+    struct Releases {
+        stdin: Stdin,
         terminate: Signal,
         interrupt: Signal,
+    }
+
+    impl Releases {
+        /// Waits for input on stdin, returning `None`, or for a release.
+        async fn next(&mut self) -> Result<Option<Release>, ShotError> {
+            let mut buf = [0_u8; 256];
+            tokio::select! {
+                read = self.stdin.read(&mut buf) => match read {
+                    Ok(0) => Ok(Some(Release::StdinClosed)),
+                    Ok(_) => Ok(None),
+                    Err(error) => Err(ShotError::Stdin(error)),
+                },
+                _ = self.terminate.recv() => Ok(Some(Release::Terminated)),
+                _ = self.interrupt.recv() => Ok(Some(Release::Interrupted)),
+            }
+        }
+
+        /// Waits for a release; input on stdin is ignored.
+        async fn released(&mut self) -> Result<Release, ShotError> {
+            loop {
+                if let Some(release) = self.next().await? {
+                    return Ok(release);
+                }
+            }
+        }
     }
 
     pub(super) fn main() -> Result<(), ShotError> {
@@ -286,7 +377,7 @@ mod linux {
             .build()
             .map_err(ShotError::Runtime)?;
         let result = runtime.block_on(run(scenario));
-        // A pending stdin read cannot be cancelled and would block a waiting shutdown.
+        // Pending stdin reads are not cancelable; runtime shutdown does not wait for them.
         runtime.shutdown_background();
         result
     }
@@ -318,11 +409,15 @@ mod linux {
         }
     }
 
-    /// Prints every scenario name after checking that its configuration parses.
+    /// Prints every scenario name after checking that its configuration
+    /// parses and that only animated scenarios are named `anim-*`.
     fn list() -> Result<(), ShotError> {
         let mut stdout = io::stdout().lock();
         for scenario in SCENARIOS {
             ui_config(scenario, DEFAULT_OUTPUT)?;
+            if scenario.name.starts_with("anim-") == scenario.steps.is_empty() {
+                return Err(ShotError::AnimatedName(scenario.name));
+            }
             writeln!(stdout, "{}", scenario.name).map_err(ShotError::Stdout)?;
         }
         stdout.flush().map_err(ShotError::Stdout)
@@ -334,6 +429,7 @@ mod linux {
             source,
         })?;
         let mut popup = config.popup;
+        popup.animations = scenario.name.starts_with("anim-");
         if scenario.pin {
             popup.output = OutputTarget::Named(vec![output.to_owned()]);
         }
@@ -341,6 +437,7 @@ mod linux {
             output: config.output,
             popup,
             notification: config.notification,
+            reduced_motion: false,
         })
     }
 
@@ -355,9 +452,9 @@ mod linux {
     #[instrument(skip_all, fields(scenario = scenario.name), err)]
     async fn run(scenario: &Scenario) -> Result<(), ShotError> {
         let cfg = ui_config(scenario, &output_name()?)?;
-        // Registered first, so a signal during startup is not fatal and
-        // still reaches `hold`.
-        let signals = Signals {
+        // Signal streams include signals received during UI startup.
+        let releases = Releases {
+            stdin: tokio::io::stdin(),
             terminate: signal(SignalKind::terminate()).map_err(ShotError::Signal)?,
             interrupt: signal(SignalKind::interrupt()).map_err(ShotError::Signal)?,
         };
@@ -370,7 +467,7 @@ mod linux {
         }
         let assets = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/assets");
         let ids: Vec<RequestId> = (1..).map(RequestId).take(scenario.shots.len()).collect();
-        let held = present(&ui, scenario, &assets, &ids, signals).await;
+        let held = present(&ui, scenario, &assets, &ids, releases).await;
         let withdrawn = withdraw(ui, &ids).await;
         match (held, withdrawn) {
             (Ok(release), withdrawn) => {
@@ -394,11 +491,21 @@ mod linux {
         scenario: &Scenario,
         assets: &Path,
         ids: &[RequestId],
-        signals: Signals,
+        releases: Releases,
     ) -> Result<Release, ShotError> {
         show(ui, scenario, assets, ids).await?;
-        ready(scenario.namespace)?;
-        hold(signals).await
+        say(format_args!("ready {}", scenario.namespace))?;
+        hold(ui, scenario, assets, ids, releases).await
+    }
+
+    fn prompt(assets: &Path, id: RequestId, shot: &Shot, state: RequestState) -> Prompt {
+        Prompt {
+            id,
+            title: shot.title.to_owned(),
+            body: shot.body.to_owned(),
+            icon: shot.icon.map(|name| -> PathBuf { assets.join(name) }),
+            state,
+        }
     }
 
     /// Shows every prompt waiting, then moves the ended ones to their outcome.
@@ -408,58 +515,81 @@ mod linux {
         assets: &Path,
         ids: &[RequestId],
     ) -> Result<(), ShotError> {
-        let prompt = |id: RequestId, shot: &Shot, state| Prompt {
-            id,
-            title: shot.title.to_owned(),
-            body: shot.body.to_owned(),
-            icon: shot.icon.map(|name| -> PathBuf { assets.join(name) }),
-            state,
-        };
         for (&id, shot) in ids.iter().zip(scenario.shots) {
-            ui.send(Command::Show(prompt(id, shot, RequestState::Waiting)))
-                .await?;
+            ui.send(Command::Show(prompt(
+                assets,
+                id,
+                shot,
+                RequestState::Waiting,
+            )))
+            .await?;
             tokio::time::sleep(SHOW_GAP).await;
         }
         for (&id, shot) in ids.iter().zip(scenario.shots) {
             if let Some(end) = shot.end {
                 let state = RequestState::Lingering(end);
-                ui.send(Command::Update(prompt(id, shot, state))).await?;
+                ui.send(Command::Update(prompt(assets, id, shot, state)))
+                    .await?;
             }
         }
         tokio::time::sleep(SETTLE).await;
         Ok(())
     }
 
-    fn ready(namespace: &str) -> Result<(), ShotError> {
+    fn say(line: std::fmt::Arguments<'_>) -> Result<(), ShotError> {
         let mut stdout = io::stdout().lock();
-        writeln!(stdout, "ready {namespace}").map_err(ShotError::Stdout)?;
+        writeln!(stdout, "{line}").map_err(ShotError::Stdout)?;
         stdout.flush().map_err(ShotError::Stdout)
     }
 
-    /// Waits until stdin closes, `SIGTERM` or `SIGINT` arrives, or
-    /// [`HOLD_LIMIT`] passes.
-    async fn hold(signals: Signals) -> Result<Release, ShotError> {
-        let Signals {
-            mut terminate,
-            mut interrupt,
-        } = signals;
-        let mut stdin = tokio::io::stdin();
-        let mut buf = [0_u8; 256];
-        let wait = async {
-            loop {
-                tokio::select! {
-                    read = stdin.read(&mut buf) => match read {
-                        Ok(0) => return Ok(Release::StdinClosed),
-                        Ok(_) => {}
-                        Err(error) => return Err(ShotError::Stdin(error)),
-                    },
-                    _ = terminate.recv() => return Ok(Release::Terminated),
-                    _ = interrupt.recv() => return Ok(Release::Interrupted),
-                }
+    /// Moves every prompt through the steps of the scenario, timed from the
+    /// call, then waits [`ANIM_TAIL`].
+    #[tracing::instrument(skip_all, fields(scenario = scenario.name), err)]
+    async fn play(
+        ui: &Ui,
+        scenario: &Scenario,
+        assets: &Path,
+        ids: &[RequestId],
+    ) -> Result<(), ShotError> {
+        let mut at = Instant::now();
+        for step in scenario.steps {
+            at += step.after;
+            tokio::time::sleep_until(at).await;
+            for (&id, shot) in ids.iter().zip(scenario.shots) {
+                ui.send(Command::Update(prompt(assets, id, shot, step.state)))
+                    .await?;
             }
+        }
+        tokio::time::sleep_until(at + ANIM_TAIL).await;
+        Ok(())
+    }
+
+    /// Plays an animated scenario once a line arrives on stdin and prints
+    /// `done`, then waits until stdin closes, `SIGTERM` or `SIGINT` arrives,
+    /// or [`HOLD_LIMIT`] passes.
+    #[tracing::instrument(skip_all, fields(scenario = scenario.name), err)]
+    async fn hold(
+        ui: &Ui,
+        scenario: &Scenario,
+        assets: &Path,
+        ids: &[RequestId],
+        mut releases: Releases,
+    ) -> Result<Release, ShotError> {
+        let wait = async {
+            if !scenario.steps.is_empty() {
+                if let Some(release) = releases.next().await? {
+                    return Ok(release);
+                }
+                tokio::select! {
+                    played = play(ui, scenario, assets, ids) => played?,
+                    release = releases.released() => return release,
+                }
+                say(format_args!("done"))?;
+            }
+            releases.released().await
         };
         match tokio::time::timeout(HOLD_LIMIT, wait).await {
-            Ok(released) => released,
+            Ok(release) => release,
             Err(source) => Err(ShotError::HoldTimeout {
                 limit: HOLD_LIMIT,
                 source,
@@ -487,6 +617,21 @@ mod linux {
                 );
                 Err(error.into())
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn only_animated_scenarios_enable_animations() -> Result<(), ShotError> {
+            for scenario in SCENARIOS {
+                let config = ui_config(scenario, DEFAULT_OUTPUT)?;
+                assert_eq!(config.popup.animations, scenario.name.starts_with("anim-"));
+                assert!(!config.reduced_motion);
+            }
+            Ok(())
         }
     }
 }

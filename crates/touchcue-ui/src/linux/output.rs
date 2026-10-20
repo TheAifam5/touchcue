@@ -100,6 +100,25 @@ impl PopupOutput {
         }
     }
 
+    /// Draws the state overlay frames due at `now`.
+    #[tracing::instrument(level = "trace", skip_all, err)]
+    pub(crate) fn animate(&mut self, now: Instant) -> Result<(), OutputError> {
+        match self {
+            Self::Wayland { popups, .. } => popups.animate(now),
+            Self::X11(popups) => popups.animate(now)?,
+        }
+        Ok(())
+    }
+
+    /// Returns when [`PopupOutput::animate`] has a frame to draw; `None`
+    /// while no popup animates.
+    pub(crate) fn next_frame(&self) -> Option<Instant> {
+        match self {
+            Self::Wayland { popups, .. } => popups.next_frame(),
+            Self::X11(popups) => popups.next_frame(),
+        }
+    }
+
     /// Returns the modal overlays and how many of them are drawn.
     #[cfg(test)]
     pub(crate) fn overlay_counts(&self) -> (usize, usize) {

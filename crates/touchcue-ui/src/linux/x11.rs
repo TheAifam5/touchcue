@@ -35,10 +35,10 @@ use x11rb::wrapper::ConnectionExt as _;
 use super::WARN_INTERVAL;
 use super::icon::{ICON_DEADLINE, IconLoader, icon_pixels};
 use super::modal::OverlayClock;
+use super::motion::Animations;
 use super::placement::{Placement, matching, stack};
-use super::render::{FontState, copy_to_argb8888, render};
+use super::render::{Canvas, FontState, Rendered, copy_to_argb8888, render};
 use crate::Prompt;
-use crate::text::display_body;
 
 /// Distance from the monitor edges, in logical pixels.
 const MARGIN: f32 = 16.0;
@@ -86,6 +86,8 @@ pub(crate) enum X11Error {
     NoShape,
     #[error("failed to register the X11 socket")]
     Register(#[from] io::Error),
+    #[error("X11 overlay geometry is out of range")]
+    Geometry(#[from] std::num::TryFromIntError),
 }
 
 /// Display servers that may show popups, in the order they are tried.
@@ -593,6 +595,9 @@ fn clamp_length(value: i32) -> u16 {
     }
 }
 
+/// BGRX pixels of a popup window, its size and the rectangles of its shape.
+type WindowPixels = (Vec<u8>, (u16, u16), Vec<Rectangle>);
+
 /// One shown popup window.
 struct PopupWindow {
     monitor: Monitor,
@@ -631,6 +636,12 @@ pub(crate) struct X11Popups {
     /// Limits warnings about output targets that fall back to `focused`.
     target_limit: RateLimit,
     windows: BTreeMap<RequestId, Vec<PopupWindow>>,
+    /// The popup of each request, shared by its windows.
+    canvases: BTreeMap<RequestId, Canvas>,
+    /// State overlay of each request with windows.
+    animations: Animations,
+    /// BGRX pixels of the last state overlay frame sent.
+    slot_pixels: Vec<u8>,
     overlays: Vec<X11Overlay>,
     overlay_clock: OverlayClock<Monitor>,
     /// Requests dismissed by a click since [`X11Popups::take_dismissed`].
@@ -655,6 +666,7 @@ impl X11Popups {
             max_bytes: connected.max_bytes,
             atoms: connected.atoms,
             randr: connected.randr,
+            animations: Animations::new(placement.animate),
             placement,
             scale: 1.0,
             font: FontState::load(),
@@ -662,6 +674,8 @@ impl X11Popups {
             warn_limit: RateLimit::new(WARN_INTERVAL),
             target_limit: RateLimit::new(WARN_INTERVAL),
             windows: BTreeMap::new(),
+            canvases: BTreeMap::new(),
+            slot_pixels: Vec::new(),
             overlays: Vec::new(),
             overlay_clock: OverlayClock::default(),
             dismissed: Vec::new(),
@@ -678,11 +692,19 @@ impl X11Popups {
         }
         self.scale = self.read_scale()?;
         let targets = self.targets()?;
-        let Some((data, size, shape)) = self.render(prompt).await else {
+        let Some(rendered) = self.render(prompt).await else {
+            return Ok(());
+        };
+        let frame = self
+            .animations
+            .show(prompt.id, prompt.state, Instant::now());
+        let canvas = Canvas::new(rendered, &frame);
+        let Some((data, size, shape)) = self.pixels(&canvas) else {
+            self.animations.remove(prompt.id);
             return Ok(());
         };
         if modal {
-            // Overlays are mapped first, so the popups stack above them.
+            // Popup windows stack above the modal overlays.
             for monitor in &targets {
                 self.hold_overlay(prompt.id, *monitor)?;
             }
@@ -721,6 +743,7 @@ impl X11Popups {
         }
         let windows: Vec<Window> = popups.iter().map(|popup| popup.window).collect();
         self.windows.insert(prompt.id, popups);
+        self.canvases.insert(prompt.id, canvas);
         self.restack()?;
         for window in &windows {
             self.conn.map_window(*window)?;
@@ -747,9 +770,17 @@ impl X11Popups {
         if !self.windows.contains_key(&prompt.id) {
             return Ok(());
         }
-        let Some((data, size, shape)) = self.render(prompt).await else {
+        let Some(rendered) = self.render(prompt).await else {
             return Ok(());
         };
+        let frame = self
+            .animations
+            .show(prompt.id, prompt.state, Instant::now());
+        let canvas = Canvas::new(rendered, &frame);
+        let Some((data, size, shape)) = self.pixels(&canvas) else {
+            return Ok(());
+        };
+        self.canvases.insert(prompt.id, canvas);
         let Some(popups) = self.windows.get_mut(&prompt.id) else {
             return Ok(());
         };
@@ -782,6 +813,8 @@ impl X11Popups {
     #[instrument(level = "debug", skip_all, fields(%id))]
     pub(crate) fn hide(&mut self, id: RequestId) -> Result<(), X11Error> {
         self.release(id)?;
+        self.canvases.remove(&id);
+        self.animations.remove(id);
         if let Some(popups) = self.windows.remove(&id) {
             for popup in &popups {
                 self.destroy(popup)?;
@@ -801,6 +834,8 @@ impl X11Popups {
         );
         let overlays = std::mem::take(&mut self.overlays);
         let windows = std::mem::take(&mut self.windows);
+        self.canvases.clear();
+        self.animations.clear();
         self.overlay_clock.clear();
         for overlay in &overlays {
             self.conn.destroy_window(overlay.window)?;
@@ -853,6 +888,26 @@ impl X11Popups {
     /// Returns the earliest time [`X11Popups::expire_overlays`] has work.
     pub(crate) fn next_overlay_deadline(&self) -> Option<Instant> {
         self.overlay_clock.next_deadline()
+    }
+
+    /// Sends the state overlay frames due at `now`.
+    #[tracing::instrument(level = "trace", skip_all, fields(backend = "x11"), err)]
+    pub(crate) fn animate(&mut self, now: Instant) -> Result<(), X11Error> {
+        let canvases = &self.canvases;
+        self.animations.retain(|id| canvases.contains_key(&id));
+        for (id, frame) in self.animations.due(now) {
+            if let Some(canvas) = self.canvases.get_mut(&id) {
+                canvas.draw(&frame);
+                self.draw_slot(id)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns when [`X11Popups::animate`] has a frame to send; `None`
+    /// while no popup animates.
+    pub(crate) fn next_frame(&self) -> Option<Instant> {
+        self.animations.next_deadline()
     }
 
     /// Returns the overlays and how many of them are mapped.
@@ -941,8 +996,8 @@ impl X11Popups {
         Ok(())
     }
 
-    /// Returns the BGRX pixels, size and shape of the rendered popup.
-    async fn render(&mut self, prompt: &Prompt) -> Option<(Vec<u8>, (u16, u16), Vec<Rectangle>)> {
+    /// Renders the static layer of the prompt's popup.
+    async fn render(&mut self, prompt: &Prompt) -> Option<Rendered> {
         let icon = match prompt.icon.as_deref() {
             Some(path) => self.icons.get(path, icon_pixels(self.scale)).await,
             None => None,
@@ -951,16 +1006,21 @@ impl X11Popups {
         let rendered = render(
             self.font.get(),
             &prompt.title,
-            &display_body(prompt),
+            &prompt.body,
             icon.as_ref(),
             self.scale,
         );
-        let Some(pixmap) = rendered.map(|rendered| rendered.pixmap) else {
+        if rendered.is_none() {
             self.warn_limit.log(Instant::now(), |suppressed| {
                 warn!(suppressed, "failed to render popup");
             });
-            return None;
-        };
+        }
+        rendered
+    }
+
+    /// Returns the BGRX pixels, size and shape of a popup.
+    fn pixels(&mut self, canvas: &Canvas) -> Option<WindowPixels> {
+        let pixmap = canvas.pixmap();
         let (Ok(width), Ok(height)) = (
             u16::try_from(pixmap.width()),
             u16::try_from(pixmap.height()),
@@ -972,7 +1032,7 @@ impl X11Popups {
         };
         let mut data = vec![0; pixmap.data().len()];
         copy_to_argb8888(pixmap.data(), &mut data);
-        Some((data, (width, height), opaque_rows(&pixmap)))
+        Some((data, (width, height), opaque_rows(pixmap)))
     }
 
     /// Sends the pixels of the popups for `id`, which all have one size.
@@ -997,31 +1057,82 @@ impl X11Popups {
             return Ok(());
         };
         for popup in self.windows.get(&id).into_iter().flatten() {
-            self.draw_window(popup, rows)?;
+            self.put_rows(popup, (0, 0), popup.size.0, &popup.data, rows)?;
+        }
+        self.draw_slot(id)
+    }
+
+    /// Sends the state overlay of the popups for `id`.
+    #[tracing::instrument(level = "trace", skip_all, fields(%id, backend = "x11"), err)]
+    fn draw_slot(&mut self, id: RequestId) -> Result<(), X11Error> {
+        let Some(canvas) = self.canvases.get(&id) else {
+            return Ok(());
+        };
+        let Some(slot) = canvas.slot() else {
+            return Ok(());
+        };
+        let pixmap = canvas.pixmap();
+        let (x, y, width) = match slot_geometry(slot.x(), slot.y(), slot.width()) {
+            Ok(geometry) => geometry,
+            Err(error) => {
+                self.warn_limit.log(Instant::now(), |suppressed| {
+                    warn!(
+                        error = &error as &dyn std::error::Error,
+                        suppressed, "overlay geometry out of range; not drawing"
+                    );
+                });
+                return Ok(());
+            }
+        };
+        let left = usize::try_from(slot.x())?;
+        let top = usize::try_from(slot.y())?;
+        let columns = usize::try_from(slot.width())?;
+        let rows = usize::try_from(slot.height())?;
+        let pitch = usize::try_from(pixmap.width())?;
+        let (stride, pitch) = (columns * 4, pitch * 4);
+        if pitch == 0 {
+            return Ok(());
+        }
+        self.slot_pixels.clear();
+        self.slot_pixels.resize(stride * rows, 0);
+        let source = pixmap.data().chunks_exact(pitch).skip(top).take(rows);
+        for (row, target) in source.zip(self.slot_pixels.chunks_exact_mut(stride)) {
+            if let Some(part) = row.get(left * 4..left * 4 + stride) {
+                copy_to_argb8888(part, target);
+            }
+        }
+        let Some(per_request) = rows_per_request(self.max_bytes, stride) else {
+            return Ok(());
+        };
+        for popup in self.windows.get(&id).into_iter().flatten() {
+            self.put_rows(popup, (x, y), width, &self.slot_pixels, per_request)?;
         }
         Ok(())
     }
 
-    /// Sends the pixels of a popup in requests of `rows` rows.
-    fn draw_window(&self, popup: &PopupWindow, rows: usize) -> Result<(), X11Error> {
-        let stride = usize::from(popup.size.0) * 4;
-        for (chunk, y) in popup
-            .data
-            .chunks(rows * stride)
-            .zip((0_usize..).step_by(rows))
-        {
-            let (Ok(height), Ok(y)) = (u16::try_from(chunk.len() / stride), i16::try_from(y))
-            else {
-                break;
-            };
+    /// Sends `data`, rows of `width` BGRX pixels, to the popup at `(x, y)`
+    /// in requests of `rows` rows.
+    #[tracing::instrument(level = "trace", skip_all, fields(backend = "x11"), err)]
+    fn put_rows(
+        &self,
+        popup: &PopupWindow,
+        (x, y): (i16, i16),
+        width: u16,
+        data: &[u8],
+        rows: usize,
+    ) -> Result<(), X11Error> {
+        let stride = usize::from(width) * 4;
+        for (chunk, row) in data.chunks(rows * stride).zip((0_usize..).step_by(rows)) {
+            let height = u16::try_from(chunk.len() / stride)?;
+            let row = i16::try_from(row)?;
             self.conn.put_image(
                 ImageFormat::Z_PIXMAP,
                 popup.window,
                 popup.gc,
-                popup.size.0,
+                width,
                 height,
-                0,
-                y,
+                x,
+                y.saturating_add(row),
                 0,
                 DEPTH,
                 chunk,
@@ -1123,6 +1234,8 @@ impl X11Popups {
         let holders: Vec<_> = overlay.holders.iter().copied().collect();
         for id in holders {
             self.release(id)?;
+            self.canvases.remove(&id);
+            self.animations.remove(id);
             if let Some(popups) = self.windows.remove(&id) {
                 for popup in &popups {
                     self.destroy(popup)?;
@@ -1339,11 +1452,35 @@ fn logical(length: f32, scale: f32) -> i32 {
     (length * scale).round().clamp(0.0, 65_535.0) as i32
 }
 
+fn slot_geometry(x: i32, y: i32, width: u32) -> Result<(i16, i16, u16), X11Error> {
+    let x = i16::try_from(u16::try_from(x)?)?;
+    let y = i16::try_from(u16::try_from(y)?)?;
+    Ok((x, y, u16::try_from(width)?))
+}
+
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
 
     use super::*;
+
+    #[test]
+    fn slot_geometry_rejects_out_of_range_coordinates() -> Result<(), X11Error> {
+        assert_eq!(slot_geometry(2, 3, 4)?, (2, 3, 4));
+        for geometry in [
+            (32_768, 0, 1),
+            (0, 32_768, 1),
+            (-1, 0, 1),
+            (0, -1, 1),
+            (0, 0, 65_536),
+        ] {
+            assert!(matches!(
+                slot_geometry(geometry.0, geometry.1, geometry.2),
+                Err(X11Error::Geometry(_))
+            ));
+        }
+        Ok(())
+    }
 
     #[test]
     fn display_servers_follow_the_environment() {
@@ -1625,7 +1762,7 @@ mod tests {
             position: Position::TopRight,
             ..touchcue_core::config::Popup::default()
         };
-        let mut popups = X11Popups::new(connected, Placement::new(&popup))?;
+        let mut popups = X11Popups::new(connected, Placement::new(&popup, false))?;
         popups
             .show(
                 &smoke_prompt(1, "Touch your security key", RequestState::Waiting),

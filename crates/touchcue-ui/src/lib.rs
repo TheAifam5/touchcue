@@ -77,6 +77,9 @@ pub struct UiConfig {
     pub output: Output,
     pub popup: Popup,
     pub notification: Notification,
+    /// The desktop asks for reduced motion; the popup state overlay then
+    /// stays still, as with `popup.animations = false`.
+    pub reduced_motion: bool,
 }
 
 /// Desktop features found by [`probe`].

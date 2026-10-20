@@ -3,6 +3,7 @@
 
 mod icon;
 mod modal;
+mod motion;
 mod notify;
 mod output;
 mod placement;
@@ -123,7 +124,10 @@ pub(crate) async fn spawn(
             Duration::from_millis(cfg.popup.show_delay_ms),
             Duration::from_millis(cfg.popup.min_display_ms),
         ),
-        placement: outputs.popups.is_some().then(|| Placement::new(&cfg.popup)),
+        placement: outputs
+            .popups
+            .is_some()
+            .then(|| Placement::new(&cfg.popup, cfg.reduced_motion)),
         popups: outputs.popups,
         reconnect: None,
         reopening: None,
@@ -232,9 +236,7 @@ pub(crate) async fn probe() -> Capabilities {
 const RECONNECT_MIN: Duration = Duration::from_secs(1);
 /// Longest wait between attempts to reopen a lost display connection.
 const RECONNECT_MAX: Duration = Duration::from_secs(60);
-/// A connection lost sooner than this after it was reopened keeps backing
-/// off, so a compositor that drops clients right away is not retried every
-/// second.
+/// Connections lost within this interval retain the reconnect backoff.
 const RECONNECT_STABLE: Duration = Duration::from_secs(30);
 
 /// When to try reopening a lost display connection next.
@@ -296,6 +298,11 @@ impl App {
         {
             self.lose_popups(&err);
         }
+        if let Some(output) = &mut self.popups
+            && let Err(err) = output.animate(now)
+        {
+            self.lose_popups(&err);
+        }
         if let Some(retry) = self.reconnect
             && retry.at <= now
         {
@@ -321,8 +328,8 @@ impl App {
     /// Takes the result of an attempt to reopen popups: shows the visible
     /// prompts again on the new connection, or schedules the next attempt.
     ///
-    /// Overlays went with the lost connection, so waiting prompts get new
-    /// ones with a new time limit, even when a click had dismissed them.
+    /// Restored waiting prompts receive new overlays and time limits,
+    /// including prompts previously dismissed by a click.
     #[instrument(level = "debug", skip_all)]
     async fn finish_reopen(&mut self, opened: Result<Option<PopupOutput>, JoinError>) {
         self.reopening = None;
@@ -396,12 +403,13 @@ impl App {
             .popups
             .as_ref()
             .and_then(PopupOutput::next_overlay_deadline);
+        let frame = self.popups.as_ref().and_then(PopupOutput::next_frame);
         // While an attempt runs, its result wakes the loop instead.
         let reconnect = self
             .reconnect
             .filter(|_| self.reopening.is_none())
             .map(|retry| retry.at);
-        [self.timing.next_deadline(), overlays, reconnect]
+        [self.timing.next_deadline(), overlays, frame, reconnect]
             .into_iter()
             .flatten()
             .min()
@@ -626,7 +634,7 @@ impl Outputs {
             .collect();
         let wants = |wanted: &[OutputMode]| modes.iter().any(|mode| wanted.contains(mode));
         let popups = if wants(&[OutputMode::Popup, OutputMode::Both]) {
-            PopupOutput::open(&Placement::new(&cfg.popup)).await
+            PopupOutput::open(&Placement::new(&cfg.popup, cfg.reduced_motion)).await
         } else {
             None
         };
@@ -679,7 +687,10 @@ mod tests {
         App {
             timing: Timing::new(Duration::ZERO, Duration::ZERO),
             popups: None,
-            placement: Some(Placement::new(&touchcue_core::config::Popup::default())),
+            placement: Some(Placement::new(
+                &touchcue_core::config::Popup::default(),
+                false,
+            )),
             reconnect: None,
             reopening: None,
             backoff: RECONNECT_MIN,
@@ -692,6 +703,11 @@ mod tests {
 
     fn lost() -> OutputError {
         OutputError::Wayland(wayland::WaylandIoError::Io(std::io::Error::other("lost")))
+    }
+
+    #[test]
+    fn idle_app_has_no_deadline() {
+        assert_eq!(disconnected_app().next_deadline(), None);
     }
 
     #[tokio::test]
@@ -761,8 +777,7 @@ mod tests {
         NoDisplay,
     }
 
-    /// Runs [`probe`] in a child process without a Wayland or session bus
-    /// environment, so this process's environment is never mutated.
+    /// Runs the probe in a child process with the Wayland and session-bus environment removed.
     #[test]
     fn probe_without_desktop_does_not_panic() -> Result<(), TestError> {
         let mut child = std::process::Command::new(std::env::current_exe()?)
@@ -797,7 +812,7 @@ mod tests {
             return;
         }
         let caps = probe().await;
-        // The session bus falls back to /run/user/<uid>/bus, so only Wayland is predictable.
+        // The session bus can fall back to /run/user/<uid>/bus; this covers Wayland only.
         assert!(!caps.wayland && !caps.layer_shell);
     }
 
@@ -928,7 +943,7 @@ mod tests {
             modal: true,
             ..touchcue_core::config::Popup::default()
         };
-        let mut output = PopupOutput::open(&Placement::new(&popup))
+        let mut output = PopupOutput::open(&Placement::new(&popup, false))
             .await
             .ok_or(TestError::NoDisplay)?;
         let second = |state| prompt(2, "Second prompt", "stacked below the first", state);
