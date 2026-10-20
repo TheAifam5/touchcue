@@ -48,6 +48,8 @@ pub enum Command {
     Gpg(Gpg),
     /// Answer an OpenSSH askpass prompt
     Askpass(Askpass),
+    /// Run gpg-agent's pinentry and report whom its PIN dialogs serve
+    Pinentry(Pinentry),
 }
 
 /// Answer an OpenSSH askpass prompt
@@ -65,6 +67,24 @@ pub struct Askpass {
         help = "The prompt OpenSSH passes"
     )]
     pub message: Vec<String>,
+}
+
+/// Run gpg-agent's pinentry and report whom its PIN dialogs serve
+///
+/// Set `pinentry-program` in gpg-agent.conf to a link to touchcue named
+/// `touchcue-pinentry`. The real pinentry is `$TOUCHCUE_PINENTRY` or
+/// `pinentry` on `PATH`. `touchcue pinentry` forwards its arguments unparsed;
+/// `pinentry` must be the first argument, with no global option before it.
+#[derive(Debug, Clone, PartialEq, Eq, usage::Args)]
+#[usage(crate = usage, unknown_flags = "value")]
+pub struct Pinentry {
+    #[usage(
+        arg,
+        value_name = "ARGS",
+        double_dash = "automatic",
+        help = "Arguments for the real pinentry"
+    )]
+    pub args: Vec<String>,
 }
 
 /// Set up touch detection for gpg and ssh through gpg-agent
@@ -129,6 +149,22 @@ mod tests {
                 message: vec![
                     "Confirm user presence\nfor key".to_owned(),
                     "--help".to_owned()
+                ]
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn pinentry_takes_arguments_unparsed() -> Result<(), usage::Error<'static, 'static>> {
+        assert_eq!(
+            parse(&["pinentry", "--display", ":0", "--help", "--unknown"])?.command,
+            Command::Pinentry(Pinentry {
+                args: vec![
+                    "--display".to_owned(),
+                    ":0".to_owned(),
+                    "--help".to_owned(),
+                    "--unknown".to_owned(),
                 ]
             })
         );

@@ -44,6 +44,9 @@ Stop gpg\-agent from running touchcue as its scdaemon
 .TP
 \fBaskpass\fR
 Answer an OpenSSH askpass prompt
+.TP
+\fBpinentry\fR
+Run gpg\-agent's pinentry and report whom its PIN dialogs serve
 .SH "TOUCHCUE RUN"
 Run the daemon in the foreground
 .PP
@@ -134,3 +137,20 @@ Print help
 .TP
 \fB<MESSAGE>\fR
 The prompt OpenSSH passes
+.SH "TOUCHCUE PINENTRY"
+Run gpg\-agent's pinentry and report whom its PIN dialogs serve
+
+Set `pinentry\-program` in gpg\-agent.conf to a link to touchcue named `touchcue\-pinentry`. The real pinentry is `$TOUCHCUE_PINENTRY` or `pinentry` on `PATH`. `touchcue pinentry` forwards its arguments unparsed; `pinentry` must be the first argument, with no global option before it.
+.PP
+\fBUsage:\fR touchcue pinentry [OPTIONS] [<ARGS>] ...
+.PP
+\fBOptions:\fR
+.PP
+.TP
+\fB\-h, \-\-help\fR
+Print help
+\fBArguments:\fR
+.PP
+.TP
+\fB<ARGS>\fR
+Arguments for the real pinentry

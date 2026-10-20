@@ -44,6 +44,15 @@ OpenSSH runs the `SSH_ASKPASS` program with no extra arguments, so point it at a
     flag "-h --help" help="Print help" action=help builtin=#true
     arg "[MESSAGE]…" help="The prompt OpenSSH passes" required=#false double_dash=automatic var=#true
 }
+cmd pinentry help="Run gpg-agent's pinentry and report whom its PIN dialogs serve" unknown_flags=value {
+    long_help #"""
+Run gpg-agent's pinentry and report whom its PIN dialogs serve
+
+Set `pinentry-program` in gpg-agent.conf to a link to touchcue named `touchcue-pinentry`. The real pinentry is `$TOUCHCUE_PINENTRY` or `pinentry` on `PATH`. `touchcue pinentry` forwards its arguments unparsed; `pinentry` must be the first argument, with no global option before it.
+"""#
+    flag "-h --help" help="Print help" action=help builtin=#true
+    arg "[ARGS]…" help="Arguments for the real pinentry" required=#false double_dash=automatic var=#true
+}
 '##
     def touchcue_completer [spans: list<string>] {
         let spec_dir = ($env.XDG_CACHE_HOME? | default ($nu.home-dir? | default $nu.home-path? | path join ".cache") | path join "usage")

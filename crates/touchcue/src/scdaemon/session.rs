@@ -33,7 +33,7 @@ pub(super) enum Side {
 
 /// Queue of reports to the daemon, shared by every tracked connection.
 #[derive(Debug, Clone)]
-pub(super) struct Reporter {
+pub(crate) struct Reporter {
     queue: mpsc::Sender<Message>,
     next_seq: Arc<AtomicU32>,
 }
@@ -42,7 +42,7 @@ impl Reporter {
     /// Starts the task that delivers reports to the helper socket under
     /// `$XDG_RUNTIME_DIR`. The task ends once every `Reporter` is dropped
     /// and the queue is drained.
-    pub(super) fn spawn() -> (Self, JoinHandle<()>) {
+    pub(crate) fn spawn() -> (Self, JoinHandle<()>) {
         let (queue, receiver) = mpsc::channel(REPORT_QUEUE);
         let task = tokio::spawn(deliver(socket_path(), receiver));
         let reporter = Self {
@@ -52,12 +52,12 @@ impl Reporter {
         (reporter, task)
     }
 
-    fn next_seq(&self) -> u32 {
+    pub(crate) fn next_seq(&self) -> u32 {
         self.next_seq.fetch_add(1, Ordering::Relaxed)
     }
 
     /// Queues `message`, dropping it when the queue is full or closed.
-    fn send(&self, message: Message) {
+    pub(crate) fn send(&self, message: Message) {
         if let Err(error) = self.queue.try_send(message) {
             tracing::debug!(error = &error as &dyn std::error::Error, "report dropped");
         }

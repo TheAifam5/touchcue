@@ -63,9 +63,10 @@ const AGENT_TOOLS: &[&str] = &[
 /// as in `comm`; it proxies the agent sockets, so its clients are the
 /// requesters and it is attributed only when no client is found.
 const PROXY: &str = "yubikey-touch-d";
-/// Time an askpass notice stays usable without its end.
+/// Time an askpass notice or a pinentry owner stays usable without its end.
 const NOTICE_TTL: Duration = Duration::from_secs(30);
-/// Most askpass notices kept; the oldest is dropped for a new one.
+/// Most askpass notices, and most pinentry owners, kept; the oldest is
+/// dropped for a new one.
 const MAX_NOTICES: usize = 16;
 
 /// Destination of prompts and published events.
@@ -90,7 +91,9 @@ pub trait Sink {
 /// Source of the client processes and application of a request, and of
 /// the files of rule icons.
 pub trait Attribute {
-    async fn attribute(&mut self, request: &Request) -> Attribution;
+    /// Attributes `request`; `owners` are the pids of the usable pinentry
+    /// owners, newest first.
+    async fn attribute(&mut self, request: &Request, owners: &[u32]) -> Attribution;
     /// Returns the file of a rule's `icon`, an absolute path, a `~/` path or
     /// an icon name; `None` when none is found.
     async fn icon(&mut self, icon: &str) -> Option<String>;
@@ -132,8 +135,13 @@ pub enum Target {
     /// Processes holding this device node open; high confidence for one
     /// holder, medium for several.
     Node(PathBuf),
-    /// Processes connected to these gpg-agent sockets; medium confidence.
-    Agent(Vec<PathBuf>),
+    /// Processes connected to these gpg-agent sockets; high confidence for
+    /// a connected client among `owners`, the first such one in their
+    /// order, else medium.
+    Agent {
+        sockets: Vec<PathBuf>,
+        owners: Vec<u32>,
+    },
     /// No way to find the clients.
     None,
 }
@@ -187,12 +195,17 @@ impl SystemAttribution {
     }
 
     /// Returns where the clients of `request` are looked for: the agent
-    /// sockets for an `OpenPGP` card, else the device node.
-    fn target(&self, request: &Request) -> Target {
+    /// sockets with the pinentry `owners` for an `OpenPGP` card, else the
+    /// device node.
+    fn target(&self, request: &Request, owners: &[u32]) -> Target {
         if request.device.kind == DeviceKind::OpenPgp {
-            return self.agent.as_ref().map_or(Target::None, |agent| {
-                Target::Agent(vec![agent.agent.clone(), agent.ssh.clone()])
-            });
+            return self
+                .agent
+                .as_ref()
+                .map_or(Target::None, |agent| Target::Agent {
+                    sockets: vec![agent.agent.clone(), agent.ssh.clone()],
+                    owners: owners.to_vec(),
+                });
         }
         let node = PathBuf::from(&request.device.id.0);
         if node.is_absolute() {
@@ -247,7 +260,7 @@ impl Attribute for SystemAttribution {
         skip_all,
         fields(id = %request.id, device = %request.device.id.0)
     )]
-    async fn attribute(&mut self, request: &Request) -> Attribution {
+    async fn attribute(&mut self, request: &Request, owners: &[u32]) -> Attribution {
         let permit = match Arc::clone(&self.busy).try_acquire_owned() {
             Ok(permit) => permit,
             Err(TryAcquireError::NoPermits) => {
@@ -264,7 +277,7 @@ impl Attribute for SystemAttribution {
         };
         let resolver = Arc::clone(&self.resolver);
         let attribute = self.scan;
-        let target = self.target(request);
+        let target = self.target(request, owners);
         let span = tracing::Span::current();
         let task = tokio::task::spawn_blocking(move || {
             let _permit = permit;
@@ -352,7 +365,7 @@ fn attribute(resolver: &Resolver, target: &Target) -> Attribution {
             };
             (holders, confidence)
         }
-        Target::Agent(sockets) => agent_clients(resolver, sockets),
+        Target::Agent { sockets, owners } => agent_clients(resolver, sockets, owners),
         Target::None => (Vec::new(), Confidence::Low),
     };
     let Some(&(pid, start)) = clients.first() else {
@@ -364,7 +377,7 @@ fn attribute(resolver: &Resolver, target: &Target) -> Attribution {
             .iter()
             .flat_map(|&(pid, _)| resolver.lineage(pid))
             .collect(),
-        Target::Agent(_) | Target::None => Vec::new(),
+        Target::Agent { .. } | Target::None => Vec::new(),
     };
     lineage.sort_unstable();
     lineage.dedup();
@@ -409,12 +422,16 @@ fn millis(duration: Duration) -> u64 {
 }
 
 /// Returns the processes connected to `sockets`, without gpg-agent,
-/// scdaemon and touchcue, ranked by [`rank_clients`].
+/// scdaemon and touchcue, ordered by [`choose_clients`].
 ///
 /// Clients of the proxy of maximbaz/yubikey-touch-detector are connected to
 /// sockets bound at the same paths, so they are found directly. The proxy
 /// itself is returned, at low confidence, only when no other client is.
-fn agent_clients(resolver: &Resolver, sockets: &[PathBuf]) -> (Vec<(u32, u64)>, Confidence) {
+fn agent_clients(
+    resolver: &Resolver,
+    sockets: &[PathBuf],
+    owners: &[u32],
+) -> (Vec<(u32, u64)>, Confidence) {
     let paths: Vec<&Path> = sockets.iter().map(PathBuf::as_path).collect();
     let connections = match sockdiag::connections(&paths) {
         Ok(connections) => connections,
@@ -443,12 +460,36 @@ fn agent_clients(resolver: &Resolver, sockets: &[PathBuf]) -> (Vec<(u32, u64)>, 
         connections = connections.len(),
         clients = clients.len(),
         proxies = proxies.len(),
+        owners = owners.len(),
         "gpg-agent clients"
     );
+    choose_clients(clients, proxies, owners)
+}
+
+/// Orders the gpg-agent `clients` by [`rank_clients`] and moves the first
+/// of `owners` among them to the front at high confidence; without such an
+/// owner the confidence is medium. Without clients, returns the ranked
+/// `proxies` at low confidence.
+fn choose_clients(
+    clients: Vec<(u32, u64, bool)>,
+    proxies: Vec<(u32, u64, bool)>,
+    owners: &[u32],
+) -> (Vec<(u32, u64)>, Confidence) {
     if clients.is_empty() {
-        (rank_clients(proxies), Confidence::Low)
-    } else {
-        (rank_clients(clients), Confidence::Medium)
+        return (rank_clients(proxies), Confidence::Low);
+    }
+    let mut ranked = rank_clients(clients);
+    let owner = owners
+        .iter()
+        .find_map(|&owner| ranked.iter().position(|&(pid, _)| pid == owner));
+    match owner {
+        Some(index) => {
+            let client = ranked.remove(index);
+            tracing::debug!(pid = client.0, "pinentry owner is a connected client");
+            ranked.insert(0, client);
+            (ranked, Confidence::High)
+        }
+        None => (ranked, Confidence::Medium),
     }
 }
 
@@ -490,6 +531,11 @@ struct Cached {
 /// An askpass notice only enriches requests: a request whose attributed
 /// lineage contains the notice's pid gets the notice's detail, whether the
 /// notice arrives before or after the request is attributed.
+///
+/// A pinentry owner only steers the attributions that start after it
+/// arrives or is refreshed, for [`NOTICE_TTL`], until one `OpenPGP`
+/// attribution uses it for high confidence or its dialog is disowned; a
+/// request already attributed keeps its attribution.
 pub struct Daemon<A, S> {
     machine: Machine,
     renderer: Renderer,
@@ -498,6 +544,8 @@ pub struct Daemon<A, S> {
     cache: BTreeMap<RequestId, Cached>,
     /// Askpass notices by pid: detail and arrival time.
     notices: BTreeMap<u32, (String, Instant)>,
+    /// Pinentry owners by pid: arrival time.
+    owners: BTreeMap<u32, Instant>,
 }
 
 impl<A: Attribute, S: Sink> Daemon<A, S> {
@@ -509,10 +557,11 @@ impl<A: Attribute, S: Sink> Daemon<A, S> {
             sink,
             cache: BTreeMap::new(),
             notices: BTreeMap::new(),
+            owners: BTreeMap::new(),
         }
     }
 
-    /// Applies an askpass notice received at `now`.
+    /// Applies an askpass notice or a pinentry owner notice received at `now`.
     pub async fn notice(&mut self, notice: Notice, now: Instant) {
         match notice {
             Notice::Started { pid, detail } => {
@@ -551,7 +600,55 @@ impl<A: Attribute, S: Sink> Daemon<A, S> {
             Notice::Ended { pid } => {
                 self.notices.remove(&pid);
             }
+            Notice::Owner { pid } => {
+                self.owners
+                    .retain(|_, at| now.saturating_duration_since(*at) < NOTICE_TTL);
+                if self.owners.len() >= MAX_NOTICES && !self.owners.contains_key(&pid) {
+                    let oldest = self
+                        .owners
+                        .iter()
+                        .min_by_key(|&(_, at)| *at)
+                        .map(|(p, _)| *p);
+                    if let Some(oldest) = oldest {
+                        tracing::debug!(pid = oldest, "pinentry owner dropped for a newer one");
+                        self.owners.remove(&oldest);
+                    }
+                }
+                tracing::debug!(pid, "pinentry owner");
+                self.owners.insert(pid, now);
+            }
+            Notice::Disowned { pid } => {
+                tracing::debug!(pid, "pinentry owner disowned");
+                self.owners.remove(&pid);
+            }
         }
+    }
+
+    /// Returns the pids of the pinentry owners usable at `now`, newest first.
+    fn live_owners(&self, now: Instant) -> Vec<u32> {
+        let mut live: Vec<(u32, Instant)> = self
+            .owners
+            .iter()
+            .filter(|&(_, at)| now.saturating_duration_since(*at) < NOTICE_TTL)
+            .map(|(&pid, &at)| (pid, at))
+            .collect();
+        live.sort_by_key(|&(_, at)| std::cmp::Reverse(at));
+        live.into_iter().map(|(pid, _)| pid).collect()
+    }
+
+    /// Attributes `request` with the owners usable at `now`. An owner that
+    /// lifts an `OpenPGP` request to high confidence is used up.
+    async fn attribute_with_owners(&mut self, request: &Request, now: Instant) -> Attribution {
+        let owners = self.live_owners(now);
+        let attribution = self.attribute.attribute(request, &owners).await;
+        if request.device.kind == DeviceKind::OpenPgp
+            && attribution.confidence == Confidence::High
+            && let Some(pid) = attribution.pids.first()
+            && self.owners.remove(pid).is_some()
+        {
+            tracing::debug!(pid, "pinentry owner used");
+        }
+        attribution
     }
 
     /// Sets the detail of the notice matching `lineage` on request `id` and
@@ -624,7 +721,7 @@ impl<A: Attribute, S: Sink> Daemon<A, S> {
     async fn handle(&mut self, event: Event, now: Instant) {
         match event {
             Event::Started(request) => {
-                let attribution = self.attribute.attribute(&request).await;
+                let attribution = self.attribute_with_owners(&request, now).await;
                 let request = self.assign(request, &attribution);
                 let request = self.with_detail(request, &attribution, now);
                 self.cache.insert(
@@ -644,7 +741,7 @@ impl<A: Attribute, S: Sink> Daemon<A, S> {
                     .get(&request.id)
                     .is_none_or(|cached| request.count > cached.count);
                 let request = if stale {
-                    let attribution = self.attribute.attribute(&request).await;
+                    let attribution = self.attribute_with_owners(&request, now).await;
                     let request = self.assign(request, &attribution);
                     let request = self.with_detail(request, &attribution, now);
                     let cached = self.cache.entry(request.id).or_insert(Cached {
@@ -1083,13 +1180,14 @@ mod tests {
         }
     }
 
-    /// Returns `firefox()` and counts the calls.
+    /// Returns `firefox()`, counts the calls and keeps the last owners.
     #[derive(Default)]
-    struct Fixed(u32);
+    struct Fixed(u32, Vec<u32>);
 
     impl Attribute for Fixed {
-        fn attribute(&mut self, _: &Request) -> impl Future<Output = Attribution> {
+        fn attribute(&mut self, _: &Request, owners: &[u32]) -> impl Future<Output = Attribution> {
             self.0 = self.0.saturating_add(1);
+            self.1 = owners.to_vec();
             std::future::ready(firefox())
         }
 
@@ -1341,6 +1439,54 @@ mod tests {
         assert_eq!(
             rank_clients(vec![shell, older_gpg, editor, gpg]),
             [(11, 500), (12, 400), (10, 900), (13, 100)]
+        );
+    }
+
+    #[test]
+    fn connected_pinentry_owner_is_the_client_at_high_confidence() {
+        let editor = (10, 900, false);
+        let gpg = (11, 500, true);
+        let git = (12, 400, false);
+        let (clients, confidence) =
+            choose_clients(vec![editor, gpg, git], Vec::new(), &[99, 12, 10]);
+        assert_eq!(clients, [(12, 400), (11, 500), (10, 900)]);
+        assert_eq!(confidence, Confidence::High);
+    }
+
+    #[test]
+    fn unconnected_pinentry_owner_leaves_the_ranking() {
+        let editor = (10, 900, false);
+        let gpg = (11, 500, true);
+        let proxy = (20, 100, false);
+        let (clients, confidence) = choose_clients(vec![editor, gpg], vec![proxy], &[99]);
+        assert_eq!(clients, [(11, 500), (10, 900)]);
+        assert_eq!(confidence, Confidence::Medium);
+        let (clients, confidence) = choose_clients(Vec::new(), vec![proxy], &[20]);
+        assert_eq!(clients, [(20, 100)]);
+        assert_eq!(confidence, Confidence::Low);
+    }
+
+    #[test]
+    fn openpgp_target_carries_the_owners() {
+        let resolver = Resolver::new(PathBuf::from("/nonexistent"), Vec::new(), 64);
+        let agent = AgentPaths {
+            agent: PathBuf::from("/run/S.gpg-agent"),
+            ssh: PathBuf::from("/run/S.gpg-agent.ssh"),
+            homedir: PathBuf::from("/nonexistent"),
+        };
+        let attribution =
+            SystemAttribution::with_scan(resolver, Some(agent), attribute, ATTRIBUTION_TIMEOUT);
+        let mut request = request(RequestState::Waiting);
+        request.device.kind = DeviceKind::OpenPgp;
+        assert_eq!(
+            attribution.target(&request, &[7, 5]),
+            Target::Agent {
+                sockets: vec![
+                    PathBuf::from("/run/S.gpg-agent"),
+                    PathBuf::from("/run/S.gpg-agent.ssh"),
+                ],
+                owners: vec![7, 5],
+            }
         );
     }
 
@@ -1621,16 +1767,16 @@ mod tests {
         let mut attribution = SystemAttribution::with_scan(resolver, None, slow_scan, MS * 20);
         let request = request(RequestState::Waiting);
         assert_eq!(
-            attribution.attribute(&request).await,
+            attribution.attribute(&request, &[]).await,
             Attribution::default()
         );
         assert_eq!(
-            attribution.attribute(&request).await,
+            attribution.attribute(&request, &[]).await,
             Attribution::default()
         );
         assert!(idle(&attribution).await, "the abandoned scan never ended");
         assert_eq!(SLOW_SCANS.load(std::sync::atomic::Ordering::SeqCst), 1);
-        attribution.attribute(&request).await;
+        attribution.attribute(&request, &[]).await;
         assert!(idle(&attribution).await, "the second scan never ended");
         assert_eq!(SLOW_SCANS.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
@@ -1826,6 +1972,95 @@ mod tests {
         d.notice(notice(42), base).await;
         d.signal(pending(1), base + NOTICE_TTL).await;
         assert_eq!(detail(d.sink.values.last()), None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pinentry_owners_reach_the_attribution_newest_first() -> TestResult {
+        let mut d = daemon("")?;
+        let base = Instant::now();
+        d.notice(Notice::Owner { pid: 5 }, base).await;
+        d.notice(Notice::Owner { pid: 7 }, base + MS * 10).await;
+        d.signal(pending(1), base + MS * 20).await;
+        assert_eq!(d.attribute.1, [7, 5]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn expired_pinentry_owner_is_ignored() -> TestResult {
+        let mut d = daemon("")?;
+        let base = Instant::now();
+        d.notice(Notice::Owner { pid: 5 }, base).await;
+        d.notice(Notice::Owner { pid: 7 }, base + MS * 10).await;
+        d.signal(pending(1), base + NOTICE_TTL).await;
+        assert_eq!(d.attribute.1, [7]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn oldest_pinentry_owner_is_dropped_beyond_the_cap() -> TestResult {
+        let mut d = daemon("")?;
+        let mut at = Instant::now();
+        let newest: u32 = 16;
+        assert_eq!(MAX_NOTICES, 16);
+        for pid in 0..=newest {
+            d.notice(Notice::Owner { pid }, at).await;
+            at += MS;
+        }
+        d.signal(pending(1), at).await;
+        assert_eq!(d.attribute.1.len(), MAX_NOTICES);
+        assert!(!d.attribute.1.contains(&0), "the oldest owner was kept");
+        assert_eq!(d.attribute.1.first(), Some(&newest));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn disowned_pinentry_owner_is_ignored() -> TestResult {
+        let mut d = daemon("")?;
+        let base = Instant::now();
+        d.notice(Notice::Owner { pid: 5 }, base).await;
+        d.notice(Notice::Disowned { pid: 5 }, base + MS * 10).await;
+        d.signal(pending(1), base + MS * 20).await;
+        assert_eq!(d.attribute.1, [] as [u32; 0]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn confirmed_pinentry_owner_is_refreshed() -> TestResult {
+        let mut d = daemon("")?;
+        let base = Instant::now();
+        let confirmed = base + NOTICE_TTL + MS * 1000;
+        d.notice(Notice::Owner { pid: 5 }, base).await;
+        d.notice(Notice::Owner { pid: 5 }, confirmed).await;
+        d.signal(pending(1), confirmed + MS * 10).await;
+        assert_eq!(d.attribute.1, [5]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pinentry_owner_is_used_up_by_a_high_openpgp_attribution() -> TestResult {
+        let openpgp = |channel, kind| {
+            let mut signal = signal(channel, kind);
+            signal.device.kind = DeviceKind::OpenPgp;
+            signal
+        };
+        let pending = SignalKind::Pending {
+            method: Method::OpenPgp,
+            op: None,
+        };
+        let mut d = daemon("")?;
+        let base = Instant::now();
+        d.notice(Notice::Owner { pid: 42 }, base).await;
+        d.signal(openpgp(1, pending), base + MS * 10).await;
+        assert_eq!(d.attribute.1, [42]);
+        d.signal(
+            openpgp(1, SignalKind::Resolved(Outcome::Touched)),
+            base + MS * 20,
+        )
+        .await;
+        d.signal(openpgp(2, pending), base + MS * 30).await;
+        assert_eq!(d.attribute.0, 2);
+        assert_eq!(d.attribute.1, [] as [u32; 0]);
         Ok(())
     }
 }

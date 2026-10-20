@@ -10,7 +10,7 @@ use tokio::runtime::Runtime;
 #[cfg(target_os = "linux")]
 use touchcue::cli::GpgCommand;
 use touchcue::cli::{Cli, Command};
-use touchcue::{askpass, scdaemon};
+use touchcue::{askpass, pinentry, scdaemon};
 use tracing::{Event, Subscriber};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::format::Writer;
@@ -30,6 +30,10 @@ mod motion;
 
 /// File name under which touchcue runs as OpenSSH's `SSH_ASKPASS` program.
 const ASKPASS_NAME: &str = "touchcue-askpass";
+/// File name under which touchcue runs as gpg-agent's pinentry.
+const PINENTRY_NAME: &str = "touchcue-pinentry";
+/// Start of every log line of the pinentry wrapper.
+const PINENTRY_LOG_PREFIX: &str = "touchcue-pinentry: ";
 /// Start of every log line of the scdaemon wrapper.
 const SCDAEMON_LOG_PREFIX: &str = "touchcue-scdaemon: ";
 /// Environment variable holding a `tracing` filter that overrides `-v`.
@@ -45,12 +49,9 @@ fn main() -> Result<ExitCode> {
     let mut command_line = env::args_os();
     let program = command_line.next();
     let args: Vec<OsString> = command_line.collect();
-    // Checked before parsing: scdaemon's arguments are gpg-agent's, and an
-    // askpass message is free text that must not be parsed as flags.
-    if scdaemon::is_invocation(&args) {
-        init_scdaemon_logging();
-        return scdaemon::run(&args).context("scdaemon wrapper failed");
-    }
+    // Checked before parsing: scdaemon's and pinentry's arguments are
+    // gpg-agent's, and an askpass message is free text that must not be
+    // parsed as flags.
     if program
         .as_deref()
         .map(Path::new)
@@ -58,6 +59,13 @@ fn main() -> Result<ExitCode> {
         .is_some_and(|name| name == ASKPASS_NAME)
     {
         return askpass::run(&args).context("askpass failed");
+    }
+    if let Some(code) = pinentry_invocation(program.as_deref(), &args) {
+        return Ok(code);
+    }
+    if scdaemon::is_invocation(&args) {
+        init_scdaemon_logging();
+        return scdaemon::run(&args).context("scdaemon wrapper failed");
     }
     if let Some((first, message)) = args.split_first()
         && first == "askpass"
@@ -126,11 +134,79 @@ fn main() -> Result<ExitCode> {
             let message: Vec<OsString> = command.message.into_iter().map(OsString::from).collect();
             askpass::run(&message).context("askpass failed")
         }
+        Command::Pinentry(_) => anyhow::bail!("`pinentry` must be the first argument"),
         #[cfg(not(target_os = "linux"))]
         Command::Run | Command::ListDevices | Command::Trace | Command::Gpg(_) => {
             eprintln!("touchcue: not supported on this platform yet");
             Ok(ExitCode::from(2))
         }
+    }
+}
+
+fn pinentry_invocation(program: Option<&std::ffi::OsStr>, args: &[OsString]) -> Option<ExitCode> {
+    let forwarded = if program
+        .map(Path::new)
+        .and_then(Path::file_name)
+        .is_some_and(|name| name == PINENTRY_NAME)
+    {
+        args
+    } else {
+        let (first, rest) = args.split_first()?;
+        if first != "pinentry" {
+            return None;
+        }
+        rest
+    };
+    init_pinentry_logging();
+    Some(run_pinentry(forwarded))
+}
+
+/// Runs pinentry, logging a startup failure on stderr.
+fn run_pinentry(args: &[OsString]) -> ExitCode {
+    match pinentry::run(args) {
+        Ok(code) => code,
+        Err(error) => {
+            tracing::error!(
+                error = &error as &dyn std::error::Error,
+                "pinentry wrapper failed"
+            );
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Logs pinentry diagnostics without timestamps or terminal escapes.
+fn init_pinentry_logging() {
+    let format = tracing_subscriber::fmt::format()
+        .without_time()
+        .with_ansi(false);
+    let result = tracing_subscriber::fmt()
+        .with_env_filter(log_filter("warn"))
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .event_format(PinentryPrefixed(format))
+        .try_init();
+    if let Err(error) = result {
+        eprintln!("{PINENTRY_LOG_PREFIX}cannot initialize logging: {error}");
+    }
+}
+
+struct PinentryPrefixed<F>(F);
+
+impl<S, N, F> FormatEvent<S, N> for PinentryPrefixed<F>
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+    N: for<'a> FormatFields<'a> + 'static,
+    F: FormatEvent<S, N>,
+{
+    fn format_event(
+        &self,
+        ctx: &FmtContext<'_, S, N>,
+        mut writer: Writer<'_>,
+        event: &Event<'_>,
+    ) -> std::fmt::Result {
+        writer.write_str(PINENTRY_LOG_PREFIX)?;
+        self.0.format_event(ctx, writer, event)
     }
 }
 

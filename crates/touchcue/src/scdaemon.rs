@@ -22,7 +22,7 @@
 #[cfg(target_os = "linux")]
 mod proxy;
 #[cfg(target_os = "linux")]
-mod session;
+pub(crate) mod session;
 pub mod tracker;
 
 use std::ffi::OsString;

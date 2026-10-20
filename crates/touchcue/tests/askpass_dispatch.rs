@@ -37,9 +37,11 @@ fn askpass_link_passes_the_message_through() -> Result<(), TestError> {
     let dir = tempfile::tempdir()?;
     let link = dir.path().join("touchcue-askpass");
     symlink(env!("CARGO_BIN_EXE_touchcue"), &link)?;
-    let output = run(dir.path(), &link, &[MESSAGE])?;
-    assert!(output.status.success(), "{output:?}");
-    assert_eq!(output.stdout, b"--help\n");
+    for message in [MESSAGE, "pinentry"] {
+        let output = run(dir.path(), &link, &[message])?;
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, format!("{message}\n").as_bytes());
+    }
     Ok(())
 }
 

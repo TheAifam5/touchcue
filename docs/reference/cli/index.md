@@ -21,3 +21,4 @@
 - [`touchcue gpg install`](/reference/cli/gpg/install.md)
 - [`touchcue gpg uninstall [--restore-backup]`](/reference/cli/gpg/uninstall.md)
 - [`touchcue askpass [MESSAGE]…`](/reference/cli/askpass.md)
+- [`touchcue pinentry [ARGS]…`](/reference/cli/pinentry.md)
