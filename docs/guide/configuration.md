@@ -70,7 +70,7 @@ extend_skip = []
 
 `mode` is used when the desktop supports it, else `fallback`, else nothing is shown.
 
-- `popup` shows an overlay popup that takes no input focus. It uses Wayland layer-shell when `WAYLAND_DISPLAY` or `WAYLAND_SOCKET` is set and the compositor supports it, else X11 when `DISPLAY` is set, which includes XWayland.
+- `popup` shows an overlay popup that takes no input focus. It uses Wayland layer-shell when `WAYLAND_DISPLAY` or `WAYLAND_SOCKET` is set and the compositor supports it, else X11 when `DISPLAY` is set, which includes XWayland. When the display connection is lost, for example because the compositor restarted, touchcue reconnects as it started, through `WAYLAND_DISPLAY`, else `DISPLAY`, first after 1 second and then less often, up to once a minute, and shows the prompts still visible again. It does not follow a compositor that comes back under another socket name, and may then reconnect through `DISPLAY` to XWayland.
 - `notification` sends a desktop notification over D-Bus; the notification server draws it, here mako:
 
   ![A mako notification: Touch your security key, Browser is waiting for a passkey](/screenshots/notification.png)
