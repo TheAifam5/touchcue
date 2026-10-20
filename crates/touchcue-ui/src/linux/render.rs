@@ -261,6 +261,14 @@ impl OutlinePen for Pen {
     }
 }
 
+/// A rendered popup.
+pub(crate) struct Rendered {
+    /// Pixels at the scale it was rendered at.
+    pub(crate) pixmap: Pixmap,
+    /// Height in logical pixels; the width is [`WIDTH`].
+    pub(crate) height: u32,
+}
+
 /// Renders a popup [`WIDTH`] logical pixels wide with the height its text
 /// needs, at `scale` device pixels per logical pixel.
 ///
@@ -271,7 +279,7 @@ pub(crate) fn render(
     body: &str,
     icon: Option<&Pixmap>,
     scale: f32,
-) -> Option<Pixmap> {
+) -> Option<Rendered> {
     let root = Transform::from_scale(scale, scale);
     let text_x = if icon.is_some() {
         PADDING + ICON_F + ICON_GAP
@@ -307,7 +315,8 @@ pub(crate) fn render(
         }
         None => 0.0,
     };
-    let height = PADDING * 2.0 + text_height.max(ICON_F);
+    // A whole logical height keeps an integer scale's buffer an exact multiple.
+    let height = (PADDING * 2.0 + text_height.max(ICON_F)).ceil();
     let mut pixmap = Pixmap::new(pixels(WIDTH_F * scale), pixels(height * scale))?;
 
     let frame = rounded_rect(0.5, 0.5, WIDTH_F - 1.0, height - 1.0, RADIUS)?;
@@ -325,6 +334,9 @@ pub(crate) fn render(
 
     if let Some(icon) = icon {
         let top = PADDING + (height - PADDING * 2.0 - ICON_F) / 2.0;
+        // The icon spans ICON_F logical pixels whatever its pixel size, so an
+        // icon loaded at the device scale is drawn pixel for pixel.
+        let fit = ICON_F / side(icon.width());
         pixmap.draw_pixmap(
             0,
             0,
@@ -333,7 +345,7 @@ pub(crate) fn render(
                 quality: FilterQuality::Bilinear,
                 ..PixmapPaint::default()
             },
-            root.pre_translate(PADDING, top),
+            root.pre_translate(PADDING, top).pre_scale(fit, fit),
             None,
         );
     }
@@ -352,7 +364,10 @@ pub(crate) fn render(
             top += body_face.line_height;
         }
     }
-    Some(pixmap)
+    Some(Rendered {
+        pixmap,
+        height: pixels(height),
+    })
 }
 
 /// Copies premultiplied RGBA pixels into a `wl_shm` `Argb8888` buffer,
@@ -435,6 +450,15 @@ fn paint(color: [u8; 4]) -> Paint<'static> {
     paint
 }
 
+/// Converts an icon's side, at most four times [`ICON_F`], to `f32` exactly.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "icon sides are small enough to be exact"
+)]
+fn side(pixels: u32) -> f32 {
+    pixels.max(1) as f32
+}
+
 #[expect(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
@@ -448,6 +472,10 @@ fn pixels(length: f32) -> u32 {
 mod tests {
     use super::*;
 
+    #[derive(Debug, thiserror::Error)]
+    #[error("the popup was not rendered")]
+    struct NotRendered;
+
     #[test]
     fn opaque_red_becomes_bgra() {
         let mut dst = [0_u8; 8];
@@ -456,10 +484,27 @@ mod tests {
     }
 
     #[test]
+    fn every_scale_keeps_the_logical_size() -> Result<(), NotRendered> {
+        let logical = render(None, "title", "body", None, 1.0).ok_or(NotRendered)?;
+        for scale in [0.75_f32, 0.8, 1.0, 1.25, 1.5, 1.75, 2.0, 3.0] {
+            let scaled = render(None, "title", "body", None, scale).ok_or(NotRendered)?;
+            assert_eq!(scaled.height, logical.height, "scale {scale}");
+            assert_eq!(
+                scaled.pixmap.height(),
+                pixels(side(logical.height) * scale),
+                "scale {scale}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn renders_without_font_or_icon() {
-        let size = render(None, "title", "body", None, 1.0).map(|p| (p.width(), p.height()));
+        let size = render(None, "title", "body", None, 1.0)
+            .map(|rendered| (rendered.pixmap.width(), rendered.pixmap.height()));
         assert_eq!(size, Some((WIDTH, pixels(PADDING * 2.0 + ICON_F))));
-        let doubled = render(None, "title", "body", None, 2.0).map(|p| (p.width(), p.height()));
+        let doubled = render(None, "title", "body", None, 2.0)
+            .map(|rendered| (rendered.pixmap.width(), rendered.pixmap.height()));
         assert_eq!(
             doubled,
             Some((WIDTH * 2, pixels((PADDING * 2.0 + ICON_F) * 2.0)))

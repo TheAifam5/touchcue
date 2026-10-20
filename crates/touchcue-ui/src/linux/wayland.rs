@@ -22,6 +22,8 @@ use smithay_client_toolkit::reexports::protocols::wp::cursor_shape::v1::client::
     Shape, WpCursorShapeDeviceV1,
 };
 use smithay_client_toolkit::reexports::protocols::wp::single_pixel_buffer::v1::client::wp_single_pixel_buffer_manager_v1::WpSinglePixelBufferManagerV1;
+use smithay_client_toolkit::reexports::protocols::wp::fractional_scale::v1::client::wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1;
+use smithay_client_toolkit::reexports::protocols::wp::fractional_scale::v1::client::wp_fractional_scale_v1::{self, WpFractionalScaleV1};
 use smithay_client_toolkit::reexports::protocols::wp::viewporter::client::wp_viewport::WpViewport;
 use smithay_client_toolkit::reexports::protocols::wp::viewporter::client::wp_viewporter::WpViewporter;
 use smithay_client_toolkit::seat::pointer::cursor_shape::CursorShapeManager;
@@ -43,10 +45,10 @@ use touchcue_core::{RateLimit, RequestId};
 use tracing::{debug, instrument, warn};
 
 use super::WARN_INTERVAL;
-use super::icon::{ICON_DEADLINE, IconLoader};
+use super::icon::{ICON_DEADLINE, IconLoader, icon_pixels};
 use super::modal::OverlayClock;
 use super::placement::{Placement, hyprland_cursor_output, matching, stack};
-use super::render::{FontState, WIDTH, copy_to_argb8888, render};
+use super::render::{FontState, Rendered, WIDTH, copy_to_argb8888, render};
 use crate::Prompt;
 use crate::text::display_body;
 
@@ -90,7 +92,17 @@ struct Surface {
     /// `None` lets the compositor pick the output.
     output: Option<wl_output::WlOutput>,
     layer: LayerSurface,
+    /// Drawn at `scale` device pixels per logical pixel.
     pixmap: Pixmap,
+    /// Logical height of the popup in `pixmap`.
+    height: u32,
+    scale: f64,
+    /// Scale the compositor prefers; differs from `scale` until re-rendered.
+    wanted: f64,
+    /// Reports the preferred fractional scale; set together with `viewport`.
+    fractional: Option<WpFractionalScaleV1>,
+    /// Shows the device-sized buffer at the logical size.
+    viewport: Option<WpViewport>,
     /// Size last requested with `set_size`; for centred popups, the size of
     /// the whole stack.
     size: (u32, u32),
@@ -126,6 +138,44 @@ impl Drop for Overlay {
         }
         if let Some(pixel) = self.pixel.take() {
             pixel.destroy();
+        }
+    }
+}
+
+impl Drop for Surface {
+    fn drop(&mut self) {
+        if let Some(fractional) = self.fractional.take() {
+            fractional.destroy();
+        }
+        if let Some(viewport) = self.viewport.take() {
+            viewport.destroy();
+        }
+    }
+}
+
+/// Globals that render popups at fractional scales.
+struct Fractional {
+    manager: WpFractionalScaleManagerV1,
+    viewporter: WpViewporter,
+}
+
+/// Routes the preferred scale of a popup surface to the popups.
+struct ScaleData;
+
+impl Dispatch2<WpFractionalScaleV1, Popups> for ScaleData {
+    fn event(
+        &self,
+        state: &mut Popups,
+        proxy: &WpFractionalScaleV1,
+        event: wp_fractional_scale_v1::Event,
+        _: &Connection,
+        _: &QueueHandle<Popups>,
+    ) {
+        if let wp_fractional_scale_v1::Event::PreferredScale { scale } = event {
+            state.prefer_scale(
+                |surface| surface.fractional.as_ref() == Some(proxy),
+                f64::from(scale) / 120.0,
+            );
         }
     }
 }
@@ -170,6 +220,13 @@ pub(crate) struct Popups {
     modal_pool: Option<SlotPool>,
     /// `None` when the compositor lacks a global or popups are not modal.
     single_pixel: Option<SinglePixel>,
+    /// `None` when the compositor lacks fractional-scale-v1 or viewporter;
+    /// popups then use integer buffer scales.
+    fractional: Option<Fractional>,
+    /// Last prompt shown for each request, to render it again at a new scale.
+    prompts: BTreeMap<RequestId, Prompt>,
+    /// Requests with a popup whose preferred scale changed since it was drawn.
+    rescale: BTreeSet<RequestId>,
     qh: QueueHandle<Self>,
     placement: Placement,
     font: FontState,
@@ -361,6 +418,22 @@ impl Popups {
         } else {
             None
         };
+        let fractional = match (
+            globals.bind::<WpFractionalScaleManagerV1, _, _>(&qh, 1..=1, OverlayData),
+            globals.bind::<WpViewporter, _, _>(&qh, 1..=1, OverlayData),
+        ) {
+            (Ok(manager), Ok(viewporter)) => Some(Fractional {
+                manager,
+                viewporter,
+            }),
+            (Err(err), _) | (_, Err(err)) => {
+                debug!(
+                    error = &err as &dyn std::error::Error,
+                    "fractional scaling unavailable; using integer buffer scales"
+                );
+                None
+            }
+        };
         Ok(Self {
             registry_state: RegistryState::new(globals),
             output_state: OutputState::new(globals, &qh),
@@ -371,6 +444,9 @@ impl Popups {
             pool,
             modal_pool: None,
             single_pixel,
+            fractional,
+            prompts: BTreeMap::new(),
+            rescale: BTreeSet::new(),
             qh,
             placement,
             font,
@@ -396,13 +472,18 @@ impl Popups {
             self.update(prompt, modal).await;
             return;
         }
-        let Some(pixmap) = self.render(prompt).await else {
+        let targets = self.targets().await;
+        let scales: Vec<f64> = targets
+            .iter()
+            .map(|output| self.output_scale(output.as_ref()))
+            .collect();
+        let Some(rendered) = self.render_scales(prompt, &scales).await else {
             self.warn_limit.log(Instant::now(), |suppressed| {
                 warn!(suppressed, "failed to render popup");
             });
             return;
         };
-        let targets = self.targets().await;
+        self.prompts.insert(prompt.id, prompt.clone());
         if modal {
             // Overlays are created first, so the popups stack above them.
             for output in &targets {
@@ -410,8 +491,27 @@ impl Popups {
             }
         }
         let mut surfaces = Vec::with_capacity(targets.len());
-        for output in targets {
+        for (output, scale) in targets.into_iter().zip(scales) {
+            let Some(popup) = pixmap_at(&rendered, scale) else {
+                continue;
+            };
+            let (pixmap, height) = (popup.pixmap.clone(), popup.height);
             let surface = self.compositor.create_surface(&self.qh);
+            let (fractional, viewport) = match &self.fractional {
+                Some(globals) => (
+                    Some(
+                        globals
+                            .manager
+                            .get_fractional_scale(&surface, &self.qh, ScaleData),
+                    ),
+                    Some(
+                        globals
+                            .viewporter
+                            .get_viewport(&surface, &self.qh, OverlayData),
+                    ),
+                ),
+                None => (None, None),
+            };
             let layer = self.layer_shell.create_layer_surface(
                 &self.qh,
                 surface,
@@ -432,7 +532,12 @@ impl Popups {
             surfaces.push(Surface {
                 output,
                 layer,
-                pixmap: pixmap.clone(),
+                pixmap,
+                height,
+                scale,
+                wanted: scale,
+                fractional,
+                viewport,
                 size: (0, 0),
                 canvas_y: 0,
                 configured: false,
@@ -442,9 +547,8 @@ impl Popups {
         }
         debug!(
             id = %prompt.id,
-            width = pixmap.width(),
-            height = pixmap.height(),
             outputs = surfaces.len(),
+            scales = ?rendered.iter().map(|(scale, _)| scale).collect::<Vec<_>>(),
             modal,
             "popup shown"
         );
@@ -464,7 +568,13 @@ impl Popups {
         if !self.surfaces.contains_key(&prompt.id) {
             return;
         }
-        let Some(pixmap) = self.render(prompt).await else {
+        self.prompts.insert(prompt.id, prompt.clone());
+        let scales: Vec<f64> = self
+            .surfaces
+            .get(&prompt.id)
+            .map(|surfaces| surfaces.iter().map(|surface| surface.scale).collect())
+            .unwrap_or_default();
+        let Some(rendered) = self.render_scales(prompt, &scales).await else {
             self.warn_limit.log(Instant::now(), |suppressed| {
                 warn!(suppressed, "failed to render popup");
             });
@@ -473,9 +583,16 @@ impl Popups {
         let Some(surfaces) = self.surfaces.get_mut(&prompt.id) else {
             return;
         };
-        debug!(id = %prompt.id, width = pixmap.width(), height = pixmap.height(), "popup updated");
+        debug!(
+            id = %prompt.id,
+            scales = ?rendered.iter().map(|(scale, _)| scale).collect::<Vec<_>>(),
+            "popup updated"
+        );
         for surface in surfaces.iter_mut() {
-            surface.pixmap = pixmap.clone();
+            if let Some(popup) = pixmap_at(&rendered, surface.scale) {
+                surface.pixmap = popup.pixmap.clone();
+                surface.height = popup.height;
+            }
         }
         // A new size takes effect with the next configure, which redraws.
         self.restack();
@@ -490,6 +607,8 @@ impl Popups {
     #[instrument(level = "debug", skip_all, fields(%id))]
     pub(crate) fn hide(&mut self, id: RequestId) {
         self.release(id);
+        self.prompts.remove(&id);
+        self.rescale.remove(&id);
         if self.surfaces.remove(&id).is_some() {
             debug!(id = %id, "popup hidden");
             self.restack();
@@ -504,6 +623,8 @@ impl Popups {
             "hiding all popups"
         );
         self.surfaces.clear();
+        self.prompts.clear();
+        self.rescale.clear();
         self.remove_overlays(|_| true);
         self.overlay_clock.clear();
     }
@@ -582,9 +703,15 @@ impl Popups {
         std::mem::take(&mut self.dismissed)
     }
 
-    async fn render(&mut self, prompt: &Prompt) -> Option<Pixmap> {
+    /// Renders the prompt at `scale` device pixels per logical pixel.
+    async fn render(&mut self, prompt: &Prompt, scale: f64) -> Option<Rendered> {
+        let scale = device_scale(scale);
         let icon = match prompt.icon.as_deref() {
-            Some(path) => self.icons.get(path).await,
+            // An icon cached at another size is drawn scaled until this size loads.
+            Some(path) => match self.icons.get(path, icon_pixels(scale)).await {
+                Some(icon) => Some(icon),
+                None => self.icons.cached(path),
+            },
             None => None,
         };
         self.font.ready().await;
@@ -593,8 +720,112 @@ impl Popups {
             &prompt.title,
             &display_body(prompt),
             icon.as_ref(),
-            1.0,
+            scale,
         )
+    }
+
+    /// Renders the prompt once for each distinct scale in `scales`; `None`
+    /// when one of them fails.
+    async fn render_scales(
+        &mut self,
+        prompt: &Prompt,
+        scales: &[f64],
+    ) -> Option<Vec<(f64, Rendered)>> {
+        let mut rendered: Vec<(f64, Rendered)> = Vec::new();
+        for &scale in scales {
+            if pixmap_at(&rendered, scale).is_none() {
+                rendered.push((scale, self.render(prompt, scale).await?));
+            }
+        }
+        Some(rendered)
+    }
+
+    /// Returns the integer scale of `output` the compositor reported, or 1;
+    /// the surface's preferred scale replaces it once known.
+    fn output_scale(&self, output: Option<&wl_output::WlOutput>) -> f64 {
+        let factor = output
+            .and_then(|output| self.output_state.info(output))
+            .map_or(1, |info| info.scale_factor);
+        f64::from(factor.max(1))
+    }
+
+    /// Records `scale` as preferred by the popup surfaces `matches` selects.
+    fn prefer_scale(&mut self, matches: impl Fn(&Surface) -> bool, scale: f64) {
+        if !(scale.is_finite() && scale > 0.0) {
+            return;
+        }
+        for (id, surfaces) in &mut self.surfaces {
+            for surface in surfaces.iter_mut().filter(|surface| matches(surface)) {
+                if !same_scale(surface.wanted, scale) {
+                    surface.wanted = scale;
+                    self.rescale.insert(*id);
+                }
+            }
+        }
+    }
+
+    /// Forgets the prompts and pending scale changes of requests whose
+    /// popups are gone.
+    fn forget_hidden(&mut self) {
+        let surfaces = &self.surfaces;
+        self.prompts.retain(|id, _| surfaces.contains_key(id));
+        self.rescale.retain(|id| surfaces.contains_key(id));
+    }
+
+    /// Reports whether a popup waits to be rendered at a new scale.
+    pub(crate) fn needs_rescale(&self) -> bool {
+        !self.rescale.is_empty()
+    }
+
+    /// Renders the popups whose preferred scale changed at that scale and
+    /// draws them again.
+    #[instrument(level = "debug", skip_all)]
+    pub(crate) async fn rescale(&mut self) {
+        self.forget_hidden();
+        let ids: Vec<RequestId> = std::mem::take(&mut self.rescale).into_iter().collect();
+        for &id in &ids {
+            let Some(prompt) = self.prompts.get(&id).cloned() else {
+                continue;
+            };
+            let wanted: Vec<f64> = self
+                .surfaces
+                .get(&id)
+                .map(|surfaces| {
+                    surfaces
+                        .iter()
+                        .filter(|surface| !same_scale(surface.wanted, surface.scale))
+                        .map(|surface| surface.wanted)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let Some(rendered) = self.render_scales(&prompt, &wanted).await else {
+                self.warn_limit.log(Instant::now(), |suppressed| {
+                    warn!(%id, suppressed, "failed to render popup at a new scale");
+                });
+                continue;
+            };
+            if let Some(surfaces) = self.surfaces.get_mut(&id) {
+                for surface in surfaces.iter_mut() {
+                    if !same_scale(surface.wanted, surface.scale)
+                        && let Some(popup) = pixmap_at(&rendered, surface.wanted)
+                    {
+                        surface.pixmap = popup.pixmap.clone();
+                        surface.height = popup.height;
+                        surface.scale = surface.wanted;
+                        debug!(%id, scale = surface.scale, "popup rendered at a new scale");
+                    }
+                }
+            }
+        }
+        // A new size takes effect with the next configure, which redraws.
+        self.restack();
+        for id in ids {
+            if let Some(surfaces) = self.surfaces.get_mut(&id) {
+                for surface in surfaces.iter_mut().filter(|surface| surface.configured) {
+                    draw(&mut self.pool, &mut self.warn_limit, surface);
+                }
+            }
+        }
     }
 
     /// Returns the outputs a new popup is shown on; `None` lets the
@@ -702,6 +933,7 @@ impl Popups {
         for id in holders {
             self.release(id);
             self.surfaces.remove(&id);
+            self.prompts.remove(&id);
             debug!(%id, "modal popup dismissed");
             self.dismissed.push(id);
         }
@@ -727,7 +959,7 @@ impl Popups {
                 .collect();
             let heights: Vec<i32> = members
                 .iter()
-                .map(|surface| clamp_i32(surface.pixmap.height()))
+                .map(|surface| clamp_i32(surface.logical().1))
                 .collect();
             let (offsets, total) = stack(&heights, SPACING);
             for (surface, offset) in members.iter_mut().zip(offsets) {
@@ -745,6 +977,11 @@ impl Popups {
 }
 
 impl Surface {
+    /// Returns the logical size of the popup the surface draws.
+    fn logical(&self) -> (u32, u32) {
+        (WIDTH, self.height)
+    }
+
     /// Returns the output whose stack the surface belongs to: the requested
     /// one, else the first output the compositor reports the surface on, so
     /// a popup left to the compositor's choice joins the popups there.
@@ -756,6 +993,82 @@ impl Surface {
                 .and_then(|data| data.outputs().next())
         })
     }
+}
+
+/// What a popup buffer is drawn from: the pixmap in device pixels, the
+/// surface's logical size and pixmap row, and its scale.
+struct Layout {
+    pixmap: (u32, u32),
+    size: (u32, u32),
+    canvas_y: u32,
+    scale: f64,
+    /// The buffer is mapped with a viewport rather than a buffer scale.
+    fractional: bool,
+}
+
+impl Layout {
+    /// Returns the buffer size in device pixels: an exact multiple of an
+    /// integer scale, or at least as large as the pixmap at its row for a
+    /// fractional scale.
+    fn buffer_size(&self) -> Option<(i32, i32)> {
+        let width = clamp_i32(self.pixmap.0);
+        let logical = clamp_i32(self.size.1);
+        let height = if self.fractional {
+            let below = clamp_i32(self.buffer_row()?).checked_add(clamp_i32(self.pixmap.1))?;
+            device_length(f64::from(logical) * self.scale)?.max(below)
+        } else {
+            logical.checked_mul(integer_scale(self.scale))?
+        };
+        Some((width, height))
+    }
+
+    /// Returns the device row at which the pixmap is drawn.
+    fn buffer_row(&self) -> Option<u32> {
+        if self.fractional {
+            device_length(f64::from(self.canvas_y) * self.scale).map(i32::unsigned_abs)
+        } else {
+            self.canvas_y
+                .checked_mul(integer_scale(self.scale).unsigned_abs())
+        }
+    }
+}
+
+/// Rounds a length in device pixels to a whole number, if it fits `i32`.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the value is rounded and range-checked first"
+)]
+fn device_length(length: f64) -> Option<i32> {
+    let rounded = length.round();
+    (rounded.is_finite() && rounded >= 0.0 && rounded <= f64::from(i32::MAX))
+        .then_some(rounded as i32)
+}
+
+/// Returns the integer buffer scale for `scale`, at least 1.
+fn integer_scale(scale: f64) -> i32 {
+    device_length(scale).map_or(1, |scale| scale.max(1))
+}
+
+/// Converts a scale to the renderer's precision.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "scales are small and lose no meaningful precision"
+)]
+fn device_scale(scale: f64) -> f32 {
+    scale as f32
+}
+
+/// Reports whether two scales are the same.
+fn same_scale(a: f64, b: f64) -> bool {
+    (a - b).abs() < 1e-6
+}
+
+/// Returns the pixmap rendered at `scale`.
+fn pixmap_at(rendered: &[(f64, Rendered)], scale: f64) -> Option<&Rendered> {
+    rendered
+        .iter()
+        .find(|(at, _)| same_scale(*at, scale))
+        .map(|(_, pixmap)| pixmap)
 }
 
 /// Converts a pixel length to `i32`, saturating at `i32::MAX`.
@@ -777,15 +1090,11 @@ fn place(
         // Each surface spans the whole stack, so the compositor centres all
         // of them in the same place and each popup is drawn at its offset.
         Position::Center => (
-            (surface.pixmap.width(), total.max(0).unsigned_abs()),
+            (surface.logical().0, total.max(0).unsigned_abs()),
             offset.max(0).unsigned_abs(),
             None,
         ),
-        _ => (
-            (surface.pixmap.width(), surface.pixmap.height()),
-            0,
-            Some(MARGIN.saturating_add(offset)),
-        ),
+        _ => (surface.logical(), 0, Some(MARGIN.saturating_add(offset))),
     };
     let mut commit = false;
     if surface.margin != margin
@@ -843,7 +1152,14 @@ fn anchor(position: Position) -> Anchor {
 /// Attaches the surface's pixmap at its canvas row in a new buffer of the
 /// surface's size and commits it.
 fn draw(pool: &mut SlotPool, limit: &mut RateLimit, surface: &mut Surface) {
-    let (Ok(width), Ok(height)) = (i32::try_from(surface.size.0), i32::try_from(surface.size.1))
+    let layout = Layout {
+        pixmap: (surface.pixmap.width(), surface.pixmap.height()),
+        size: surface.size,
+        canvas_y: surface.canvas_y,
+        scale: surface.scale,
+        fractional: surface.viewport.is_some(),
+    };
+    let (Some((width, height)), Some(canvas_y)) = (layout.buffer_size(), layout.buffer_row())
     else {
         limit.log(Instant::now(), |suppressed| {
             warn!(suppressed, "popup size out of range; not drawing");
@@ -866,7 +1182,7 @@ fn draw(pool: &mut SlotPool, limit: &mut RateLimit, surface: &mut Surface) {
     };
     canvas.fill(0);
     let data = surface.pixmap.data();
-    let start = u64::from(surface.canvas_y).saturating_mul(u64::from(stride.unsigned_abs()));
+    let start = u64::from(canvas_y).saturating_mul(u64::from(stride.unsigned_abs()));
     let target = match usize::try_from(start) {
         Ok(start) => start
             .checked_add(data.len())
@@ -881,6 +1197,12 @@ fn draw(pool: &mut SlotPool, limit: &mut RateLimit, surface: &mut Surface) {
     };
     copy_to_argb8888(data, target);
     let wl_surface = surface.layer.wl_surface();
+    match &surface.viewport {
+        Some(viewport) => {
+            viewport.set_destination(clamp_i32(surface.size.0), clamp_i32(surface.size.1));
+        }
+        None => wl_surface.set_buffer_scale(integer_scale(surface.scale)),
+    }
     wl_surface.damage_buffer(0, 0, width, height);
     if let Err(err) = buffer.attach_to(wl_surface) {
         limit.log(Instant::now(), |suppressed| {
@@ -1010,9 +1332,16 @@ impl CompositorHandler for Popups {
         &mut self,
         _: &Connection,
         _: &QueueHandle<Self>,
-        _: &wl_surface::WlSurface,
-        _: i32,
+        surface: &wl_surface::WlSurface,
+        factor: i32,
     ) {
+        // With fractional scaling the preferred fractional scale decides.
+        if self.fractional.is_none() {
+            self.prefer_scale(
+                |popup| popup.layer.wl_surface() == surface,
+                f64::from(factor),
+            );
+        }
     }
 
     fn transform_changed(
@@ -1137,6 +1466,7 @@ impl OutputHandler for Popups {
             removed = removed.saturating_add(before - surfaces.len());
         }
         self.surfaces.retain(|_, surfaces| !surfaces.is_empty());
+        self.forget_hidden();
         if removed > 0 || overlays > 0 {
             debug!(
                 popups = removed,
@@ -1165,6 +1495,8 @@ impl LayerShellHandler for Popups {
         }
         if closed {
             self.surfaces.retain(|_, surfaces| !surfaces.is_empty());
+            self.forget_hidden();
+            self.forget_hidden();
             debug!("compositor closed a popup");
             self.restack();
         }
@@ -1448,3 +1780,101 @@ impl ProvidesRegistryState for Popups {
 
 delegate_registry!(Popups);
 delegate_dispatch2!(Popups);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug, thiserror::Error)]
+    enum TestError {
+        #[error("no buffer at scale {0}")]
+        NoBuffer(f64),
+        #[error("pixmap not created")]
+        Pixmap,
+    }
+
+    /// A stack of popups `heights` logical pixels high, the last of them
+    /// drawn at its row, as `restack` lays out a centred stack.
+    fn stacked(heights: &[u32], scale: f64, fractional: bool) -> Layout {
+        let row: u32 = heights
+            .iter()
+            .take(heights.len().saturating_sub(1))
+            .map(|height| height + 8)
+            .sum();
+        let total = row + heights.last().copied().unwrap_or(1);
+        let last = f64::from(heights.last().copied().unwrap_or(1));
+        let device = |length: f64| device_length(length * scale).map_or(0, i32::unsigned_abs);
+        Layout {
+            pixmap: (device(360.0), device(last)),
+            size: (360, total),
+            canvas_y: row,
+            scale,
+            fractional,
+        }
+    }
+
+    #[test]
+    fn integer_buffers_are_exact_multiples_of_the_scale() -> Result<(), TestError> {
+        for scale in 1..=4 {
+            for heights in [&[76][..], &[76, 115], &[77, 133, 241]] {
+                let layout = stacked(heights, f64::from(scale), false);
+                let (Some((width, height)), Some(row)) =
+                    (layout.buffer_size(), layout.buffer_row())
+                else {
+                    return Err(TestError::NoBuffer(f64::from(scale)));
+                };
+                assert_eq!(width % scale, 0, "width at scale {scale}");
+                assert_eq!(height % scale, 0, "height at scale {scale}");
+                assert_eq!(clamp_i32(row) % scale, 0, "row at scale {scale}");
+                assert!(clamp_i32(row) + clamp_i32(layout.pixmap.1) <= height);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn fractional_buffers_hold_the_pixmap_at_its_row() -> Result<(), TestError> {
+        for numerator in [120_u16, 150, 160, 180, 210, 300] {
+            let scale = f64::from(numerator) / 120.0;
+            for heights in [&[76][..], &[76, 115], &[77, 133, 241]] {
+                let layout = stacked(heights, scale, true);
+                let (Some((_, height)), Some(row)) = (layout.buffer_size(), layout.buffer_row())
+                else {
+                    return Err(TestError::NoBuffer(scale));
+                };
+                assert!(clamp_i32(row) + clamp_i32(layout.pixmap.1) <= height);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn rendered_pixmaps_are_found_by_scale() -> Result<(), TestError> {
+        let one = Pixmap::new(1, 1);
+        let two = Pixmap::new(2, 2);
+        let (Some(one), Some(two)) = (one, two) else {
+            return Err(TestError::Pixmap);
+        };
+        let rendered = [
+            (
+                1.0,
+                Rendered {
+                    pixmap: one,
+                    height: 1,
+                },
+            ),
+            (
+                1.5,
+                Rendered {
+                    pixmap: two,
+                    height: 1,
+                },
+            ),
+        ];
+        let width = |scale| pixmap_at(&rendered, scale).map(|popup| popup.pixmap.width());
+        assert_eq!(width(1.5), Some(2));
+        assert_eq!(width(1.0 + 1e-9), Some(1));
+        assert!(pixmap_at(&rendered, 2.0).is_none());
+        Ok(())
+    }
+}

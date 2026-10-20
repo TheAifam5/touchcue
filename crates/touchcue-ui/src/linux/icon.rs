@@ -20,8 +20,10 @@ use tracing::{Span, debug, error, instrument, warn};
 
 use super::WARN_INTERVAL;
 
-/// Icon edge length in pixels.
+/// Icon edge length in pixels at a scale of 1.
+#[cfg(test)]
 pub(crate) const ICON: u32 = 48;
+/// Icon edge length in logical pixels.
 pub(crate) const ICON_F: f32 = 48.0;
 /// Longest time the UI task waits for one icon.
 pub(crate) const ICON_DEADLINE: Duration = Duration::from_millis(500);
@@ -66,7 +68,7 @@ pub(crate) enum IconError {
 }
 
 type Key = (PathBuf, u32);
-type Load = fn(&Path) -> Result<Pixmap, IconError>;
+type Load = fn(&Path, u32) -> Result<Pixmap, IconError>;
 
 /// Decodes icons on the blocking pool, one at a time, waiting at most a
 /// deadline per icon.
@@ -75,7 +77,7 @@ pub(crate) struct IconLoader {
     /// Held by the one running decode; a busy loader skips further icons.
     busy: Arc<Semaphore>,
     /// Decode that outlived its deadline, kept to collect its late result.
-    late: Option<(PathBuf, JoinHandle<Result<Pixmap, IconError>>)>,
+    late: Option<(Key, JoinHandle<Result<Pixmap, IconError>>)>,
     deadline: Duration,
     cache: VecDeque<(Key, Pixmap)>,
     /// Icons that failed or timed out, with the time they may be retried.
@@ -101,22 +103,31 @@ impl IconLoader {
         }
     }
 
-    /// Returns the decoded icon at `path`, or `None` when it cannot be
-    /// loaded within the deadline.
+    /// Returns the decoded icon at `path`, `size` pixels square, or `None`
+    /// when it cannot be loaded within the deadline.
     ///
     /// An icon that failed or timed out is not tried again for [`FAILED_TTL`].
-    pub(crate) async fn get(&mut self, path: &Path) -> Option<Pixmap> {
-        self.get_at(path, Instant::now()).await
+    pub(crate) async fn get(&mut self, path: &Path, size: u32) -> Option<Pixmap> {
+        self.get_at(path, size, Instant::now()).await
+    }
+
+    /// Returns the largest cached size of the icon at `path`.
+    pub(crate) fn cached(&self, path: &Path) -> Option<Pixmap> {
+        self.cache
+            .iter()
+            .filter(|((cached, _), _)| cached == path)
+            .max_by_key(|((_, size), _)| *size)
+            .map(|(_, icon)| icon.clone())
     }
 
     /// Implements [`IconLoader::get`] with `now` as the time for cache expiry.
-    #[instrument(level = "debug", skip_all, fields(path = %log_path(path)))]
-    async fn get_at(&mut self, path: &Path, now: Instant) -> Option<Pixmap> {
+    #[instrument(level = "debug", skip_all, fields(path = %log_path(path), size))]
+    async fn get_at(&mut self, path: &Path, size: u32, now: Instant) -> Option<Pixmap> {
         self.collect_late(now).await;
         if let Some((_, icon)) = self
             .cache
             .iter()
-            .find(|((cached, size), _)| cached == path && *size == ICON)
+            .find(|((cached, cached_size), _)| cached == path && *cached_size == size)
         {
             debug!("icon cache hit");
             return Some(icon.clone());
@@ -125,7 +136,7 @@ impl IconLoader {
         if self
             .failed
             .iter()
-            .any(|((failed, size), _)| failed == path && *size == ICON)
+            .any(|((failed, failed_size), _)| failed == path && *failed_size == size)
         {
             debug!("icon failed recently; skipping it");
             return None;
@@ -155,10 +166,10 @@ impl IconLoader {
         let span = Span::current();
         let mut decode = tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            span.in_scope(|| load(&owned))
+            span.in_scope(|| load(&owned, size))
         });
         match tokio::time::timeout(self.deadline, &mut decode).await {
-            Ok(joined) => return self.store(path.to_path_buf(), joined, now),
+            Ok(joined) => return self.store((path.to_path_buf(), size), joined, now),
             Err(elapsed) => {
                 self.warn_limit
                     .log(std::time::Instant::now(), |suppressed| {
@@ -171,8 +182,8 @@ impl IconLoader {
                     });
             }
         }
-        self.remember_failure(path.to_path_buf(), now);
-        self.late = Some((path.to_path_buf(), decode));
+        self.remember_failure((path.to_path_buf(), size), now);
+        self.late = Some(((path.to_path_buf(), size), decode));
         None
     }
 
@@ -185,9 +196,9 @@ impl IconLoader {
         {
             return;
         }
-        if let Some((path, decode)) = self.late.take() {
+        if let Some((key, decode)) = self.late.take() {
             let joined = decode.await;
-            self.store(path, joined, now);
+            self.store(key, joined, now);
         }
     }
 
@@ -195,46 +206,45 @@ impl IconLoader {
     /// returns it; a failure is recorded at `now`.
     fn store(
         &mut self,
-        path: PathBuf,
+        key: Key,
         joined: Result<Result<Pixmap, IconError>, JoinError>,
         now: Instant,
     ) -> Option<Pixmap> {
         match joined {
             Ok(Ok(icon)) => {
-                self.failed
-                    .retain(|((failed, size), _)| !(*failed == path && *size == ICON));
+                self.failed.retain(|(failed, _)| *failed != key);
                 if self.cache.len() >= CACHE_ENTRIES {
                     self.cache.pop_front();
                 }
-                self.cache.push_back(((path, ICON), icon.clone()));
+                self.cache.push_back((key, icon.clone()));
                 Some(icon)
             }
             Ok(Err(err)) => {
                 debug!(
-                    path = %log_path(&path),
+                    path = %log_path(&key.0),
                     error = &err as &dyn std::error::Error,
                     "skipping popup icon"
                 );
-                self.remember_failure(path, now);
+                self.remember_failure(key, now);
                 None
             }
             Err(err) => {
                 warn!(
-                    path = %log_path(&path),
+                    path = %log_path(&key.0),
                     error = &err as &dyn std::error::Error,
                     "icon decode task failed"
                 );
-                self.remember_failure(path, now);
+                self.remember_failure(key, now);
                 None
             }
         }
     }
 
-    fn remember_failure(&mut self, path: PathBuf, now: Instant) {
+    fn remember_failure(&mut self, key: Key, now: Instant) {
         if self.failed.len() >= FAILED_ENTRIES {
             self.failed.pop_front();
         }
-        self.failed.push_back(((path, ICON), now + FAILED_TTL));
+        self.failed.push_back((key, now + FAILED_TTL));
     }
 }
 
@@ -244,11 +254,23 @@ fn log_path(path: &Path) -> String {
     sanitize(&path.to_string_lossy(), MAX_LOGGED_PATH_CHARS).unwrap_or_default()
 }
 
-/// Reads and decodes a PNG or SVG icon scaled to fit `ICON` pixels.
-#[instrument(level = "debug", skip_all, fields(path = %log_path(path)))]
-fn load_icon(path: &Path) -> Result<Pixmap, IconError> {
+/// Returns the side in pixels of an icon drawn at `scale` device pixels per
+/// logical pixel, at most four times [`ICON_F`].
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "the value is rounded and clamped to 1..=4 * ICON first"
+)]
+pub(crate) fn icon_pixels(scale: f32) -> u32 {
+    let max = ICON_F * 4.0;
+    (ICON_F * scale).ceil().clamp(1.0, max) as u32
+}
+
+/// Reads and decodes a PNG or SVG icon scaled to fit `size` pixels square.
+#[instrument(level = "debug", skip_all, fields(path = %log_path(path), size))]
+fn load_icon(path: &Path, size: u32) -> Result<Pixmap, IconError> {
     let data = read_icon(path)?;
-    let mut icon = Pixmap::new(ICON, ICON).ok_or(IconError::Empty)?;
+    let mut icon = Pixmap::new(size, size).ok_or(IconError::Empty)?;
     if data.starts_with(PNG_MAGIC) {
         let image = Pixmap::decode_png(&data).map_err(|err| {
             debug!(
@@ -257,8 +279,12 @@ fn load_icon(path: &Path) -> Result<Pixmap, IconError> {
             );
             IconError::Png
         })?;
-        let transform =
-            fit(dimension(image.width()), dimension(image.height())).ok_or(IconError::Empty)?;
+        let transform = fit(
+            dimension(image.width()),
+            dimension(image.height()),
+            dimension(size),
+        )
+        .ok_or(IconError::Empty)?;
         icon.draw_pixmap(
             0,
             0,
@@ -281,8 +307,9 @@ fn load_icon(path: &Path) -> Result<Pixmap, IconError> {
             },
         )?;
         let tree = usvg::Tree::from_xmltree(&xml, &svg_options())?;
-        let size = tree.size();
-        let transform = fit(size.width(), size.height()).ok_or(IconError::Empty)?;
+        let tree_size = tree.size();
+        let transform =
+            fit(tree_size.width(), tree_size.height(), dimension(size)).ok_or(IconError::Empty)?;
         resvg::render(&tree, transform, &mut icon.as_mut());
     }
     Ok(icon)
@@ -326,19 +353,19 @@ fn svg_options() -> usvg::Options<'static> {
 
 /// Returns the transform that scales a `width` by `height` image to fit
 /// the icon square, centred, keeping its aspect ratio.
-fn fit(width: f32, height: f32) -> Option<Transform> {
+fn fit(width: f32, height: f32, side: f32) -> Option<Transform> {
     let longest = width.max(height);
     if longest <= 0.0 || !longest.is_finite() {
         return None;
     }
-    let scale = ICON_F / longest;
+    let scale = side / longest;
     Some(Transform::from_row(
         scale,
         0.0,
         0.0,
         scale,
-        (ICON_F - width * scale) / 2.0,
-        (ICON_F - height * scale) / 2.0,
+        (side - width * scale) / 2.0,
+        (side - height * scale) / 2.0,
     ))
 }
 
@@ -391,7 +418,7 @@ mod tests {
     #[test]
     fn missing_icon_is_an_open_error() {
         assert!(matches!(
-            load_icon(Path::new("/nonexistent/touchcue-icon.png")),
+            load_icon(Path::new("/nonexistent/touchcue-icon.png"), ICON),
             Err(IconError::Open(_))
         ));
     }
@@ -405,7 +432,7 @@ mod tests {
             r#"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="10" height="10"><image href="/dev/zero" width="10" height="10"/><image xlink:href="file:///dev/zero" width="10" height="10"/></svg>"#,
         )?;
         let started = Instant::now();
-        let loaded = load_icon(&svg);
+        let loaded = load_icon(&svg, ICON);
         assert!(started.elapsed() < Duration::from_secs(1));
         loaded?;
         let options = svg_options();
@@ -425,7 +452,7 @@ mod tests {
         let fifo = dir.join("x.png");
         rustix::fs::mkfifoat(rustix::fs::CWD, &fifo, Mode::from_raw_mode(0o600))?;
         let started = Instant::now();
-        assert!(matches!(load_icon(&fifo), Err(IconError::NotRegular)));
+        assert!(matches!(load_icon(&fifo, ICON), Err(IconError::NotRegular)));
         assert!(started.elapsed() < Duration::from_secs(1));
         std::fs::remove_dir_all(&dir)?;
         Ok(())
@@ -438,7 +465,7 @@ mod tests {
         write_png(&target)?;
         let link = dir.join("link.png");
         std::os::unix::fs::symlink(&target, &link)?;
-        load_icon(&link)?;
+        load_icon(&link, ICON)?;
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }
@@ -451,7 +478,7 @@ mod tests {
         let link = dir.join("x.png");
         std::os::unix::fs::symlink(&fifo, &link)?;
         let started = Instant::now();
-        assert!(matches!(load_icon(&link), Err(IconError::NotRegular)));
+        assert!(matches!(load_icon(&link, ICON), Err(IconError::NotRegular)));
         assert!(started.elapsed() < Duration::from_secs(1));
         std::fs::remove_dir_all(&dir)?;
         Ok(())
@@ -465,9 +492,9 @@ mod tests {
             &svg,
             r#"<?xml version="1.0"?><!DOCTYPE svg [<!ENTITY a "aaaaaaaaaa"><!ENTITY b "&a;&a;&a;&a;&a;&a;&a;&a;&a;&a;">]><svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><text>&b;</text></svg>"#,
         )?;
-        assert!(matches!(load_icon(&svg), Err(IconError::Xml(_))));
+        assert!(matches!(load_icon(&svg, ICON), Err(IconError::Xml(_))));
         let mut loader = IconLoader::new(Duration::from_secs(5));
-        assert!(loader.get(&svg).await.is_none());
+        assert!(loader.get(&svg, ICON).await.is_none());
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }
@@ -477,7 +504,7 @@ mod tests {
         let dir = scratch("large")?;
         let large = dir.join("large.png");
         std::fs::write(&large, vec![0_u8; MAX_ICON_LEN + 1])?;
-        assert!(matches!(load_icon(&large), Err(IconError::TooLarge)));
+        assert!(matches!(load_icon(&large, ICON), Err(IconError::TooLarge)));
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }
@@ -488,11 +515,11 @@ mod tests {
         let png = dir.join("icon.png");
         write_png(&png)?;
         let mut loader = IconLoader::new(Duration::from_secs(5));
-        let first = loader.get(&png).await;
+        let first = loader.get(&png, ICON).await;
         assert!(first.is_some());
         std::fs::remove_file(&png)?;
-        assert_eq!(loader.get(&png).await, first);
-        assert!(loader.get(&dir.join("missing.png")).await.is_none());
+        assert_eq!(loader.get(&png, ICON).await, first);
+        assert!(loader.get(&dir.join("missing.png"), ICON).await.is_none());
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }
@@ -503,19 +530,19 @@ mod tests {
         let png = dir.join("icon.png");
         let mut loader = IconLoader::new(Duration::from_secs(5));
         let t0 = Instant::now();
-        assert!(loader.get_at(&png, t0).await.is_none());
+        assert!(loader.get_at(&png, ICON, t0).await.is_none());
         // The file now decodes, so only the failure record keeps it hidden.
         write_png(&png)?;
         let within = t0 + Duration::from_secs(59);
-        assert!(loader.get_at(&png, within).await.is_none());
-        assert!(loader.get_at(&png, t0 + FAILED_TTL).await.is_some());
+        assert!(loader.get_at(&png, ICON, within).await.is_none());
+        assert!(loader.get_at(&png, ICON, t0 + FAILED_TTL).await.is_some());
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }
 
-    fn slow_load(_: &Path) -> Result<Pixmap, IconError> {
+    fn slow_load(_: &Path, size: u32) -> Result<Pixmap, IconError> {
         std::thread::sleep(Duration::from_millis(300));
-        Pixmap::new(ICON, ICON).ok_or(IconError::Empty)
+        Pixmap::new(size, size).ok_or(IconError::Empty)
     }
 
     #[tokio::test]
@@ -523,13 +550,13 @@ mod tests {
         let mut loader = IconLoader::with_load(Duration::from_millis(20), slow_load);
         let path = Path::new("/slow.png");
         let started = std::time::Instant::now();
-        assert!(loader.get(path).await.is_none());
-        assert!(loader.get(path).await.is_none());
-        assert!(loader.get(Path::new("/other.png")).await.is_none());
+        assert!(loader.get(path, ICON).await.is_none());
+        assert!(loader.get(path, ICON).await.is_none());
+        assert!(loader.get(Path::new("/other.png"), ICON).await.is_none());
         assert!(started.elapsed() < Duration::from_millis(200));
         assert_eq!(loader.failed.len(), 1);
         tokio::time::sleep(Duration::from_millis(500)).await;
-        assert!(loader.get(path).await.is_some());
+        assert!(loader.get(path, ICON).await.is_some());
         assert!(loader.failed.is_empty());
     }
 
@@ -538,7 +565,7 @@ mod tests {
         let mut loader = IconLoader::new(Duration::from_secs(5));
         let t0 = Instant::now();
         for index in 0..=FAILED_ENTRIES {
-            loader.remember_failure(PathBuf::from(format!("/missing/{index}.png")), t0);
+            loader.remember_failure((PathBuf::from(format!("/missing/{index}.png")), ICON), t0);
         }
         assert_eq!(loader.failed.len(), FAILED_ENTRIES);
         assert!(
@@ -556,7 +583,7 @@ mod tests {
         for index in 0..=CACHE_ENTRIES {
             let png = dir.join(format!("{index}.png"));
             write_png(&png)?;
-            assert!(loader.get(&png).await.is_some());
+            assert!(loader.get(&png, ICON).await.is_some());
         }
         assert_eq!(loader.cache.len(), CACHE_ENTRIES);
         assert!(
@@ -572,9 +599,9 @@ mod tests {
     #[test]
     fn fit_centres_and_scales() {
         assert_eq!(
-            fit(96.0, 48.0),
+            fit(96.0, 48.0, ICON_F),
             Some(Transform::from_row(0.5, 0.0, 0.0, 0.5, 0.0, 12.0))
         );
-        assert_eq!(fit(0.0, 0.0), None);
+        assert_eq!(fit(0.0, 0.0, ICON_F), None);
     }
 }

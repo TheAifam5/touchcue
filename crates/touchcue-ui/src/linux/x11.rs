@@ -33,7 +33,7 @@ use x11rb::utils::RawFdContainer;
 use x11rb::wrapper::ConnectionExt as _;
 
 use super::WARN_INTERVAL;
-use super::icon::{ICON_DEADLINE, IconLoader};
+use super::icon::{ICON_DEADLINE, IconLoader, icon_pixels};
 use super::modal::OverlayClock;
 use super::placement::{Placement, matching, stack};
 use super::render::{FontState, copy_to_argb8888, render};
@@ -944,7 +944,7 @@ impl X11Popups {
     /// Returns the BGRX pixels, size and shape of the rendered popup.
     async fn render(&mut self, prompt: &Prompt) -> Option<(Vec<u8>, (u16, u16), Vec<Rectangle>)> {
         let icon = match prompt.icon.as_deref() {
-            Some(path) => self.icons.get(path).await,
+            Some(path) => self.icons.get(path, icon_pixels(self.scale)).await,
             None => None,
         };
         self.font.ready().await;
@@ -955,7 +955,7 @@ impl X11Popups {
             icon.as_ref(),
             self.scale,
         );
-        let Some(pixmap) = rendered else {
+        let Some(pixmap) = rendered.map(|rendered| rendered.pixmap) else {
             self.warn_limit.log(Instant::now(), |suppressed| {
                 warn!(suppressed, "failed to render popup");
             });

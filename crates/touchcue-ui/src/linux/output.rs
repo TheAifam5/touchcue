@@ -146,7 +146,14 @@ impl PopupOutput {
     /// Handles queued events and sends pending requests.
     pub(crate) async fn dispatch(&mut self) -> Result<(), OutputError> {
         match self {
-            Self::Wayland { popups, io } => io.dispatch(popups).await?,
+            Self::Wayland { popups, io } => {
+                io.dispatch(popups).await?;
+                // Scale changes arrive as events; their redraws are sent at once.
+                if popups.needs_rescale() {
+                    popups.rescale().await;
+                    io.dispatch(popups).await?;
+                }
+            }
             Self::X11(popups) => popups.dispatch()?,
         }
         Ok(())
