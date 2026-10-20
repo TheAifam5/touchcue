@@ -35,15 +35,15 @@ Hooks make the configuration file run commands as your user. Keep it writable on
 
 One change can fire several events. They fire in this order: `started`, `updated` or `ended`, then `revived`, `waiting` or `lingering`, then `touched`, `cancelled`, `failed` or `timed_out`. For example, a new request fires `started`, then `waiting`.
 
-`touched` fires when the request ends. `cancelled`, `failed` and `timed_out` fire as soon as the operation ends, together with `lingering`, and are not repeated by `ended`. A request that is revived after `cancelled` waits again, so it can end with `touched` later.
+`touched` fires when the request ends. `cancelled`, `failed` and `timed_out` fire as soon as the operation ends, together with `lingering`, and are not repeated by `ended`. A revived cancelled request returns to waiting and may later end with `touched`.
 
 The device events only come from FIDO keys, while `[sources.fido]` is enabled. The `device_added` events of keys present at startup arrive after `daemon_started`. In the rare case that the kernel drops device notifications, touchcue fires `device_removed` and `device_added` again for every key.
 
-`match` selects which events run a hook; it does not prove anything. Application and process names are set by the processes themselves, so any program can claim to be `ssh` or `firefox`.
+`match` selects which events run a hook; it does not prove anything. Application and process names are self-reported and are not authenticated identities.
 
 ## Environment
 
-A command gets touchcue's own environment, so `PATH`, `WAYLAND_DISPLAY` and `DBUS_SESSION_BUS_ADDRESS` reach it, plus these variables:
+Commands inherit touchcue's environment, including `PATH`, `WAYLAND_DISPLAY`, and `DBUS_SESSION_BUS_ADDRESS`, plus the following variables.
 
 - `TOUCHCUE_EVENT` is the event name, such as `started`.
 - Each [placeholder](./placeholders) that touchcue publishes becomes a variable named `TOUCHCUE_` followed by the placeholder name in upper case with dots replaced by underscores. For example, `app.name` is `TOUCHCUE_APP_NAME` and `request.state` is `TOUCHCUE_REQUEST_STATE`.
@@ -113,7 +113,7 @@ A process that exits before its request ends, with any exit status, or that cann
 A process gets the [environment](#environment) of other hooks, with these differences:
 
 - `TOUCHCUE_EVENT` is `show` for the first process of a request, and `update` for a process started again after a change or after the prompt was suppressed.
-- `TOUCHCUE_TITLE` and `TOUCHCUE_BODY` are the prompt title and body exactly as the popup and the notification show them, after rules, with the same cleaning and length limit as the other values. While a request lingers after it was cancelled or timed out, the body ends with `(cancelled)` or `(timed out)`, as on the popup; `TOUCHCUE_REQUEST_STATE` holds the state for a script that words the outcome itself. They are rendered from your own templates, so they can hold placeholders that are not published, such as a command line, when your templates use them.
+- `TOUCHCUE_TITLE` and `TOUCHCUE_BODY` are the prompt title and body exactly as the notification shows them, after rules, with the same cleaning and length limit as the other values. While a request lingers after it was cancelled or timed out, the body ends with `(cancelled)` or `(timed out)`, as in the notification; `TOUCHCUE_REQUEST_STATE` holds the state for a script that words the outcome itself. These values use the configured templates and may include unpublished placeholders, including command lines.
 
 Other hooks get no `TOUCHCUE_TITLE` or `TOUCHCUE_BODY`: they also run for suppressed and ended requests, which have no prompt.
 

@@ -21,6 +21,7 @@ show_delay_ms = 0
 modal = false
 modal_dim = 0.4
 modal_dismiss = true
+animations = true
 
 [notification]
 urgency = "critical"
@@ -89,6 +90,7 @@ extend_skip = []
 | `modal` | `true`, `false` | `false` |
 | `modal_dim` | 0.0 to 1.0 | 0.4 |
 | `modal_dismiss` | `true`, `false` | `true` |
+| `animations` | `true`, `false` | `true` |
 
 ![A popup in the top-right corner of an output, with position = "top-right"](/screenshots/corner.png)
 
@@ -101,6 +103,24 @@ Popups are drawn at the scale of the output they are on: at fractional scales su
 Several popups on one output stack in the order the requests started: away from the screen edge, or vertically around the centre with `center`.
 
 ![Two stacked popups, one from the browser and one from claude in a terminal](/screenshots/stacked.png)
+
+### State overlay
+
+The application icon is drawn dimmed, with the request's state centred over it. A popup without an icon shows the state alone in the icon's place.
+
+- While the request waits for a touch, a spinner turns over the icon.
+- When the operation ends, the spinner gives way to a mark on a coloured disc: a check on green after a touch, a cross on red after a cancel or failure, and a clock on amber after a timeout.
+
+  ![A popup whose spinner turns over the dimmed browser icon, then gives way to a check on a green disc after a touch](/screenshots/anim-touched.gif)
+
+  ![A popup whose spinner gives way to a cross on a red disc after a cancel](/screenshots/anim-cancelled.gif)
+
+  ![A popup whose spinner gives way to a clock on an amber disc after a timeout](/screenshots/anim-timed-out.gif)
+- When a client retries, the mark gives way to the spinner again.
+
+  ![A popup whose spinner gives way to the timeout clock, turns again when the client retries, and gives way to the touch check](/screenshots/anim-retry.gif)
+
+Each change fades and grows into place over 250 ms. With `animations = false`, or when the desktop asks for reduced motion, the spinner stands still and each mark appears at once. touchcue reads the desktop preference once at start, through the XDG desktop portal: `reduced-motion` = 1 in `org.freedesktop.appearance`, or `enable-animations` = false in `org.gnome.desktop.interface` where the portal provides it. Without a portal, motion is not reduced.
 
 ### Outputs
 
@@ -115,7 +135,7 @@ Several popups on one output stack in the order the requests started: away from 
 
 ### Modal popups
 
-With `modal = true`, a popup that waits for a touch also blocks clicks: on each of its outputs, a full-screen layer behind the popup takes every click. The keyboard is never grabbed, so typing still goes to the focused window. The overlay is removed when no request on that output waits any more, and after 120 seconds at most, even when requests still wait; requests that start while it is shown do not extend it. After those 120 seconds, that output gets no new overlay for 30 seconds.
+With `modal = true`, a popup that waits for a touch also blocks clicks: on each of its outputs, a full-screen layer behind the popup takes every click. The keyboard is never grabbed. Keyboard input remains with the focused window. The overlay is removed when no request on that output waits any more, and after 120 seconds at most, even when requests still wait; requests that start while it is shown do not extend it. After those 120 seconds, that output gets no new overlay for 30 seconds.
 
 ![A modal popup over a dimmed output](/screenshots/modal-dim.png)
 
@@ -125,7 +145,7 @@ With `modal = true`, a popup that waits for a touch also blocks clicks: on each 
 - With `modal_dismiss = true`, a click or touch on the overlay hides the popups and overlays of the requests on it. Only the display is hidden: the request keeps waiting for a touch. The next request on that output gets a new overlay right away. Only the left, middle and right buttons dismiss; scrolling and side buttons do not.
 - With `modal_dismiss = false`, requests that follow each other can keep an output dimmed for longer than 120 seconds: the limit applies to each overlay, and a new request gets a new overlay once the previous one ended, or 30 seconds after it reached the limit. The keyboard keeps working throughout.
 
-On X11 the overlay is an input-only window that blocks clicks without dimming, so `modal_dim` has no effect there. On Wayland the overlay is on the layer-shell overlay layer, above windows and panels.
+On X11 the overlay blocks clicks without dimming; `modal_dim` has no effect. On Wayland the overlay is on the layer-shell overlay layer, above windows and panels.
 
 ## `[notification]`
 
@@ -165,13 +185,13 @@ Without `theme`, `touchcue run` detects the theme once at start, from the first 
 
 The default body names the requester and its application through [`requester.label`](./placeholders#requester): `claude in Kitty is waiting for a GPG signature`, or `Firefox is waiting for a passkey` when the application asks itself. [`request.action`](./placeholders#values) words what the request waits for.
 
-Templates use Jinja syntax with [placeholders](./placeholders#template-syntax). A template that fails while rendering is replaced by the next of: the matching rule's template, the `[templates]` template, the default above, and an empty text. A request that ended without a touch keeps its prompt briefly, with `(cancelled)` or `(timed out)` appended to the body.
+Templates use Jinja syntax with [placeholders](./placeholders#template-syntax). A template that fails while rendering is replaced by the next of: the matching rule's template, the `[templates]` template, the default above, and an empty text. A request that ended without a touch keeps its prompt briefly: the popup shows the outcome in its [state overlay](#state-overlay), and a notification appends `(cancelled)` or `(timed out)` to the body.
 
 The title wraps to at most two lines and the body to at most six; longer text ends with an ellipsis:
 
 ![A popup whose long title and body wrap and end with an ellipsis](/screenshots/long-text.png)
 
-![Three popups: a touched request, which keeps its text, a cancelled one and a timed-out one](/screenshots/outcomes.png)
+![Three popups with the same text: a touched request with a check, a cancelled one with a cross and a timed-out one with a clock](/screenshots/outcomes.png)
 
 ## `[[rules]]`
 
@@ -201,7 +221,7 @@ suppress = true
 | `icon` | path or name | Icon shown instead of the application's icon: an absolute path, a path starting with `~/` in your home directory, or an icon name. |
 | `suppress` | boolean | Shows nothing for matching requests. IPC still publishes them. Default `false`. |
 
-An `icon` path must name a PNG or SVG file. A `~/` path must stay in your home directory: an absolute rest, as in `~//etc`, or a `..` part is a configuration error. A value without `/`, such as `utilities-terminal`, is an icon name, looked up in the [icon theme](#icons) like application icons. Other relative paths are a configuration error. The icon is looked up each time a prompt is shown or changes, within 0.5 s, so an icon path may name a file created after the daemon starts. An icon name that was not found stays unfound until the daemon restarts or more than 512 names have been looked up, as described under [`[icons]`](#icons). When no file is found in time, the prompt shows the application's icon and the daemon logs a warning.
+An `icon` path must name a PNG or SVG file. A `~/` path must stay in your home directory: an absolute rest, as in `~//etc`, or a `..` part is a configuration error. A value without `/`, such as `utilities-terminal`, is an icon name, looked up in the [icon theme](#icons) like application icons. Other relative paths are a configuration error. Icon paths are looked up whenever a prompt is shown or changes, within 0.5 s. Files created after startup are eligible. An icon name that was not found stays unfound until the daemon restarts or more than 512 names have been looked up, as described under [`[icons]`](#icons). When no file is found in time, the prompt shows the application's icon and the daemon logs a warning.
 
 ![A popup with a rule's title and key icon below a popup with the application's icon](/screenshots/rule-icon.png)
 
@@ -223,7 +243,7 @@ concurrency = 4
 | Key | Type | Meaning |
 | --- | --- | --- |
 | `on` | list of event names | Events that run the command. Required and non-empty. An unknown name is an error. |
-| `match` | table of strings | Placeholder names and values that must all be equal, as in `[[rules]]`. Optional; without it, every listed event runs the command. Device events only have `device.*` values and daemon events none, so a `match` on other names never runs for them. `match` only selects events: application and process names are set by the processes themselves. |
+| `match` | table of strings | Placeholder names and values that must all be equal, as in `[[rules]]`. Optional; without it, every listed event runs the command. Device events only have `device.*` values and daemon events none. A match requiring values absent from the event does not run. `match` only selects events: application and process names are set by the processes themselves. |
 | `command` | list of strings | The program and its arguments, run without a shell. Required, and the program must not be empty. |
 | `timeout_ms` | 1 to 600000 | Time the command may run before it is ended. Default 5000. Not allowed with `until`. |
 | `concurrency` | 1 to 32 | Most runs of this hook at once. Default 4. Not allowed with `until`. |
@@ -241,7 +261,7 @@ concurrency = 4
 | `keepalive_timeout_ms` | 100 to 600000 | 1500 |
 | `retry_window_ms` | 1 to 600000 | 1000 |
 
-`keepalive_timeout_ms` is how long a FIDO request survives without a keepalive from the key. `retry_window_ms` is how long an ended operation waits for the client to retry it, so a retry continues the same prompt.
+`keepalive_timeout_ms` is how long a FIDO request survives without a keepalive from the key. `retry_window_ms` is how long an ended operation waits for a client retry. A client retry during that interval continues the same prompt.
 
 ## `[sources.gpg]`
 
@@ -265,7 +285,7 @@ These lists name the processes passed over when looking for the [requester](./pl
 extend_skip = ["nvim"]
 ```
 
-An entry is a name, compared exactly and case-sensitively with the process's `comm`, or with its executable's file name when `comm` cannot be read, or a prefix ending in `*`, such as `tmux*`. The kernel cuts `comm` to 15 bytes, so match longer names with a prefix. An invalid entry is reported with its location in the file. `touchcue check` prints the effective list; copy the list after `skip =` into the configuration to start from it.
+An entry is a name, compared exactly and case-sensitively with the process's `comm`, or with its executable's file name when `comm` cannot be read, or a prefix ending in `*`, such as `tmux*`. The kernel truncates `comm` to 15 bytes. Use a prefix entry for longer names. An invalid entry is reported with its location in the file. `touchcue check` prints the effective list; copy the list after `skip =` into the configuration to start from it.
 
 ## IPC
 

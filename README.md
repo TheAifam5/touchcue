@@ -14,7 +14,7 @@ touchcue is a daemon and CLI. When a hardware authenticator waits for a physical
 
 ## touchcue and yubikey-touch-detector
 
-[yubikey-touch-detector](https://github.com/maximbaz/yubikey-touch-detector) by Maxim Baz is the established tool for this job and the inspiration for touchcue. touchcue takes a different approach in some areas and speaks the same socket protocol, so status bars and scripts written for yubikey-touch-detector keep working.
+[yubikey-touch-detector](https://github.com/maximbaz/yubikey-touch-detector) by Maxim Baz is the established tool for this job and the inspiration for touchcue. touchcue implements the yubikey-touch-detector socket protocol. Existing clients can use that interface.
 
 | | touchcue | yubikey-touch-detector |
 | --- | --- | --- |

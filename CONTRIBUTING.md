@@ -1,10 +1,10 @@
 # Contributing
 
-Thanks for helping. touchcue is in early development, so the codebase and the plan change quickly.
+Thanks for helping. touchcue is in early development. The codebase and plan change frequently.
 
 ## Before you start
 
-Open an issue or a [discussion](https://github.com/theaifam5/touchcue/discussions) before working on a non-trivial change, so the approach can be agreed first.
+Open an issue or a [discussion](https://github.com/theaifam5/touchcue/discussions) and agree on the approach before starting a non-trivial change.
 
 ## Development setup
 
@@ -58,9 +58,9 @@ mise run screenshots stacked modal-dim  # only these
 mise run screenshots --dry-run          # print the plan; start nothing
 ```
 
-The task builds the `screenshots` example of `touchcue-ui` (`crates/touchcue-ui/examples/screenshots.rs`), which holds each scenario's configuration and prompts; `cargo run -p touchcue-ui --example screenshots -- --list` names them. `scripts/screenshots.sh` then starts a nested Hyprland with its own Wayland socket and its own D-Bus session bus, captures each scenario with `grim`, and stops everything again. Each nested output is a window on your desktop; when your desktop is Hyprland, the script floats these windows and resizes them to 1280x720 so every run gives images of the same size. Nothing else is drawn on your desktop. The script sets `HYPRLAND_NO_SD_VARS=1` so the nested Hyprland does not export its variables to the systemd user environment, and it uses a private bus; to check, compare `systemctl --user show-environment` before and after a run. Pass `--headless` to capture 1280x720 headless outputs instead, with no windows; this fails on drivers that cannot allocate buffers for headless outputs, such as NVIDIA. Working files go to `target/screenshots/` and are kept there when a run fails.
+The task builds the `screenshots` example of `touchcue-ui` (`crates/touchcue-ui/examples/screenshots.rs`), which holds each scenario's configuration and prompts; `cargo run -p touchcue-ui --example screenshots -- --list` names them. `scripts/screenshots.sh` starts a nested Hyprland with its own Wayland socket and D-Bus session bus, captures still scenarios as PNG images and `anim-*` scenarios as animated GIFs, and stops its processes. Each nested output is a window on your desktop. On a Hyprland host, the script floats the nested windows and resizes them to 1280×720. Nothing else is drawn on your desktop. The script sets `HYPRLAND_NO_SD_VARS=1`; the nested compositor does not export its variables to the systemd user environment. It uses a private bus; compare `systemctl --user show-environment` before and after a run to check. Pass `--headless` to capture 1280×720 headless outputs instead, with no windows; this fails on drivers that cannot allocate buffers for headless outputs, such as NVIDIA. Working files go to `target/screenshots/` and are kept there when a run fails.
 
-Requirements: a running Wayland session, and Hyprland 0.56 (Lua configuration) with `hyprctl`, `dbus-run-session`, `grim`, `jq` and ImageMagick (`magick`) from your system packages; `mako` and `makoctl` for the notification scenario. The script checks for them and is not part of the pinned toolchain.
+Requirements: a running Wayland session, and Hyprland 0.56 (Lua configuration) with `hyprctl`, `dbus-run-session`, `grim`, `jq` and ImageMagick (`magick`) from your system packages; `mako` and `makoctl` for the notification scenario; `ffmpeg`, coreutils `timeout`, and a `date` supporting nanoseconds (`%N`) for GIF scenarios. GIF frame capture is bounded by `GIF_LIMIT` (30 seconds); encoding runs separately after capture. The script checks its prerequisites and is not part of the pinned toolchain.
 
 ## Commits and pull requests
 

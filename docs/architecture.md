@@ -21,7 +21,7 @@ The scdaemon wrapper and `touchcue askpass` are separate touchcue processes star
 
 ## Request lifecycle
 
-A request starts in `waiting` and ends in exactly one of `touched`, `cancelled`, `failed` or `timed_out`. An ended operation lingers for `sources.fido.retry_window_ms`, so that a client retry continues the same request and the prompt can show the outcome, before the request ends.
+A request starts in `waiting` and ends in exactly one of `touched`, `cancelled`, `failed` or `timed_out`. An ended operation lingers for `sources.fido.retry_window_ms`. A retry during that interval continues the same request; the prompt displays the outcome during the interval.
 
 ```
 waiting -> touched | cancelled | failed | timed_out
@@ -31,7 +31,7 @@ waiting -> touched | cancelled | failed | timed_out
 
 A FIDO authenticator that waits for a touch sends CTAPHID `KEEPALIVE` (`0xBB`) frames with status `UPNEEDED` (`0x02`). touchcue tracks these per CTAPHID channel ID. A request ends on the final frame of the same channel ID, or when no keepalive arrives for `sources.fido.keepalive_timeout_ms` (1.5 s by default). CTAP2 status codes in the final frame tell a cancel (`0x2D`, `0x27`) or a timeout (`0x2F`, `0x3A`) apart from a touch. For U2F, a reply with status word `0x6985` (conditions not satisfied) means the key waits for a touch.
 
-Tracking per channel ID keeps the prompt steady: frames from other channels do not end or restart the request.
+Frames from other CTAPHID channel IDs do not end or restart the request.
 
 ## OpenPGP detection
 
@@ -45,4 +45,4 @@ For a FIDO request, the daemon scans `/proc` for the processes holding the devic
 - the requester, `requester`: walking from the application down to the client, the first process not on the skip list of shells, multiplexers, wrappers and service managers, and neither running the application's executable nor owned by another user;
 - the chain, `process.chain`: the names from the client up to the application.
 
-Each process's start time is read during the walk and checked again after its names are read, so a pid reused in between ends the walk. See [Placeholders](./guide/placeholders#requester) for the rules and their limits.
+The walk ends if a process's start time changes between its initial check and the check after reading its names. See [Placeholders](./guide/placeholders#requester) for the rules and their limits.

@@ -1,8 +1,7 @@
 #!/bin/sh
-# Generates the popup and notification screenshots in docs/public/screenshots
-# from a nested Hyprland session that has its own Wayland socket and D-Bus
-# session bus, so nothing is drawn on the host desktop apart from the nested
-# Hyprland windows.
+# Captures PNG and animated GIF scenarios in a nested Hyprland session with a
+# private Wayland socket and session bus. Only the nested windows appear on
+# the host desktop. Scenarios named anim-* produce GIFs; others produce PNG images.
 #
 # Usage: scripts/screenshots.sh [--dry-run] [--headless] [SCENARIO...]
 #
@@ -14,7 +13,8 @@
 # Needs a running Wayland session, the example built with
 # `cargo build -p touchcue-ui --example screenshots`, and Hyprland, hyprctl,
 # dbus-run-session, grim, jq, magick (ImageMagick), ps and mkfifo; mako for the
-# notification scenario.
+# notification scenario; ffmpeg and a date that prints nanoseconds with %N for
+# the anim-* scenarios.
 set -eu
 # Words are split from scenario names and hyprctl output but never globbed.
 set -f
@@ -23,7 +23,8 @@ set -f
 # size the host gives their windows.
 WIDTH=1280
 HEIGHT=720
-# Background of the nested outputs in full-output captures, as RRGGBB.
+# Background of the nested outputs in full-output captures and in animated
+# GIFs, as RRGGBB.
 BACKGROUND=8a8f99
 # Limits for the nested session, in tenths of a second.
 START_LIMIT=200
@@ -32,6 +33,12 @@ LAYER_LIMIT=100
 STOP_LIMIT=50
 # Pause between a layer appearing and its capture, in seconds.
 SETTLE=0.5
+# Frames per second the animated GIFs are recorded at, the longest recording
+# in seconds, and the largest GIF width in pixels and size in bytes.
+GIF_FPS=25
+GIF_LIMIT=30
+GIF_MAX_WIDTH=480
+GIF_MAX_BYTES=1048576
 HEADLESS=SHOT
 SECOND=SHOT2
 
@@ -48,6 +55,9 @@ Usage: scripts/screenshots.sh [--dry-run] [--headless] [SCENARIO...]
   --headless capture headless outputs instead of the nested Hyprland windows;
              fails on drivers that cannot allocate their buffers, such as NVIDIA
   SCENARIO   only these scenarios; default: every scenario of the example
+
+Scenarios named anim-* are recorded as animated GIFs, the others captured as
+PNG images.
 EOF
 }
 
@@ -76,8 +86,8 @@ host_bus=${DBUS_SESSION_BUS_ADDRESS:-}
 # nested instance.
 host_sig=${HYPRLAND_INSTANCE_SIGNATURE:-}
 unset HYPRLAND_INSTANCE_SIGNATURE
-# An inherited socket fd would connect every client to the host display, and
-# the Aquamarine variables could steer the nested Hyprland onto real hardware.
+# Nested clients use the nested Wayland socket. The nested compositor does not
+# inherit Aquamarine backend or DRM-device overrides.
 unset WAYLAND_SOCKET AQ_BACKENDS AQ_DRM_DEVICES
 
 need() {
@@ -96,8 +106,12 @@ else
 	done
 fi
 needs_mako=false
+needs_gif=false
 for name in $selected; do
-	[ "$name" = notification ] && needs_mako=true
+	case $name in
+	notification) needs_mako=true ;;
+	anim-*) needs_gif=true ;;
+	esac
 done
 
 for tool in Hyprland hyprctl dbus-run-session grim jq magick ps mkfifo mktemp; do
@@ -107,6 +121,13 @@ if $needs_mako; then
 	need mako
 	need makoctl
 fi
+if $needs_gif; then
+	need ffmpeg
+	need timeout
+	case $(date +%s%N) in
+	*[!0-9]*) die "date does not print nanoseconds with %N; the anim-* scenarios need it" ;;
+	esac
+fi
 
 # Hyprland's name for the first nested window output; the real name is read
 # once the session runs.
@@ -115,7 +136,7 @@ if $window; then
 	shot_output=$window_output
 	second_kind=wayland
 	window_position=0x0
-	# Window outputs take any size, so the second one is placed by Hyprland.
+	# Hyprland places the second window output automatically to the right.
 	second_position=auto-right
 else
 	second_position=${WIDTH}x0
@@ -166,7 +187,16 @@ capture_mode() {
 	case $1 in
 	modal-* | corner) echo output ;;
 	all-outputs) echo all ;;
+	anim-*) echo gif ;;
 	*) echo crop ;;
+	esac
+}
+
+# Prints the file name of the image of scenario $1.
+image_of() {
+	case $1 in
+	anim-*) echo "$1.gif" ;;
+	*) echo "$1.png" ;;
 	esac
 }
 
@@ -176,9 +206,11 @@ if $dry_run; then
 	printf 'images:     %s\n' "$out_dir"
 	printf 'outputs:    %s, plus %s %s for all-outputs\n' "$shot_output" "$second_kind" "$SECOND"
 	printf 'mako:       %s\n' "$needs_mako"
+	printf 'gifs:       %s fps over #%s, at most %s px wide and %s bytes, %s s long\n' \
+		"$GIF_FPS" "$BACKGROUND" "$GIF_MAX_WIDTH" "$GIF_MAX_BYTES" "$GIF_LIMIT"
 	printf 'start:      HYPRLAND_NO_SD_VARS=1 HYPRLAND_NO_SD_NOTIFY=1 HYPRLAND_NO_CRASHREPORTER=1 dbus-run-session --config-file=<work>/bus.conf -- Hyprland -c <work>/hyprland.lua\n'
 	for name in $selected; do
-		printf 'scenario:   %-13s capture %-6s -> %s/%s.png\n' "$name" "$(capture_mode "$name")" "$out_dir" "$name"
+		printf 'scenario:   %-15s capture %-6s -> %s/%s\n' "$name" "$(capture_mode "$name")" "$out_dir" "$(image_of "$name")"
 	done
 	printf -- '--- hyprland.lua\n'
 	hyprland_config "$(window_rule "$window_output" '')"
@@ -186,7 +218,7 @@ if $dry_run; then
 fi
 
 [ -n "${XDG_RUNTIME_DIR:-}" ] || die "XDG_RUNTIME_DIR is not set"
-# Without a host Wayland display Hyprland would take over the seat instead of nesting.
+# A live host Wayland display is required for nested operation.
 [ -n "${WAYLAND_DISPLAY:-}" ] || die "WAYLAND_DISPLAY is not set; run this inside a Wayland session"
 case $WAYLAND_DISPLAY in
 /*) host_socket=$WAYLAND_DISPLAY ;;
@@ -230,9 +262,8 @@ named() {
 	[ -z "$2" ] || [ "$(comm_of "$1")" = "$2" ]
 }
 
-# Sends SIGTERM to $1 and waits up to STOP_LIMIT, then sends SIGKILL. A
-# process whose command name is not $2, when given, is left alone, since its
-# pid was reused.
+# Sends SIGTERM, waits up to STOP_LIMIT, and sends SIGKILL if needed.
+# Processes whose command name differs from $2 are not signaled.
 stop() {
 	alive "$1" && named "$1" "${2:-}" || return 0
 	kill -TERM "$1" 2>/dev/null || true
@@ -262,8 +293,7 @@ host_hctl() {
 	env HYPRLAND_INSTANCE_SIGNATURE="$host_sig" hyprctl -i "$host_sig" "$@"
 }
 
-# Floats the host windows of the nested Hyprland and resizes them to
-# WIDTH x HEIGHT, so window outputs get the size of headless ones.
+# Floats and resizes the nested Hyprland's host windows to WIDTH x HEIGHT.
 size_windows() {
 	if [ -z "$host_sig" ] || ! valid_sig "$host_sig"; then
 		printf 'screenshots: the host is not Hyprland; window outputs keep the size the host gives them\n' >&2
@@ -363,7 +393,7 @@ cleanup() {
 			status=1
 		fi
 	done
-	# Without a known daemon pid the socket may still be in use, so it stays.
+	# The bus socket is removed only after a known daemon PID has stopped.
 	if [ -n "$bus" ] && [ -n "$daemon_pid" ] && ! alive "$daemon_pid"; then
 		path=${bus#unix:path=}
 		path=${path%%,*}
@@ -408,8 +438,7 @@ work=$(mktemp -d "$work_root/run.XXXXXX")
 chmod 700 "$work"
 
 hyprland_config "$(window_rule "$window_output" '')" >"$work/hyprland.lua"
-# The private bus has no service directories, so nothing is activated on it
-# with the host display in its environment.
+# The private bus has no service directories and does not activate services.
 cat >"$work/bus.conf" <<EOF
 <!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
  "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
@@ -492,8 +521,7 @@ has_output() {
 	hctl -j monitors | jq -e --arg name "$1" 'any(.[]; .name == $name)' >/dev/null
 }
 
-# Fails when Hyprland reports configuration errors, which it would also draw
-# on every output.
+# Fails when Hyprland reports configuration errors.
 check_config() {
 	errors=$(hctl -j configerrors) || die "hyprctl configerrors failed"
 	printf '%s' "$errors" | jq -e 'type == "array" and all(.[]; . == "")' >/dev/null ||
@@ -571,6 +599,78 @@ ready_seen() {
 	grep -q '^ready ' "$work/$name.out"
 }
 
+# Prints the grim geometry of the mapped layers of namespace $1, or fails
+# when there are none.
+layer_geometry() {
+	box=$(layer_box "$1")
+	[ -n "$box" ] || return 1
+	# shellcheck disable=SC2086 # box holds four numbers
+	set -- $box
+	printf '%s,%s %sx%s\n' "$1" "$2" $(($3 - $1)) $(($4 - $2))
+}
+
+# Records geometry $3 for scenario $1 into the animated GIF $2. Writing a line
+# to the example's stdin starts its state changes; frames are taken at
+# GIF_FPS until it prints done. Each frame lasts until the next one was
+# taken, rounded to hundredths of a second, the unit of GIF delays; a frame
+# taken under two hundredths after the last kept one is dropped. Frames show
+# the popup over BACKGROUND.
+record() {
+	frames=$work/$1.frames
+	mkdir -- "$frames"
+	interval=$((1000000000 / GIF_FPS))
+	limit=$((GIF_LIMIT * 1000000000))
+	n=0
+	start=$(date +%s%N)
+	printf 'start\n' >&3
+	until grep -qx 'done' "$work/$1.out"; do
+		alive "$example_pid" || die "$1: the example exited during the recording; see $work/$1.err"
+		now=$(date +%s%N)
+		[ $((now - start)) -lt "$limit" ] || die "$1: the example did not print done within $GIF_LIMIT s"
+		n=$((n + 1))
+		printf '%s\n' "$now" >>"$frames/times"
+		remaining=$((limit - (now - start)))
+		seconds=$((remaining / 1000000000))
+		nanos=$((remaining % 1000000000))
+		WAYLAND_DISPLAY=$wl timeout -s KILL "$seconds.$(printf '%09d' "$nanos")s" \
+			grim -t ppm -g "$3" "$(printf '%s/%05d.ppm' "$frames" "$n")" ||
+			die "$1: frame capture failed or exceeded the recording deadline"
+		pause=$((start + n * interval - $(date +%s%N)))
+		[ "$pause" -le 0 ] || sleep "0.$(printf '%09d' "$pause")"
+	done
+	end=$(date +%s%N)
+	[ "$n" -gt 0 ] || die "$1: the example printed done before the first frame"
+	# The per-file framerate keeps the durations in hundredths; the option
+	# directive needs -safe 0. The last frame's delay is final_delay.
+	awk -v end="$end" -v final="$frames/final" '
+		function cs(t) { return int((t - first) / 1e7 + 0.5) }
+		function emit(d) { printf "file %s\noption framerate 100\nduration %d.%02d\n", f, d / 100, d % 100 }
+		NR == 1 {
+			first = $1
+			print "ffconcat version 1.0"
+		}
+		{ c = cs($1) }
+		NR == 1 || c - kept >= 2 {
+			if (NR > 1) emit(c - kept)
+			kept = c
+			f = sprintf("%05d.ppm", NR)
+		}
+		END {
+			d = cs(end) - kept
+			if (d < 2)
+				d = 2
+			emit(d)
+			print d > final
+		}
+	' "$frames/times" >"$frames/list"
+	ffmpeg -hide_banner -loglevel error -nostdin -y -f concat -safe 0 -i "$frames/list" \
+		-filter_complex "scale=w='min(iw\\,$GIF_MAX_WIDTH)':h=-1:flags=lanczos,split[a][b];[a]palettegen=stats_mode=full[p];[b][p]paletteuse=dither=bayer:bayer_scale=5:diff_mode=rectangle" \
+		-fps_mode passthrough -loop 0 -final_delay "$(cat "$frames/final")" "$2" 2>"$work/$1.ffmpeg.log" ||
+		die "$1: encoding the GIF failed; see $work/$1.ffmpeg.log"
+	size=$(wc -c <"$2" | tr -d ' ')
+	[ "$size" -le "$GIF_MAX_BYTES" ] || die "$1: $2 has $size bytes, more than GIF_MAX_BYTES"
+}
+
 # Captures scenario $1 whose layers have namespace $2 into $3.
 capture() {
 	case $(capture_mode "$1") in
@@ -583,11 +683,8 @@ capture() {
 		WAYLAND_DISPLAY=$wl grim -l 9 -g "$2,$3 $(($4 - $2))x$(($5 - $3))" "$1"
 		;;
 	crop)
-		box=$(layer_box "$2")
-		[ -n "$box" ] || die "$1: the $2 layer disappeared before the capture"
-		# shellcheck disable=SC2086 # box holds four numbers
-		set -- "$3" $box
-		geometry="$2,$3 $(($4 - $2))x$(($5 - $3))"
+		geometry=$(layer_geometry "$2") || die "$1: the $2 layer disappeared before the capture"
+		set -- "$3" "$geometry"
 		# The popups have transparent corners: their alpha is recovered from
 		# captures over black and over white.
 		set_background 000000
@@ -600,6 +697,10 @@ capture() {
 			\( -clone 0,2 +swap -compose DivideDst -composite \) \
 			-delete 0,1 +swap -compose CopyOpacity -composite \
 			-define png:color-type=6 -define png:compression-level=9 "$1"
+		;;
+	gif)
+		geometry=$(layer_geometry "$2") || die "$1: the $2 layer disappeared before the recording"
+		record "$1" "$3" "$geometry"
 		;;
 	esac
 }
@@ -624,7 +725,7 @@ for name in $selected; do
 	poll "$READY_LIMIT" ready_seen || die "$name: the example did not get ready; see $work/$name.err"
 	namespace=$(sed -n 's/^ready //p' "$work/$name.out")
 	if ! poll "$LAYER_LIMIT" has_layer "$namespace"; then
-		# Diagnostics only; the die below reports the failure.
+		# Captures failure diagnostics.
 		hctl -j layers >"$work/layers.json" 2>&1 || true
 		cp -- "$XDG_RUNTIME_DIR/hypr/$sig/hyprland.log" "$work/hyprland-instance.log" 2>/dev/null || true
 		die "$name: no $namespace layer appeared; see $work/layers.json"
@@ -633,7 +734,8 @@ for name in $selected; do
 		poll "$LAYER_LIMIT" has_layer touchcue || die "$name: no popup layer appeared"
 	fi
 	sleep "$SETTLE"
-	capture "$name" "$namespace" "$work/$name.png"
+	image=$(image_of "$name")
+	capture "$name" "$namespace" "$work/$image"
 	exec 3>&-
 	poll "$STOP_LIMIT" eval '! alive "$example_pid"' || stop "$example_pid"
 	if wait "$example_pid"; then
@@ -643,8 +745,8 @@ for name in $selected; do
 		example_pid=
 		die "$name: the example exited with status $code; see $work/$name.err"
 	fi
-	mv -- "$work/$name.png" "$out_dir/$name.png"
-	printf 'screenshots: wrote %s\n' "$out_dir/$name.png" >&2
+	mv -- "$work/$image" "$out_dir/$image"
+	printf 'screenshots: wrote %s\n' "$out_dir/$image" >&2
 	if [ "$name" = all-outputs ]; then
 		hctl output remove "$SECOND" >>"$work/hyprctl.log" 2>&1 ||
 			die "removing output $SECOND failed; see $work/hyprctl.log"
