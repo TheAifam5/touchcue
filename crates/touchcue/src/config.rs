@@ -145,6 +145,13 @@ pub fn report_handler(color: bool) -> GraphicalReportHandler {
     GraphicalReportHandler::new_themed(theme)
 }
 
+/// Returns whether output to a stream uses colors: only on a terminal, and
+/// never while `NO_COLOR` is set to a non-empty value.
+#[must_use]
+pub fn use_color(terminal: bool) -> bool {
+    terminal && std::env::var_os("NO_COLOR").is_none_or(|value| value.is_empty())
+}
+
 /// Renders `error` as a report with its source snippet and labels.
 ///
 /// # Errors

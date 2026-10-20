@@ -39,7 +39,7 @@ pub enum Error {
 #[tracing::instrument(skip_all, err)]
 pub fn run(config_path: Option<&ConfigPath>, runtime: &Runtime) -> Result<bool, Error> {
     let stdout = io::stdout();
-    let color = stdout.is_terminal();
+    let color = config::use_color(stdout.is_terminal());
     report(config_path, runtime, color, &mut stdout.lock())
 }
 

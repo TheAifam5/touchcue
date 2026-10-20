@@ -211,14 +211,15 @@ where
 }
 
 /// Prints `error` as a graphical report on stderr, with colors only on a
-/// terminal, and returns the failure exit code. Falls back to the plain
-/// error chain when the report cannot be rendered or written.
+/// terminal without `NO_COLOR`, and returns the failure exit code. Falls
+/// back to the plain error chain when the report cannot be rendered or
+/// written.
 #[cfg(target_os = "linux")]
 fn report_config_error(error: config::LoadError) -> Result<ExitCode> {
     use std::io::Write as _;
 
     let stderr = std::io::stderr();
-    let handler = config::report_handler(stderr.is_terminal());
+    let handler = config::report_handler(config::use_color(stderr.is_terminal()));
     let report = match config::render(&error, &handler) {
         Ok(report) => report,
         Err(render) => {
@@ -265,7 +266,7 @@ fn init_logging(verbose: u8) {
     let result = tracing_subscriber::fmt()
         .with_env_filter(log_filter(default))
         .with_writer(std::io::stderr)
-        .with_ansi(std::io::stderr().is_terminal())
+        .with_ansi(config::use_color(std::io::stderr().is_terminal()))
         .try_init();
     if let Err(error) = result {
         eprintln!("touchcue: cannot initialize logging: {error}");
