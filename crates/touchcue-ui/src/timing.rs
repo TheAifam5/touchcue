@@ -116,6 +116,14 @@ impl Timing {
         actions
     }
 
+    /// Returns the prompts shown at the moment, in id order.
+    pub(crate) fn visible(&self) -> impl Iterator<Item = &Prompt> {
+        self.entries
+            .values()
+            .filter(|entry| matches!(entry.phase, Phase::Visible { .. }))
+            .map(|entry| &entry.prompt)
+    }
+
     /// Returns the earliest time at which [`Timing::tick`] has work.
     pub(crate) fn next_deadline(&self) -> Option<Instant> {
         self.entries
@@ -197,6 +205,21 @@ mod tests {
             timing.command(Command::Update(prompt(1, "late")), t0 + ms(1000)),
             []
         );
+    }
+
+    #[test]
+    fn visible_lists_shown_prompts_only() {
+        let t0 = Instant::now();
+        let mut timing = Timing::new(ms(500), ms(0));
+        timing.command(Command::Show(prompt(1, "a")), t0);
+        timing.command(Command::Show(prompt(2, "b")), t0 + ms(400));
+        assert_eq!(timing.visible().count(), 0);
+        timing.tick(t0 + ms(500));
+        let shown: Vec<_> = timing.visible().map(|prompt| prompt.id).collect();
+        assert_eq!(shown, [RequestId(1)]);
+        timing.tick(t0 + ms(900));
+        let shown: Vec<_> = timing.visible().map(|prompt| prompt.id).collect();
+        assert_eq!(shown, [RequestId(1), RequestId(2)]);
     }
 
     #[test]

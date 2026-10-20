@@ -56,6 +56,14 @@ impl PopupOutput {
         None
     }
 
+    /// Returns the display server the popups are on, for logs.
+    pub(crate) fn backend(&self) -> &'static str {
+        match self {
+            Self::Wayland { .. } => "wayland",
+            Self::X11(_) => "x11",
+        }
+    }
+
     /// Shows the prompt; with `modal`, it holds overlays that block clicks.
     pub(crate) async fn show(&mut self, prompt: &Prompt, modal: bool) -> Result<(), OutputError> {
         match self {

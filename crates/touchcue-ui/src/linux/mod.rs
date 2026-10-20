@@ -14,7 +14,7 @@ use std::future;
 use std::time::Duration;
 
 use tokio::sync::mpsc::{self, error::TrySendError};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinError, JoinHandle};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use touchcue_core::config::OutputMode;
@@ -123,7 +123,12 @@ pub(crate) async fn spawn(
             Duration::from_millis(cfg.popup.show_delay_ms),
             Duration::from_millis(cfg.popup.min_display_ms),
         ),
+        placement: outputs.popups.is_some().then(|| Placement::new(&cfg.popup)),
         popups: outputs.popups,
+        reconnect: None,
+        reopening: None,
+        backoff: RECONNECT_MIN,
+        restored_at: None,
         modal: cfg.popup.modal,
         modal_timer: ModalTimer::default(),
         notifier: outputs.notifier.map(NotifyWorker::start),
@@ -222,10 +227,51 @@ pub(crate) async fn probe() -> Capabilities {
     caps
 }
 
+/// First wait before reopening a lost display connection; each failed
+/// attempt doubles it, up to [`RECONNECT_MAX`].
+const RECONNECT_MIN: Duration = Duration::from_secs(1);
+/// Longest wait between attempts to reopen a lost display connection.
+const RECONNECT_MAX: Duration = Duration::from_secs(60);
+/// A connection lost sooner than this after it was reopened keeps backing
+/// off, so a compositor that drops clients right away is not retried every
+/// second.
+const RECONNECT_STABLE: Duration = Duration::from_secs(30);
+
+/// When to try reopening a lost display connection next.
+#[derive(Debug, Clone, Copy)]
+struct Reconnect {
+    at: std::time::Instant,
+    delay: Duration,
+}
+
+impl Reconnect {
+    fn after(now: std::time::Instant, delay: Duration) -> Self {
+        Self {
+            at: now.checked_add(delay).unwrap_or(now),
+            delay,
+        }
+    }
+
+    /// Returns the attempt after a failed one, waiting twice as long.
+    fn next(self, now: std::time::Instant) -> Self {
+        Self::after(now, self.delay.saturating_mul(2).min(RECONNECT_MAX))
+    }
+}
+
 /// State of the UI task.
 struct App {
     timing: Timing,
     popups: Option<PopupOutput>,
+    /// Placement to reopen popups with; `None` when they were never opened.
+    placement: Option<Placement>,
+    /// Set while popups were lost and are being reopened.
+    reconnect: Option<Reconnect>,
+    /// The attempt to reopen popups in flight; at most one runs at a time.
+    reopening: Option<JoinHandle<Option<PopupOutput>>>,
+    /// Wait before the last scheduled attempt.
+    backoff: Duration,
+    /// When popups were last reopened.
+    restored_at: Option<std::time::Instant>,
     /// Popups of waiting requests hold overlays that block clicks.
     modal: bool,
     modal_timer: ModalTimer,
@@ -250,6 +296,98 @@ impl App {
         {
             self.lose_popups(&err);
         }
+        if let Some(retry) = self.reconnect
+            && retry.at <= now
+        {
+            self.start_reopen();
+        }
+    }
+
+    /// Starts reopening popups in a task that the UI loop awaits, unless an
+    /// attempt is still running.
+    fn start_reopen(&mut self) {
+        if self.reopening.is_some() {
+            return;
+        }
+        let Some(placement) = self.placement.clone() else {
+            self.reconnect = None;
+            return;
+        };
+        self.reopening = Some(tokio::spawn(
+            async move { PopupOutput::open(&placement).await }.in_current_span(),
+        ));
+    }
+
+    /// Takes the result of an attempt to reopen popups: shows the visible
+    /// prompts again on the new connection, or schedules the next attempt.
+    ///
+    /// Overlays went with the lost connection, so waiting prompts get new
+    /// ones with a new time limit, even when a click had dismissed them.
+    #[instrument(level = "debug", skip_all)]
+    async fn finish_reopen(&mut self, opened: Result<Option<PopupOutput>, JoinError>) {
+        self.reopening = None;
+        if self.reconnect.is_none() {
+            return;
+        }
+        let mut output = match opened {
+            Ok(Some(output)) => output,
+            Ok(None) => {
+                self.retry_later();
+                return;
+            }
+            Err(err) => {
+                debug!(
+                    error = &err as &dyn std::error::Error,
+                    "display reopen task failed"
+                );
+                self.retry_later();
+                return;
+            }
+        };
+        let shown: Vec<Prompt> = self.timing.visible().cloned().collect();
+        self.modal_timer.clear();
+        for prompt in &shown {
+            let modal = self.modal
+                && self
+                    .modal_timer
+                    .sync(prompt.id, prompt.state == RequestState::Waiting);
+            if let Err(err) = output.show(prompt, modal).await {
+                debug!(
+                    error = &err as &dyn std::error::Error,
+                    "display lost again while showing prompts"
+                );
+                self.retry_later();
+                return;
+            }
+        }
+        info!(
+            backend = output.backend(),
+            prompts = shown.len(),
+            "display connection restored; popups are enabled"
+        );
+        self.popups = Some(output);
+        self.reconnect = None;
+        self.restored_at = Some(Instant::now().into_std());
+    }
+
+    /// Schedules the attempt after a failed one, counted from now.
+    fn retry_later(&mut self) {
+        let previous = self.backoff;
+        let now = Instant::now().into_std();
+        let retry = Reconnect::after(now, previous).next(now);
+        self.backoff = retry.delay;
+        self.reconnect = Some(retry);
+        if retry.delay == RECONNECT_MAX && previous < RECONNECT_MAX {
+            info!(
+                retry_ms = RECONNECT_MAX.as_millis(),
+                "display still unavailable; retrying every minute"
+            );
+        } else {
+            debug!(
+                retry_ms = retry.delay.as_millis(),
+                "display still unavailable"
+            );
+        }
     }
 
     /// Returns the earliest time [`App::on_tick`] has work.
@@ -258,10 +396,15 @@ impl App {
             .popups
             .as_ref()
             .and_then(PopupOutput::next_overlay_deadline);
-        match (self.timing.next_deadline(), overlays) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        }
+        // While an attempt runs, its result wakes the loop instead.
+        let reconnect = self
+            .reconnect
+            .filter(|_| self.reopening.is_none())
+            .map(|retry| retry.at);
+        [self.timing.next_deadline(), overlays, reconnect]
+            .into_iter()
+            .flatten()
+            .min()
     }
 
     /// Reports whether the prompt's popups may hold overlays.
@@ -347,14 +490,53 @@ impl App {
         self.take_dismissed();
     }
 
-    /// Drops the display connection, which destroys every popup and overlay.
+    /// Drops the display connection, which destroys every popup and overlay,
+    /// and schedules reopening it. A connection lost within
+    /// [`RECONNECT_STABLE`] of being reopened keeps backing off.
     fn lose_popups(&mut self, err: &OutputError) {
-        warn!(
-            error = err as &dyn std::error::Error,
-            "display connection lost; popups are disabled"
-        );
         self.popups = None;
         self.modal_timer.clear();
+        if self.placement.is_none() {
+            warn!(
+                error = err as &dyn std::error::Error,
+                "display connection lost; popups are disabled"
+            );
+            return;
+        }
+        let now = Instant::now().into_std();
+        let flapping = self
+            .restored_at
+            .is_some_and(|at| now.saturating_duration_since(at) < RECONNECT_STABLE);
+        let retry = if flapping {
+            Reconnect::after(now, self.backoff).next(now)
+        } else {
+            Reconnect::after(now, RECONNECT_MIN)
+        };
+        self.backoff = retry.delay;
+        self.reconnect = Some(retry);
+        if flapping {
+            debug!(
+                error = err as &dyn std::error::Error,
+                retry_ms = retry.delay.as_millis(),
+                "display connection lost again soon after it was restored"
+            );
+        } else {
+            warn!(
+                error = err as &dyn std::error::Error,
+                retry_ms = retry.delay.as_millis(),
+                "display connection lost; reconnecting"
+            );
+        }
+    }
+}
+
+/// Waits for the attempt to reopen popups, or forever without one.
+async fn reopened(
+    task: Option<&mut JoinHandle<Option<PopupOutput>>>,
+) -> Result<Option<PopupOutput>, JoinError> {
+    match task {
+        Some(task) => task.await,
+        None => future::pending().await,
     }
 }
 
@@ -389,8 +571,12 @@ async fn run(mut app: App, mut queue: mpsc::Receiver<Msg>, cancel: CancellationT
             },
             () = sleep_until(next) => app.on_tick().await,
             incoming = read_display(app.popups.as_ref()) => app.on_incoming(incoming),
+            opened = reopened(app.reopening.as_mut()) => app.finish_reopen(opened).await,
         }
     };
+    if let Some(task) = app.reopening.take() {
+        task.abort();
+    }
     if let Some(mut output) = app.popups.take() {
         let hidden = match output.hide_all() {
             Ok(()) => output.dispatch().await,
@@ -488,6 +674,72 @@ mod tests {
 
     use super::*;
     use crate::Ui;
+
+    fn disconnected_app() -> App {
+        App {
+            timing: Timing::new(Duration::ZERO, Duration::ZERO),
+            popups: None,
+            placement: Some(Placement::new(&touchcue_core::config::Popup::default())),
+            reconnect: None,
+            reopening: None,
+            backoff: RECONNECT_MIN,
+            restored_at: None,
+            modal: false,
+            modal_timer: ModalTimer::default(),
+            notifier: None,
+        }
+    }
+
+    fn lost() -> OutputError {
+        OutputError::Wayland(wayland::WaylandIoError::Io(std::io::Error::other("lost")))
+    }
+
+    #[tokio::test]
+    async fn reconnect_time_is_no_deadline_while_an_attempt_runs() {
+        let mut app = disconnected_app();
+        let due = Instant::now().into_std();
+        app.reconnect = Some(Reconnect {
+            at: due,
+            delay: RECONNECT_MIN,
+        });
+        assert_eq!(app.next_deadline(), Some(due));
+        app.reopening = Some(tokio::spawn(future::pending()));
+        assert_eq!(app.next_deadline(), None);
+        if let Some(task) = app.reopening.take() {
+            task.abort();
+        }
+    }
+
+    #[test]
+    fn loss_soon_after_a_restore_keeps_backing_off() {
+        let mut app = disconnected_app();
+        let now = Instant::now().into_std();
+        app.backoff = Duration::from_secs(4);
+        app.restored_at = Some(now);
+        app.lose_popups(&lost());
+        assert_eq!(
+            app.reconnect.map(|retry| retry.delay),
+            Some(Duration::from_secs(8))
+        );
+        app.restored_at = now.checked_sub(RECONNECT_STABLE);
+        app.lose_popups(&lost());
+        assert_eq!(app.reconnect.map(|retry| retry.delay), Some(RECONNECT_MIN));
+    }
+
+    #[test]
+    fn reconnect_waits_twice_as_long_up_to_a_minute() {
+        let t0 = std::time::Instant::now();
+        let first = Reconnect::after(t0, RECONNECT_MIN);
+        assert_eq!(first.at, t0 + Duration::from_secs(1));
+        let mut retry = first;
+        let mut delays = Vec::new();
+        for _ in 0..8 {
+            retry = retry.next(t0);
+            delays.push(retry.delay.as_secs());
+        }
+        assert_eq!(delays, [2, 4, 8, 16, 32, 60, 60, 60]);
+        assert_eq!(retry.at, t0 + RECONNECT_MAX);
+    }
 
     const CHILD_ENV: &str = "TOUCHCUE_UI_PROBE_CHILD";
 
