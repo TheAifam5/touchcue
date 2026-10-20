@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::io::{self, IoSlice};
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::time::{Duration, Instant};
 
 use rustix::event::{PollFd, PollFlags, Timespec};
@@ -582,15 +582,6 @@ fn intern_and_query_randr(
     Ok((atoms, monitors))
 }
 
-/// The connection socket, registered with tokio for readiness only.
-struct SocketFd(RawFd);
-
-impl AsRawFd for SocketFd {
-    fn as_raw_fd(&self) -> RawFd {
-        self.0
-    }
-}
-
 /// Converts `value` to a window length, at least 1 and saturating at
 /// `u16::MAX`.
 fn clamp_length(value: i32) -> u16 {
@@ -622,8 +613,9 @@ struct X11Overlay {
 
 /// X11 client state; owns every popup window.
 pub(crate) struct X11Popups {
-    /// Declared before `conn` so it deregisters before the socket closes.
-    fd: AsyncFd<SocketFd>,
+    /// A duplicate of the connection socket, registered with tokio for
+    /// readiness only.
+    fd: AsyncFd<OwnedFd>,
     conn: RustConnection<TimedStream>,
     root: Window,
     visual: Visualid,
@@ -648,7 +640,12 @@ pub(crate) struct X11Popups {
 impl X11Popups {
     /// Registers the connection with the tokio reactor of the current runtime.
     pub(crate) fn new(connected: Connected, placement: Placement) -> Result<Self, X11Error> {
-        let fd = AsyncFd::new(SocketFd(connected.conn.stream().as_raw_fd()))?;
+        let socket = connected.conn.stream().as_fd().try_clone_to_owned()?;
+        // SAFETY: the `AsyncFd` takes ownership of the duplicated `OwnedFd`,
+        // which nothing else closes or replaces, and `OwnedFd::as_raw_fd`
+        // always returns the descriptor it owns.
+        #[expect(unsafe_code, reason = "tokio requires it to register a descriptor")]
+        let fd = unsafe { AsyncFd::register(socket) }.map_err(io::Error::from)?;
         Ok(Self {
             fd,
             conn: connected.conn,

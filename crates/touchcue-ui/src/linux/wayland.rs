@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
-use std::os::fd::{AsFd, AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, RawFd};
 use std::time::{Duration, Instant};
 
 use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState, Region, SurfaceData};
@@ -227,11 +227,16 @@ pub(crate) enum WaylandIoError {
 
 /// The connection socket, registered with tokio for readiness only: reads
 /// and writes go through `wayland-client`.
-struct WaylandFd(Connection);
+struct WaylandFd {
+    /// Keeps the socket open.
+    _conn: Connection,
+    /// The socket descriptor, read once from the connection.
+    fd: RawFd,
+}
 
 impl AsRawFd for WaylandFd {
     fn as_raw_fd(&self) -> RawFd {
-        self.0.backend().poll_fd().as_fd().as_raw_fd()
+        self.fd
     }
 }
 
@@ -244,10 +249,15 @@ pub(crate) struct WaylandIo {
 impl WaylandIo {
     /// Registers the connection with the tokio reactor of the current runtime.
     pub(crate) fn new(conn: Connection, queue: EventQueue<Popups>) -> io::Result<Self> {
-        Ok(Self {
-            queue,
-            fd: AsyncFd::new(WaylandFd(conn))?,
-        })
+        let fd = conn.backend().poll_fd().as_raw_fd();
+        let socket = WaylandFd { _conn: conn, fd };
+        // SAFETY: `as_raw_fd` returns the cached `fd`, and the `Connection`
+        // held next to it keeps that socket open: the backend creates the
+        // socket once when it connects and closes it only when its last
+        // `Connection` drops.
+        #[expect(unsafe_code, reason = "tokio requires it to register a descriptor")]
+        let fd = unsafe { AsyncFd::register(socket) }.map_err(io::Error::from)?;
+        Ok(Self { queue, fd })
     }
 
     /// Dispatches queued events to `popups`, then sends pending requests,

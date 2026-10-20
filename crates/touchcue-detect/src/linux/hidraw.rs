@@ -128,9 +128,13 @@ fn spawn_with(
         WatchFlags::CREATE | WatchFlags::DELETE | WatchFlags::ATTRIB,
     )
     .map_err(io("cannot watch device directory"))?;
-    let inotify = AsyncFd::new(inotify).map_err(|source| DetectError::Io {
+    // SAFETY: the `AsyncFd` takes ownership of the inotify `OwnedFd`, which
+    // nothing else closes or replaces, and `OwnedFd::as_raw_fd` always returns
+    // the descriptor it owns.
+    #[expect(unsafe_code, reason = "tokio requires it to register a descriptor")]
+    let inotify = unsafe { AsyncFd::register(inotify) }.map_err(|err| DetectError::Io {
         context: "cannot register inotify instance",
-        source,
+        source: err.into(),
     })?;
     let state = State::new(sys_root, dev_root, tx, cancel.clone(), open).reporting(devices);
     let task = tokio::spawn(
@@ -668,9 +672,15 @@ impl State {
                 return;
             }
         };
-        let fd = match AsyncFd::new(fd) {
+        // SAFETY: the `AsyncFd` takes ownership of the node's `OwnedFd`, which
+        // nothing else closes or replaces, and `OwnedFd::as_raw_fd` always
+        // returns the descriptor it owns.
+        #[expect(unsafe_code, reason = "tokio requires it to register a descriptor")]
+        let registered = unsafe { AsyncFd::register(fd) };
+        let fd = match registered {
             Ok(fd) => fd,
             Err(error) => {
+                let error = std::io::Error::from(error);
                 tracing::debug!(
                     node = name,
                     error = &error as &dyn std::error::Error,
@@ -816,7 +826,12 @@ mod tests {
         let (reader, writer) = std::io::pipe()?;
         let reader = OwnedFd::from(reader);
         rustix::fs::fcntl_setfl(&reader, OFlags::NONBLOCK)?;
-        Ok((AsyncFd::new(reader)?, writer))
+        // SAFETY: the `AsyncFd` takes ownership of the read end's `OwnedFd`,
+        // which nothing else closes or replaces, and `OwnedFd::as_raw_fd`
+        // always returns the descriptor it owns.
+        #[expect(unsafe_code, reason = "tokio requires it to register a descriptor")]
+        let reader = unsafe { AsyncFd::register(reader) }.map_err(std::io::Error::from)?;
+        Ok((reader, writer))
     }
 
     /// Opens a FIFO standing in for a hidraw node.
