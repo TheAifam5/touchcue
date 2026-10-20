@@ -27,6 +27,10 @@ use linux as platform;
 #[cfg(not(target_os = "linux"))]
 use stub as platform;
 
+#[cfg(target_os = "linux")]
+#[doc(hidden)]
+pub use linux::offscreen::{OffscreenError, OffscreenStack};
+
 /// Time the UI task is given to stop after its commands channel closes or
 /// its cancellation token fires.
 pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);

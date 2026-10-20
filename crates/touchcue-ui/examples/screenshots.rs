@@ -1,5 +1,6 @@
 //! Shows one built-in screenshot scenario of the popup or notification UI
-//! on the current Wayland display, for `scripts/screenshots.sh`.
+//! on the current Wayland display, for `scripts/screenshots.sh`, or renders
+//! the frames of an animation without a display, for `scripts/hero.sh`.
 //!
 //! `screenshots --list` prints the scenario names, one per line, after
 //! checking that every scenario configuration parses; it opens no display.
@@ -12,6 +13,11 @@
 //! line arrives on stdin after `ready`, times them from that line, prints
 //! `done` once the last change has lingered for [`ANIM_TAIL`], and then
 //! holds the prompts the same way.
+//!
+//! `screenshots --frames <film> <dir> [--fps <n>]` writes the frames of a
+//! looping film, `hero`, as transparent RGBA PNG files `frame-NNNN.png` in
+//! `<dir>`, at scale 2 and [`DEFAULT_FPS`] unless `--fps` is given. Frames
+//! are rendered at exact times, so repeated runs write identical files.
 //!
 //! Popups are pinned to the output named by `TOUCHCUE_SCREENSHOT_OUTPUT`,
 //! `SHOT` by default, except where a scenario targets every output.
@@ -31,7 +37,10 @@ fn main() -> Result<(), linux::ShotError> {
 #[cfg(target_os = "linux")]
 mod linux {
     use std::env::{self, VarError};
+    use std::ffi::OsString;
+    use std::fs;
     use std::io::{self, Write as _};
+    use std::num::{NonZeroU32, ParseIntError};
     use std::path::{Path, PathBuf};
     use std::time::Duration;
 
@@ -41,7 +50,10 @@ mod linux {
     use tokio_util::sync::CancellationToken;
     use touchcue_core::config::OutputTarget;
     use touchcue_core::{Config, ConfigError, EndReason, RequestId, RequestState};
-    use touchcue_ui::{Backend, Command, Prompt, SHUTDOWN_TIMEOUT, Ui, UiConfig, UiError};
+    use touchcue_ui::{
+        Backend, Command, OffscreenError, OffscreenStack, Prompt, SHUTDOWN_TIMEOUT, Ui, UiConfig,
+        UiError,
+    };
     use tracing::{error, info, instrument};
     use tracing_subscriber::EnvFilter;
 
@@ -72,12 +84,28 @@ mod linux {
     const TOUCHED: RequestState = RequestState::Lingering(EndReason::Touched);
     const CANCELLED: RequestState = RequestState::Lingering(EndReason::Cancelled);
     const TIMED_OUT: RequestState = RequestState::Lingering(EndReason::TimedOut);
+    /// Frame rate of `--frames` without `--fps`.
+    const DEFAULT_FPS: NonZeroU32 = NonZeroU32::MIN.saturating_add(29);
 
     /// A screenshot example failure.
     #[derive(Debug, thiserror::Error)]
     pub(super) enum ShotError {
-        #[error("usage: screenshots <scenario> | --list")]
+        #[error("usage: screenshots <scenario> | --list | --frames <film> <dir> [--fps <n>]")]
         Usage,
+        #[error("argument {0:?} is not valid UTF-8")]
+        Argument(OsString),
+        #[error("the frame rate is not a positive integer")]
+        Fps(#[source] ParseIntError),
+        #[error(transparent)]
+        Offscreen(#[from] OffscreenError),
+        #[error("failed to encode a frame")]
+        Png(#[from] png::EncodingError),
+        #[error("failed to write {}", path.display())]
+        Write {
+            path: PathBuf,
+            #[source]
+            source: io::Error,
+        },
         #[error("unknown scenario {0:?}; run with --list")]
         UnknownScenario(String),
         #[error("the configuration of scenario {scenario} is invalid")]
@@ -316,6 +344,49 @@ mod linux {
         },
     ];
 
+    /// A state change of a film: `at` from the start, prompt `id` moves to
+    /// `state`.
+    struct Change {
+        at: Duration,
+        id: RequestId,
+        state: RequestState,
+    }
+
+    /// A looping animation rendered offscreen; prompt `n` of `shots` has
+    /// id `n + 1` and starts waiting.
+    struct Film {
+        name: &'static str,
+        shots: &'static [Shot],
+        /// Changes in time order.
+        changes: &'static [Change],
+        length: Duration,
+    }
+
+    const fn change(at_ms: u64, id: u64, state: RequestState) -> Change {
+        Change {
+            at: Duration::from_millis(at_ms),
+            id: RequestId(id),
+            state,
+        }
+    }
+
+    /// Spinners return 1.2 s, one spinner turn, before the end, so the last
+    /// frame leads into the first.
+    const FILMS: &[Film] = &[Film {
+        name: "hero",
+        shots: &[
+            waiting(BROWSER, "browser.svg"),
+            waiting(AGENT, "terminal.svg"),
+        ],
+        changes: &[
+            change(1200, 1, TOUCHED),
+            change(1600, 2, TIMED_OUT),
+            change(2800, 1, RequestState::Waiting),
+            change(2800, 2, RequestState::Waiting),
+        ],
+        length: Duration::from_millis(4000),
+    }];
+
     /// What released the held prompts.
     #[derive(Debug, Clone, Copy)]
     enum Release {
@@ -358,16 +429,22 @@ mod linux {
 
     pub(super) fn main() -> Result<(), ShotError> {
         init_logging();
-        let mut args = env::args_os().skip(1);
-        let (Some(arg), None) = (args.next(), args.next()) else {
-            return Err(ShotError::Usage);
+        let args: Vec<String> = env::args_os()
+            .skip(1)
+            .map(|arg| arg.into_string().map_err(ShotError::Argument))
+            .collect::<Result<_, _>>()?;
+        let arg = match args.as_slice() {
+            [arg] if arg == "--list" => return list(),
+            [arg] => arg.as_str(),
+            [flag, film, dir] if flag == "--frames" => {
+                return frames(film, Path::new(dir), DEFAULT_FPS);
+            }
+            [flag, film, dir, fps_flag, fps] if flag == "--frames" && fps_flag == "--fps" => {
+                let fps = fps.parse().map_err(ShotError::Fps)?;
+                return frames(film, Path::new(dir), fps);
+            }
+            _ => return Err(ShotError::Usage),
         };
-        let Some(arg) = arg.to_str() else {
-            return Err(ShotError::Usage);
-        };
-        if arg == "--list" {
-            return list();
-        }
         let scenario = SCENARIOS
             .iter()
             .find(|scenario| scenario.name == arg)
@@ -496,6 +573,47 @@ mod linux {
         show(ui, scenario, assets, ids).await?;
         say(format_args!("ready {}", scenario.namespace))?;
         hold(ui, scenario, assets, ids, releases).await
+    }
+
+    /// Writes the frames of film `name` at `fps` to `dir`, which is created
+    /// when missing.
+    fn frames(name: &str, dir: &Path, fps: NonZeroU32) -> Result<(), ShotError> {
+        let film = FILMS
+            .iter()
+            .find(|film| film.name == name)
+            .ok_or_else(|| ShotError::UnknownScenario(name.to_owned()))?;
+        let assets = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/assets");
+        let prompts: Vec<Prompt> = (1..)
+            .map(RequestId)
+            .zip(film.shots)
+            .map(|(id, shot)| prompt(&assets, id, shot, RequestState::Waiting))
+            .collect();
+        let mut stack = OffscreenStack::new(&prompts)?;
+        let (width, height) = stack.size();
+        fs::create_dir_all(dir).map_err(|source| ShotError::Write {
+            path: dir.to_owned(),
+            source,
+        })?;
+        let mut changes = film.changes.iter().peekable();
+        for index in 0_u64.. {
+            let at = Duration::from_secs(index) / fps.get();
+            if at >= film.length {
+                break;
+            }
+            while let Some(change) = changes.next_if(|change| change.at <= at) {
+                stack.set_state(change.id, change.state, change.at);
+            }
+            let mut png = Vec::new();
+            let mut encoder = png::Encoder::new(&mut png, width, height);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header()?;
+            writer.write_image_data(&stack.frame(at))?;
+            writer.finish()?;
+            let path = dir.join(format!("frame-{index:04}.png"));
+            fs::write(&path, png).map_err(|source| ShotError::Write { path, source })?;
+        }
+        Ok(())
     }
 
     fn prompt(assets: &Path, id: RequestId, shot: &Shot, state: RequestState) -> Prompt {

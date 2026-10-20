@@ -58,7 +58,7 @@ const MODAL_NAMESPACE: &str = "touchcue-modal";
 /// Distance from the screen edges, in pixels.
 const MARGIN: i32 = 16;
 /// Vertical space between stacked popups, in pixels.
-const SPACING: i32 = 8;
+pub(super) const SPACING: i32 = 8;
 /// Initial size of the shared memory pool: one popup of 256 rows.
 const POOL_BYTES: usize = WIDTH as usize * 256 * 4;
 /// Linux input codes of the buttons that dismiss an overlay; others, such

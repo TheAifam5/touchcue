@@ -268,7 +268,7 @@ pub(crate) fn icon_pixels(scale: f32) -> u32 {
 
 /// Reads and decodes a PNG or SVG icon scaled to fit `size` pixels square.
 #[instrument(level = "debug", skip_all, fields(path = %log_path(path), size))]
-fn load_icon(path: &Path, size: u32) -> Result<Pixmap, IconError> {
+pub(super) fn load_icon(path: &Path, size: u32) -> Result<Pixmap, IconError> {
     let data = read_icon(path)?;
     let mut icon = Pixmap::new(size, size).ok_or(IconError::Empty)?;
     if data.starts_with(PNG_MAGIC) {

@@ -5,6 +5,7 @@ mod icon;
 mod modal;
 mod motion;
 mod notify;
+pub(crate) mod offscreen;
 mod output;
 mod placement;
 mod render;
