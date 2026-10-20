@@ -31,6 +31,10 @@ pub enum PortalError {
     TimedOut(#[source] tokio::time::error::Elapsed),
     #[error("portal setting is not a string")]
     NotString,
+    #[error("portal setting is not an unsigned 32-bit integer")]
+    NotU32,
+    #[error("portal setting is not a boolean")]
+    NotBool,
 }
 
 /// A session bus connection for reading portal settings.
@@ -49,7 +53,7 @@ impl Portal {
     /// [`PortalError::NoPortal`] when no portal runs or can be started by the
     /// bus, and
     /// [`PortalError::TimedOut`] when the bus does not answer in time.
-    #[tracing::instrument(name = "portal_connect", skip_all, err(level = "debug"))]
+    #[tracing::instrument(name = "portal_connect", skip_all)]
     pub async fn connect() -> Result<Self, PortalError> {
         timeout(PORTAL_TIMEOUT, Self::setup())
             .await
@@ -94,6 +98,37 @@ impl Portal {
         namespace: &str,
         key: &str,
     ) -> Result<Option<String>, PortalError> {
+        let value = self.read_one(namespace, key).await?;
+        string_setting(&value)
+    }
+
+    /// Returns the unsigned 32-bit setting `key` of `namespace` through
+    /// `org.freedesktop.portal.Settings.ReadOne`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Portal::read_string`], with [`PortalError::NotU32`] for a value
+    /// of another type.
+    #[tracing::instrument(name = "portal_read", skip_all, fields(namespace = %namespace, key = %key))]
+    pub async fn read_u32(&self, namespace: &str, key: &str) -> Result<u32, PortalError> {
+        let value = self.read_one(namespace, key).await?;
+        u32_setting(&value)
+    }
+
+    /// Returns the boolean setting `key` of `namespace` through
+    /// `org.freedesktop.portal.Settings.ReadOne`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Portal::read_string`], with [`PortalError::NotBool`] for a value
+    /// of another type.
+    #[tracing::instrument(name = "portal_read", skip_all, fields(namespace = %namespace, key = %key))]
+    pub async fn read_bool(&self, namespace: &str, key: &str) -> Result<bool, PortalError> {
+        let value = self.read_one(namespace, key).await?;
+        bool_setting(&value)
+    }
+
+    async fn read_one(&self, namespace: &str, key: &str) -> Result<OwnedVariant, PortalError> {
         let body = (namespace, key);
         let call =
             self.conn
@@ -102,8 +137,7 @@ impl Portal {
             .await
             .map_err(PortalError::TimedOut)?
             .map_err(PortalError::Call)?;
-        let value: OwnedVariant = reply.body().deserialize().map_err(PortalError::Call)?;
-        string_setting(&value)
+        reply.body().deserialize().map_err(PortalError::Call)
     }
 }
 
@@ -113,9 +147,9 @@ fn portal_available(owned: bool, activatable: bool) -> bool {
     owned || activatable
 }
 
-/// Returns the string held by `value`, unwrapping at most
-/// [`MAX_VARIANT_DEPTH`] nested variants, or `None` for an empty string.
-fn string_setting(value: &Variant<'_>) -> Result<Option<String>, PortalError> {
+/// Returns the innermost value of `value`, unwrapping at most
+/// [`MAX_VARIANT_DEPTH`] nested variants.
+fn unwrapped<'a>(value: &'a Variant<'a>) -> &'a Variant<'a> {
     let mut value = value;
     for _ in 0..MAX_VARIANT_DEPTH {
         match value {
@@ -123,10 +157,34 @@ fn string_setting(value: &Variant<'_>) -> Result<Option<String>, PortalError> {
             _ => break,
         }
     }
-    match value {
+    value
+}
+
+/// Returns the string held by `value`, unwrapping at most
+/// [`MAX_VARIANT_DEPTH`] nested variants, or `None` for an empty string.
+fn string_setting(value: &Variant<'_>) -> Result<Option<String>, PortalError> {
+    match unwrapped(value) {
         Variant::Str(text) if text.is_empty() => Ok(None),
         Variant::Str(text) => Ok(Some(text.as_str().to_owned())),
         _ => Err(PortalError::NotString),
+    }
+}
+
+/// Returns the `u32` held by `value`, unwrapping at most
+/// [`MAX_VARIANT_DEPTH`] nested variants.
+fn u32_setting(value: &Variant<'_>) -> Result<u32, PortalError> {
+    match unwrapped(value) {
+        Variant::U32(number) => Ok(*number),
+        _ => Err(PortalError::NotU32),
+    }
+}
+
+/// Returns the boolean held by `value`, unwrapping at most
+/// [`MAX_VARIANT_DEPTH`] nested variants.
+fn bool_setting(value: &Variant<'_>) -> Result<bool, PortalError> {
+    match unwrapped(value) {
+        Variant::Bool(flag) => Ok(*flag),
+        _ => Err(PortalError::NotBool),
     }
 }
 
@@ -165,6 +223,28 @@ mod tests {
         assert!(matches!(
             string_setting(&nested(3)),
             Err(PortalError::NotString)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn reply_values_become_numbers_and_flags() -> Result<(), PortalError> {
+        assert_eq!(u32_setting(&Variant::from(1_u32))?, 1);
+        assert_eq!(
+            u32_setting(&Variant::Variant(Box::new(Variant::from(0_u32))))?,
+            0
+        );
+        assert!(matches!(
+            u32_setting(&Variant::from(1_i32)),
+            Err(PortalError::NotU32)
+        ));
+        assert!(!bool_setting(&Variant::from(false))?);
+        assert!(bool_setting(&Variant::Variant(Box::new(Variant::from(
+            true
+        ))))?);
+        assert!(matches!(
+            bool_setting(&Variant::from("false")),
+            Err(PortalError::NotBool)
         ));
         Ok(())
     }
