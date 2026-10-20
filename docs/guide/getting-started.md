@@ -80,7 +80,7 @@ In the foreground:
 touchcue run -v
 ```
 
-`-v` logs at info level and `-vv` at debug level; the `TOUCHCUE_LOG` environment variable takes a `tracing` filter and overrides both.
+`-v` logs at info level and `-vv` at debug level; the `TOUCHCUE_LOG` environment variable takes a `tracing` filter and overrides both. Logs and `touchcue check` use colors only on a terminal; setting `NO_COLOR` to any non-empty value turns them off.
 
 ### As a systemd user service
 
