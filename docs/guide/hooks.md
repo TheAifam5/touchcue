@@ -113,7 +113,7 @@ A process that exits before its request ends, with any exit status, or that cann
 A process gets the [environment](#environment) of other hooks, with these differences:
 
 - `TOUCHCUE_EVENT` is `show` for the first process of a request, and `update` for a process started again after a change or after the prompt was suppressed.
-- `TOUCHCUE_TITLE` and `TOUCHCUE_BODY` are the prompt title and body exactly as the notification shows them, after rules, with the same cleaning and length limit as the other values. While a request lingers after it was cancelled or timed out, the body ends with `(cancelled)` or `(timed out)`, as in the notification; `TOUCHCUE_REQUEST_STATE` holds the state for a script that words the outcome itself. These values use the configured templates and may include unpublished placeholders, including command lines.
+- `TOUCHCUE_TITLE` and `TOUCHCUE_BODY` are the prompt title and body exactly as the notification shows them, after rules, with the same cleaning and length limit as the other values. While a request lingers after it was cancelled or timed out, the body ends with `(cancelled)` or `(timed out)` in the prompt's [language](./configuration#locale), as in the notification; `TOUCHCUE_REQUEST_STATE` holds the state for a script that words the outcome itself. These values use the configured templates and may include unpublished placeholders, including command lines.
 
 Other hooks get no `TOUCHCUE_TITLE` or `TOUCHCUE_BODY`: they also run for suppressed and ended requests, which have no prompt.
 

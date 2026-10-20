@@ -72,7 +72,7 @@ The requester is the program you started inside the application: touchcue walks 
 
 Names are matched against the skip list by `comm`, else by the executable's file name when `comm` cannot be read. Matching is exact and case-sensitive, an entry ending in `*` is a prefix, and `comm` holds at most 15 bytes, so a longer name needs a prefix entry. `requester.*` is empty when there is no requester; when the application is found through its systemd unit, the application end of the walk is the topmost process of that unit, the one that started the application. The walk stops at the first process whose names cannot be read or whose pid was reused; the requester is then the best guess among the processes read before it.
 
-`requester.label` combines both names: `<requester.name> in <app.name>` when both are known and differ other than in ASCII case, otherwise whichever of `app.name` and `requester.name` is known, and empty when neither is. It is at most 260 characters. Like the names it is built from, it is published to IPC clients and hooks.
+`requester.label` combines both names: `<requester.name> in <app.name>` (`w` instead of `in` in Polish) when both are known and differ other than in ASCII case, otherwise whichever of `app.name` and `requester.name` is known, and empty when neither is. It is at most 260 characters. Like the names it is built from, it is published to IPC clients and hooks.
 
 Limits:
 
@@ -102,16 +102,18 @@ Limits:
 
 `request.confidence` is `high` when one process holds the FIDO device open, or when an OpenPGP request is the next OpenPGP card operation within 30 s after a confirmed pinentry PIN or confirmation dialog whose client is still connected to gpg-agent (see [GPG](./gpg#pin-dialog-attribution)); `medium` when several processes hold the FIDO device open or when the client is otherwise chosen among the clients of gpg-agent for an OpenPGP request; and `low` otherwise.
 
-`request.action` words `request.method` and `request.op` for the default body. Rules and hooks should compare `request.method`, `request.op` and `request.source`, whose values stay fixed; the wording of `request.action` may change.
+`request.action` words `request.method` and `request.op` for the default body, in the language of [`locale`](./configuration#locale). Rules and hooks should compare `request.method`, `request.op` and `request.source`, whose values stay fixed; the wording and language of `request.action` may change.
 
-| Request | `request.action` |
-| --- | --- |
-| FIDO2 or U2F | `a passkey` |
-| OpenPGP `sign` | `a GPG signature` |
-| OpenPGP `decrypt` | `GPG decryption` |
-| OpenPGP `auth` | `GPG authentication` |
-| OpenPGP with `source` `ssh` | `an SSH login` |
-| other OpenPGP operations | `a GPG operation` |
+| Request | English | Polish | German |
+| --- | --- | --- | --- |
+| FIDO2 or U2F | `a passkey` | `potwierdzenie kluczem dostępu` | `eine Bestätigung per Passkey` |
+| OpenPGP `sign` | `a GPG signature` | `podpis GPG` | `das Signieren mit GPG` |
+| OpenPGP `decrypt` | `GPG decryption` | `odszyfrowanie GPG` | `das Entschlüsseln mit GPG` |
+| OpenPGP `auth` | `GPG authentication` | `uwierzytelnienie GPG` | `die Authentifizierung mit GPG` |
+| OpenPGP with `source` `ssh` | `an SSH login` | `logowanie przez SSH` | `eine SSH-Anmeldung` |
+| other OpenPGP operations | `a GPG operation` | `operację GPG` | `einen GPG-Vorgang` |
+
+The Polish and German wordings follow `czeka na` and `wartet auf` in the default body, so they are in the accusative case.
 
 The FIDO source cannot tell a sign-in from a registration. An OpenSSH security key is a FIDO request too; a rule matching `requester.name = "ssh"` can word it differently.
 

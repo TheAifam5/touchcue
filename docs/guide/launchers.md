@@ -1,6 +1,6 @@
 # Launchers
 
-touchcue can show the prompt through programs of your choice, such as rofi, fuzzel, `hyprctl notify` or a status bar script. touchcue contains no code for any of them: a [hook with `until = "ended"`](./hooks#hooks-that-last-for-a-request) runs the program for as long as a request lasts and gives it the prompt in `TOUCHCUE_TITLE` and `TOUCHCUE_BODY`, the text the notification shows, including `(cancelled)` or `(timed out)` while the prompt lingers, and on stdin a JSON line when the prompt is shown and when it goes away, and with `on_change = "stream"` one for every change in between. It runs on Linux.
+touchcue can show the prompt through programs of your choice, such as rofi, fuzzel, `hyprctl notify` or a status bar script. touchcue contains no code for any of them: a [hook with `until = "ended"`](./hooks#hooks-that-last-for-a-request) runs the program for as long as a request lasts and gives it the prompt in `TOUCHCUE_TITLE` and `TOUCHCUE_BODY`, the text the notification shows, including `(cancelled)` or `(timed out)` in the prompt's [language](./configuration#locale) while the prompt lingers, and on stdin a JSON line when the prompt is shown and when it goes away, and with `on_change = "stream"` one for every change in between. It runs on Linux.
 
 ```toml
 [output]

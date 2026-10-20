@@ -9,6 +9,8 @@ Every key is optional. Unknown keys and out-of-range values are errors: `touchcu
 The defaults, written out:
 
 ```toml
+# locale is read from the environment when unset
+
 [output]
 mode = "popup"
 fallback = "notification"
@@ -60,6 +62,21 @@ skip = [
   "systemd", "init",
 ]
 extend_skip = []
+```
+
+## `locale`
+
+| Key | Values | Default |
+| --- | --- | --- |
+| `locale` | a locale name such as `pl`, `de` or `pl_PL.UTF-8` | from the environment |
+
+`locale` chooses the language of the built-in prompt text: the default title and body, [`request.action`](./placeholders#values), and the `(cancelled)` and `(timed out)` suffix. English, Polish (`pl`) and German (`de`) are available. Without `locale`, or with an empty one, `touchcue run` reads the first non-empty of `LC_ALL`, `LC_MESSAGES` and `LANG` once at start. The language is the part of the name before the first `_`, `.` or `@`; `C`, `POSIX` and other languages mean English; the first non-empty value decides, so an unknown `locale` does not fall back to the environment. Templates you write are not translated. As a top-level key, `locale` goes before the first `[section]` of the file:
+
+```toml
+locale = "pl"
+
+[output]
+mode = "popup"
 ```
 
 ## `[output]`
@@ -183,9 +200,18 @@ Without `theme`, `touchcue run` detects the theme once at start, from the first 
 | `body` | `{{ requester.label or process.name or "An application" }} is waiting for {{ request.action }}` |
 :::
 
+These are the English defaults. With Polish or German as the [`locale`](#locale), the defaults are:
+
+::: v-pre
+| Language | `title` | `body` |
+| --- | --- | --- |
+| Polish | `Dotknij klucza {{ device.vendor or "bezpieczeństwa" }}` | `{{ requester.label or process.name or "Aplikacja" }} czeka na {{ request.action }}` |
+| German | `Bitte {{ device.vendor ~ "-Schlüssel" if device.vendor else "Sicherheitsschlüssel" }} berühren` | `{{ requester.label or process.name or "Eine Anwendung" }} wartet auf {{ request.action }}` |
+:::
+
 The default body names the requester and its application through [`requester.label`](./placeholders#requester): `claude in Kitty is waiting for a GPG signature`, or `Firefox is waiting for a passkey` when the application asks itself. [`request.action`](./placeholders#values) words what the request waits for.
 
-Templates use Jinja syntax with [placeholders](./placeholders#template-syntax). A template that fails while rendering is replaced by the next of: the matching rule's template, the `[templates]` template, the default above, and an empty text. A request that ended without a touch keeps its prompt briefly: the popup shows the outcome in its [state overlay](#state-overlay), and a notification appends `(cancelled)` or `(timed out)` to the body.
+Templates use Jinja syntax with [placeholders](./placeholders#template-syntax). A template that fails while rendering is replaced by the next of: the matching rule's template, the `[templates]` template, the default above, and an empty text. A request that ended without a touch keeps its prompt briefly: the popup shows the outcome in its [state overlay](#state-overlay), and a notification appends `(cancelled)` or `(timed out)` to the body, in Polish `(anulowano)` or `(upłynął limit czasu)`, in German `(abgebrochen)` or `(Zeitüberschreitung)`.
 
 The title wraps to at most two lines and the body to at most six; longer text ends with an ellipsis:
 
