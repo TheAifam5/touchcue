@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/TheAifam5/touchcue/compare/v0.2.1...v0.3.0) - 2026-10-20
+
+### Added
+
+- *(core)* add the request.action placeholder for the default body
+- *(ui)* draw popups at the output's scale
+- *(ui)* reconnect to the display after the connection is lost
+
+### Fixed
+
+- *(ui)* share one modal overlay per output with fallback popups
+- *(ui)* stack fallback popups with the output they are on
+
+### Other
+
+- *(cli)* upgrade usage-rs to 7.1.0
+- *(core)* upgrade minijinja to 3.0.1
+- *(deps)* update tokio to 1.54.0
+- update Cargo.toml dependencies
+- *(deps)* upgrade zbus to 6.0.0
+- *(ui)* reword the screenshot example prompts
+
 ## [0.2.1](https://github.com/TheAifam5/touchcue/compare/v0.2.0...v0.2.1) - 2026-10-08
 
 ### Fixed

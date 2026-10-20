@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/TheAifam5/touchcue/compare/v0.2.1...v0.3.0) - 2026-10-20
+
+### Added
+
+- *(core)* add the request.action placeholder for the default body
+
+### Other
+
+- *(core)* upgrade minijinja to 3.0.1
+
 ## [0.2.0](https://github.com/TheAifam5/touchcue/compare/v0.1.1...v0.2.0) - 2026-10-08
 
 ### Added
