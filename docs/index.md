@@ -6,8 +6,8 @@ hero:
   text: Shows who is waiting for your security key touch
   tagline: Early development. Works on Linux for FIDO2/U2F keys and OpenPGP cards through gpg-agent.
   image:
-    src: /screenshots/stacked.png
-    alt: Two stacked touchcue popups
+    src: /screenshots/hero.webp
+    alt: Two stacked touchcue popups, a browser waiting for a passkey and claude in Terminal waiting for a GPG signature, whose spinners turn into a check mark for the touch and a clock for the timeout
   actions:
     - theme: brand
       text: Get started
