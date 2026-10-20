@@ -4,7 +4,7 @@ Templates in `[templates]` and `[[rules]]` substitute values from the current to
 
 ## Template syntax
 
-Templates use Jinja syntax, rendered by [MiniJinja](https://docs.rs/minijinja/2/minijinja/syntax/index.html). Earlier versions of touchcue used single braces, as in `{app.name|"An application"}`; such a template is now a configuration error. A placeholder `namespace.field` from the table below is written as an attribute, such as `app.name`:
+Templates use Jinja syntax, rendered by [MiniJinja](https://docs.rs/minijinja/3/minijinja/syntax/index.html). Earlier versions of touchcue used single braces, as in `{app.name|"An application"}`; such a template is now a configuration error. A placeholder `namespace.field` from the table below is written as an attribute, such as `app.name`:
 
 ```text
 {{ request.method }}                               the value of a placeholder
@@ -21,7 +21,7 @@ Templates use Jinja syntax, rendered by [MiniJinja](https://docs.rs/minijinja/2/
 ::: v-pre
 - Every value is a string. A value that is not known is undefined: it renders empty and is false, and so is an empty string. `app.name` renders empty when there is no application.
 - Comparisons compare strings, as in `request.count == "2"`. Convert with `int` to compare numbers: `request.count | int > 1`. A comparison printed directly renders `True` or `False`.
-- The built-in [filters](https://docs.rs/minijinja/2/minijinja/filters/index.html) and [tests](https://docs.rs/minijinja/2/minijinja/tests/index.html) are available, for example the filters `upper`, `lower`, `title`, `capitalize`, `trim`, `replace`, `default`, `first`, `length` and `int`, and the tests `defined`, `startingwith`, `endingwith` and `in`. The filters `format`, `indent`, `slice` and `batch` are not available. Of the global functions, `range`, `dict` and `namespace` are available. Methods, as in `app.name.upper()`, are not: use a filter.
+- The built-in [filters](https://docs.rs/minijinja/3/minijinja/filters/index.html) and [tests](https://docs.rs/minijinja/3/minijinja/tests/index.html) are available, for example the filters `upper`, `lower`, `title`, `capitalize`, `trim`, `replace`, `default`, `first`, `length` and `int`, and the tests `defined`, `startingwith`, `endingwith` and `in`. The filters `format`, `indent`, `slice` and `batch` are not available. Of the global functions, `range`, `dict` and `namespace` are available. Methods, as in `app.name.upper()`, are not: use a filter.
 - `{% set %}`, `{% with %}`, `{% for %}` and `{% filter %}` work. Macros, `include`, `extends` and `import` do not: they are syntax errors.
 - Whitespace is kept as written, except that one trailing newline of the template is removed. A `-` inside a block's delimiter, as in `{%-`, `-%}`, `{{-` or `-}}`, removes the whitespace, newlines included, on that side of the block; this helps in templates written as multi-line TOML strings.
 - The output is plain text and is not HTML-escaped.

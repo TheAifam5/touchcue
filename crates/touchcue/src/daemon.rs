@@ -748,6 +748,8 @@ fn values(
 /// error kind and the error chain, never the placeholder values.
 pub struct Renderer {
     config: Arc<Config>,
+    /// [`Config::rendered`]; replaced in tests to make a render fail.
+    render: fn(&Config, &BTreeMap<String, String>) -> Option<Rendered>,
     /// Held by the one running render.
     busy: Arc<Semaphore>,
     /// Per template name, so at most one per template of the configuration.
@@ -761,6 +763,7 @@ impl Renderer {
     pub fn new(config: Config) -> Self {
         Self {
             config: Arc::new(config),
+            render: Config::rendered,
             busy: Arc::new(Semaphore::new(1)),
             limits: BTreeMap::new(),
             unfinished_limits: BTreeMap::new(),
@@ -785,11 +788,12 @@ impl Renderer {
         let (reason, failure) = match Arc::clone(&self.busy).try_acquire_owned() {
             Ok(permit) => {
                 let config = Arc::clone(&self.config);
+                let render = self.render;
                 let owned = values.clone();
                 let started = Instant::now();
                 let task = tokio::task::spawn_blocking(move || {
                     let _permit = permit;
-                    config.rendered(&owned)
+                    render(&config, &owned)
                 });
                 let result = tokio::time::timeout(RENDER_TIMEOUT, task).await;
                 tracing::debug!(elapsed_ms = millis(started.elapsed()), "rendered templates");
@@ -1188,13 +1192,11 @@ mod tests {
         Ok(())
     }
 
-    /// Relies on minijinja's unchecked `len * n` in sequence repetition,
-    /// which panics only when overflow checks are on.
-    #[cfg(debug_assertions)]
     #[tokio::test]
     async fn panicked_renders_use_the_built_in_templates() -> TestResult {
         let now = Instant::now();
-        let mut renderer = Renderer::new(icon_rule("{{ (([1, 2] * 10**19) | length) }}")?);
+        let mut renderer = Renderer::new(icon_rule("{{ app.name }}")?);
+        renderer.render = |_, _| std::panic::resume_unwind(Box::new("render failed"));
         let (_, prompt) = render(
             &mut renderer,
             &request(RequestState::Waiting),
@@ -1206,8 +1208,10 @@ mod tests {
         let prompt = prompt.ok_or(TestError::NoPrompt)?;
         assert_eq!(prompt.body, "Firefox is waiting for a passkey");
         assert_eq!(prompt.icon, Some(PathBuf::from("/icons/fixture.svg")));
+        // The failure was logged, so the next one within the interval is not.
         let panicked = renderer.unfinished_limits.get_mut("panicked");
         assert_eq!(panicked.and_then(|limit| limit.check(now)), None);
+        assert!(renderer.unfinished_limits.contains_key("panicked"));
         Ok(())
     }
 

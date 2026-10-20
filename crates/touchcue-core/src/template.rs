@@ -10,8 +10,8 @@
 //!
 //! Templates are trusted configuration. [`FUEL`] and [`OUTPUT_MAX`] bound a
 //! render's instructions and output, but not the strings it builds on the
-//! way: one `*` may build 100 MB, and `~` may double a string per
-//! instruction.
+//! way: one `*` may build a 100 MB string or a 100 million item sequence
+//! of about 2.4 GB, and `~` may double a string per instruction.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -314,13 +314,13 @@ impl Template {
         &self,
         values: &BTreeMap<String, String>,
     ) -> Result<(String, Option<u64>), RenderError> {
-        let mut context: BTreeMap<&str, BTreeMap<&str, &str>> = BTreeMap::new();
+        let mut context: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
         for (key, value) in values {
             if let Some((namespace, attribute)) = key.split_once('.') {
                 context
-                    .entry(namespace)
+                    .entry(namespace.to_owned())
                     .or_default()
-                    .insert(attribute, value);
+                    .insert(attribute.to_owned(), value.clone());
             }
         }
         let error = |source| RenderError {
@@ -336,7 +336,7 @@ impl Template {
         let template = self.env.get_template(&self.name).map_err(error)?;
         let mut output = Capped(Vec::new());
         let captured = template
-            .render_captured_to(&context, &mut output)
+            .render_captured_to(context, &mut output)
             .map_err(error)?;
         let fuel = captured.state().fuel_levels().map(|(consumed, _)| consumed);
         // Whole `&str` chunks are written, so the bytes are UTF-8.
