@@ -210,6 +210,8 @@ pub struct Popup {
     pub modal_dim: Opacity,
     /// A click outside the popup hides the popup of the waiting request.
     pub modal_dismiss: bool,
+    /// Animates the state overlay on the popup icon.
+    pub animations: bool,
 }
 
 impl Default for Popup {
@@ -222,6 +224,7 @@ impl Default for Popup {
             modal: false,
             modal_dim: Opacity(0.4),
             modal_dismiss: true,
+            animations: true,
         }
     }
 }
@@ -1418,6 +1421,7 @@ mod tests {
         assert_eq!(parsed.popup.position, Position::Center);
         assert_eq!(parsed.popup.output, OutputTarget::Focused);
         assert!(!parsed.popup.modal && parsed.popup.modal_dismiss);
+        assert!(parsed.popup.animations);
         assert!((parsed.popup.modal_dim.get() - 0.4).abs() < f32::EPSILON);
         assert_eq!(parsed.popup.min_display_ms, 800);
         assert_eq!(parsed.notification.urgency, Urgency::Critical);
@@ -1620,6 +1624,8 @@ mod tests {
         assert!(modal.modal && !modal.modal_dismiss);
         assert!(modal.modal_dim.get().abs() < f32::EPSILON);
         assert!((popup("modal_dim = 1.0")?.modal_dim.get() - 1.0).abs() < f32::EPSILON);
+        assert!(!popup("animations = false")?.animations);
+        assert!(popup("animations = true")?.animations);
         Ok(())
     }
 
@@ -1634,6 +1640,8 @@ mod tests {
             ("modal_dim = -0.1", "-0.1"),
             ("modal_dim = nan", "nan"),
             ("position = \"middle\"", "\"middle\""),
+            ("animations = \"no\"", "\"no\""),
+            ("animations = 0", "0"),
         ];
         for (body, value) in cases {
             let src = format!("[popup]\n{body}\n");
