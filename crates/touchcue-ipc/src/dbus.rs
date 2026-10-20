@@ -94,12 +94,12 @@ impl Bus {
             active: BTreeMap::new(),
         };
         let conn = async {
-            Builder::session()?
-                .serve_at(PATH, service)?
+            Builder::session()
+                .serve_at(PATH, service)
                 .method_timeout(METHOD_TIMEOUT)
                 .allow_name_replacements(false)
                 .replace_existing_names(false)
-                .name(NAME)?
+                .name(NAME)
                 .build()
                 .await
         }

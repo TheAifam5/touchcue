@@ -3,10 +3,9 @@
 use std::time::Duration;
 
 use tokio::time::timeout;
-use zbus::Connection;
 use zbus::fdo::DBusProxy;
 use zbus::names::WellKnownName;
-use zbus::zvariant::{OwnedValue, Value};
+use zbus::{Connection, OwnedVariant, Variant};
 
 const DESTINATION: &str = "org.freedesktop.portal.Desktop";
 const PATH: &str = "/org/freedesktop/portal/desktop";
@@ -103,7 +102,7 @@ impl Portal {
             .await
             .map_err(PortalError::TimedOut)?
             .map_err(PortalError::Call)?;
-        let value: OwnedValue = reply.body().deserialize().map_err(PortalError::Call)?;
+        let value: OwnedVariant = reply.body().deserialize().map_err(PortalError::Call)?;
         string_setting(&value)
     }
 }
@@ -116,17 +115,17 @@ fn portal_available(owned: bool, activatable: bool) -> bool {
 
 /// Returns the string held by `value`, unwrapping at most
 /// [`MAX_VARIANT_DEPTH`] nested variants, or `None` for an empty string.
-fn string_setting(value: &Value<'_>) -> Result<Option<String>, PortalError> {
+fn string_setting(value: &Variant<'_>) -> Result<Option<String>, PortalError> {
     let mut value = value;
     for _ in 0..MAX_VARIANT_DEPTH {
         match value {
-            Value::Value(inner) => value = inner,
+            Variant::Variant(inner) => value = inner,
             _ => break,
         }
     }
     match value {
-        Value::Str(text) if text.is_empty() => Ok(None),
-        Value::Str(text) => Ok(Some(text.as_str().to_owned())),
+        Variant::Str(text) if text.is_empty() => Ok(None),
+        Variant::Str(text) => Ok(Some(text.as_str().to_owned())),
         _ => Err(PortalError::NotString),
     }
 }
@@ -145,21 +144,21 @@ mod tests {
     #[test]
     fn reply_values_become_strings() -> Result<(), PortalError> {
         assert_eq!(
-            string_setting(&Value::from("Papirus-Dark"))?,
+            string_setting(&Variant::from("Papirus-Dark"))?,
             Some("Papirus-Dark".to_owned())
         );
-        assert_eq!(string_setting(&Value::from(""))?, None);
+        assert_eq!(string_setting(&Variant::from(""))?, None);
         assert_eq!(
-            string_setting(&Value::Value(Box::new(Value::from("breeze"))))?,
+            string_setting(&Variant::Variant(Box::new(Variant::from("breeze"))))?,
             Some("breeze".to_owned())
         );
         assert!(matches!(
-            string_setting(&Value::from(7_u32)),
+            string_setting(&Variant::from(7_u32)),
             Err(PortalError::NotString)
         ));
         let nested = |depth: usize| {
-            (0..depth).fold(Value::from("deep"), |inner, _| {
-                Value::Value(Box::new(inner))
+            (0..depth).fold(Variant::from("deep"), |inner, _| {
+                Variant::Variant(Box::new(inner))
             })
         };
         assert_eq!(string_setting(&nested(2))?, Some("deep".to_owned()));

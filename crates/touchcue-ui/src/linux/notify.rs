@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 use touchcue_core::config::{Notification, Urgency};
 use touchcue_core::{RateLimit, RequestId};
 use tracing::{Instrument, debug, info_span, instrument, warn};
-use zbus::zvariant::Value;
+use zbus::Variant;
 
 use super::WARN_INTERVAL;
 use crate::Prompt;
@@ -43,7 +43,7 @@ trait Notifications {
         summary: &str,
         body: &str,
         actions: &[&str],
-        hints: HashMap<&str, Value<'_>>,
+        hints: HashMap<&str, Variant<'_>>,
         expire_timeout: i32,
     ) -> zbus::Result<u32>;
 
@@ -59,15 +59,13 @@ pub(crate) enum NotifyError {
     Bus(#[from] zbus::Error),
     #[error("session bus refused a query")]
     Fdo(#[from] zbus::fdo::Error),
-    #[error("invalid bus name")]
-    Name(#[from] zbus::names::Error),
     #[error("no notification server is running or activatable")]
     NoService,
 }
 
 /// Opens a session bus connection whose calls time out after [`CALL_TIMEOUT`].
 pub(crate) async fn session() -> zbus::Result<zbus::Connection> {
-    zbus::connection::Builder::session()?
+    zbus::connection::Builder::session()
         .method_timeout(CALL_TIMEOUT)
         .build()
         .await
@@ -288,9 +286,9 @@ impl Call<'_> {
                 expire_timeout,
             } => {
                 let hints = HashMap::from([
-                    ("urgency", Value::U8(urgency)),
-                    ("transient", Value::Bool(true)),
-                    ("desktop-entry", Value::from(APP_NAME)),
+                    ("urgency", Variant::U8(urgency)),
+                    ("transient", Variant::Bool(true)),
+                    ("desktop-entry", Variant::from(APP_NAME)),
                 ]);
                 proxy
                     .notify(
