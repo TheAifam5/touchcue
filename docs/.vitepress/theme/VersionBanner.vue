@@ -27,8 +27,8 @@ onUnmounted(() => {
 <template>
   <div v-if="theme.channel === 'next'" ref="banner" class="VersionBanner">
     <span>
-      You are reading the docs for the unreleased main branch.
-      <a :href="latest" target="_self">See the latest release.</a>
+      {{ theme.versionBanner.text }}
+      <a :href="latest" target="_self">{{ theme.versionBanner.link }}</a>
     </span>
   </div>
 </template>
