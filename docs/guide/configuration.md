@@ -92,6 +92,8 @@ extend_skip = []
 
 ![A popup in the top-right corner of an output, with position = "top-right"](/screenshots/corner.png)
 
+Popups are drawn at the scale of the output they are on: at fractional scales such as 1.5 when the Wayland compositor supports fractional-scale-v1, else at the integer scale it prefers. On X11 the scale comes from `Xft.dpi`.
+
 `min_display_ms` is the shortest time a shown popup stays visible. `show_delay_ms` is how long a request must wait before its popup appears.
 
 ![The default popup, centred: Touch your security key, Browser is waiting for a passkey](/screenshots/default.png)
