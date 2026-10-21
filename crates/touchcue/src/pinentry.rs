@@ -6,7 +6,8 @@
 //! inherits stderr, forwards SIGTERM, SIGINT, SIGHUP, SIGUSR1 and SIGUSR2,
 //! and exits with the child's status. It refuses to start when
 //! `TOUCHCUE_PINENTRY_ACTIVE` is already set. It never answers a command
-//! itself and makes itself non-dumpable.
+//! itself. It makes itself non-dumpable first and refuses to start when it
+//! cannot.
 //!
 //! A copy of the stream is fed to an [`observer::Observer`]. When a `GETPIN`
 //! or `CONFIRM` dialog starts after gpg-agent named the client it serves
@@ -49,6 +50,9 @@ pub enum PinentryError {
     Nested,
     #[error("the real pinentry is not an executable file")]
     NotExecutable { path: PathBuf },
+    #[cfg(target_os = "linux")]
+    #[error("cannot make the wrapper non-dumpable; refusing to start")]
+    Dumpable(#[source] rustix::io::Errno),
     #[error("cannot {action}")]
     Io {
         action: &'static str,
@@ -67,19 +71,22 @@ pub enum PinentryError {
 ///
 /// # Errors
 ///
-/// Returns [`PinentryError`] when the real pinentry cannot be located or
+/// Returns [`PinentryError`] when the process cannot be made
+/// non-dumpable, the real pinentry cannot be located or
 /// started, or stdio cannot be taken over. Nothing has been written to
 /// stdout then.
 #[cfg(target_os = "linux")]
 pub fn run(args: &[OsString]) -> Result<std::process::ExitCode, PinentryError> {
-    if let Err(error) =
-        rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable)
-    {
-        tracing::warn!(
-            error = &error as &dyn std::error::Error,
-            "cannot make the wrapper non-dumpable"
-        );
-    }
+    run_with(args, crate::dumpable::forbid)
+}
+
+/// [`run`] with the function that makes the process non-dumpable.
+#[cfg(target_os = "linux")]
+fn run_with(
+    args: &[OsString],
+    forbid_dumps: fn() -> Result<(), rustix::io::Errno>,
+) -> Result<std::process::ExitCode, PinentryError> {
+    forbid_dumps().map_err(PinentryError::Dumpable)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -703,5 +710,22 @@ mod linux {
             ));
             Ok(())
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refuses_to_start_when_dumps_cannot_be_forbidden() {
+        let result = run_with(&[], || Err(rustix::io::Errno::PERM));
+        assert!(
+            matches!(
+                result,
+                Err(PinentryError::Dumpable(rustix::io::Errno::PERM))
+            ),
+            "{result:?}"
+        );
     }
 }

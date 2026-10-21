@@ -2,6 +2,7 @@
 
 pub mod askpass;
 pub mod cli;
+pub mod dumpable;
 pub mod gpg;
 #[cfg(target_os = "linux")]
 pub mod helper_socket;

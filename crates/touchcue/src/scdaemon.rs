@@ -7,7 +7,7 @@
 //! copies both streams unchanged, inherits stderr, forwards SIGTERM, SIGINT,
 //! SIGHUP, SIGUSR1 and SIGUSR2, and exits with the child's status. The
 //! wrapper makes itself non-dumpable, which keeps other processes of the
-//! user from reading its own memory; PINs and data also pass through
+//! user from reading its own memory, and refuses to start when it cannot; PINs and data also pass through
 //! gpg-agent and the real scdaemon, which this does not cover.
 //!
 //! gpg-agent also connects to scdaemon's own socket when the pipe is in use.
@@ -59,6 +59,9 @@ pub enum ScdaemonError {
     Recursive { path: std::path::PathBuf },
     #[error("{} is not an executable file", path.display())]
     NotExecutable { path: std::path::PathBuf },
+    #[cfg(target_os = "linux")]
+    #[error("cannot make the wrapper non-dumpable; refusing to start")]
+    Dumpable(#[source] rustix::io::Errno),
     #[error("cannot {action}")]
     Io {
         action: &'static str,
@@ -79,20 +82,22 @@ pub enum ScdaemonError {
 ///
 /// # Errors
 ///
-/// Returns [`ScdaemonError`] when the real scdaemon cannot be located or
+/// Returns [`ScdaemonError`] when the process cannot be made
+/// non-dumpable, the real scdaemon cannot be located or
 /// started, or stdio cannot be taken over. Nothing has been written to
 /// stdout then.
 #[cfg(target_os = "linux")]
 pub fn run(args: &[OsString]) -> Result<std::process::ExitCode, ScdaemonError> {
-    // Reset on exec, so the real scdaemon keeps its own setting.
-    if let Err(error) =
-        rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable)
-    {
-        tracing::warn!(
-            error = &error as &dyn std::error::Error,
-            "cannot make the wrapper non-dumpable"
-        );
-    }
+    run_with(args, crate::dumpable::forbid)
+}
+
+/// [`run`] with the function that makes the process non-dumpable.
+#[cfg(target_os = "linux")]
+fn run_with(
+    args: &[OsString],
+    forbid_dumps: fn() -> Result<(), rustix::io::Errno>,
+) -> Result<std::process::ExitCode, ScdaemonError> {
+    forbid_dumps().map_err(ScdaemonError::Dumpable)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -510,6 +515,21 @@ mod linux {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn refuses_to_start_when_dumps_cannot_be_forbidden() {
+        let result = run_with(&[OsString::from("--multi-server")], || {
+            Err(rustix::io::Errno::PERM)
+        });
+        assert!(
+            matches!(
+                result,
+                Err(ScdaemonError::Dumpable(rustix::io::Errno::PERM))
+            ),
+            "{result:?}"
+        );
+    }
 
     #[test]
     fn only_multi_server_first_is_an_invocation() {
