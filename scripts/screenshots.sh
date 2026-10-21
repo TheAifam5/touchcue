@@ -225,8 +225,9 @@ case $WAYLAND_DISPLAY in
 *) host_socket=$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY ;;
 esac
 [ -S "$host_socket" ] || die "WAYLAND_DISPLAY does not name a Wayland socket: $host_socket"
-# A socket left by a crashed compositor passes -S; only a live one answers.
-grim -t ppm - >/dev/null 2>&1 || die "the Wayland display $WAYLAND_DISPLAY does not respond"
+# A socket left by a crashed compositor passes -S; only a live one answers a
+# one-pixel capture.
+grim -g "0,0 1x1" -t ppm - >/dev/null 2>&1 || die "the Wayland display $WAYLAND_DISPLAY does not respond"
 case $XDG_RUNTIME_DIR in
 *'<'* | *'>'* | *'&'* | *'"'* | *"'"*) die "XDG_RUNTIME_DIR holds characters the bus configuration cannot carry" ;;
 esac
