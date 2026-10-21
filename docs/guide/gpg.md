@@ -38,7 +38,7 @@ gpg-agent starts its `scdaemon-program` with the argument `--multi-server`. When
 - It starts the real scdaemon from `gpgconf --list-dirs libexecdir` with the same arguments and environment. If gpgconf cannot run or fails, it tries `/usr/libexec/scdaemon`, `/usr/lib/gnupg/scdaemon` and `/usr/lib/gnupg2/scdaemon` in that order. It never starts a program that resolves to touchcue itself.
 - It copies the Assuan streams between gpg-agent and scdaemon byte for byte, in both directions. scdaemon's stderr, which is gpg-agent's log, goes through unchanged. touchcue adds only its own rare warnings there, prefixed with `touchcue-scdaemon:`, such as when the socket proxy cannot be set up. Under systemd they appear in the journal of `gpg-agent.service`; when gpg-agent runs with `--daemon`, it discards scdaemon's stderr. Set `TOUCHCUE_LOG` in gpg-agent's environment to change the level.
 - It forwards SIGTERM, SIGINT, SIGHUP, SIGUSR1 and SIGUSR2 to scdaemon and exits with scdaemon's exit status.
-- It makes itself non-dumpable, so other processes of the same user cannot read its memory. This hardens only the wrapper: PINs and data also pass through gpg-agent and the real scdaemon.
+- It makes itself non-dumpable, so other processes of the same user cannot read its memory, and refuses to start when it cannot; gpg-agent then cannot use the card until this is fixed, and the reason is in gpg-agent's log. This hardens only the wrapper: PINs and data also pass through gpg-agent and the real scdaemon.
 
 While copying, it watches the command lines. `PKSIGN`, `PKDECRYPT` and `PKAUTH` start a sign, decrypt or auth operation. When scdaemon then stays silent for 400 ms, the card is waiting for a touch. touchcue reports this to the daemon over `$XDG_RUNTIME_DIR/touchcue/helper.sock`. scdaemon's `OK` or `ERR` reply ends the report.
 
@@ -74,7 +74,7 @@ gpgconf --reload gpg-agent
 
 The wrapper runs `pinentry` from `PATH`. Set `TOUCHCUE_PINENTRY` in gpg-agent's environment to an absolute path to select another pinentry program. A program that resolves to touchcue itself is refused. The wrapper sets `TOUCHCUE_PINENTRY_ACTIVE=1` for the real pinentry and refuses to start when that variable is already set. `touchcue pinentry [ARGS]...` also runs the wrapper and passes its arguments through unparsed; `pinentry` must be the first argument.
 
-The wrapper copies stdin and stdout byte for byte, inherits pinentry's stderr, forwards SIGTERM, SIGINT, SIGHUP, SIGUSR1 and SIGUSR2, and exits with pinentry's status. It never answers Assuan commands itself. It makes itself non-dumpable; this protects only the wrapper, not gpg-agent or the real pinentry.
+The wrapper copies stdin and stdout byte for byte, inherits pinentry's stderr, forwards SIGTERM, SIGINT, SIGHUP, SIGUSR1 and SIGUSR2, and exits with pinentry's status. It never answers Assuan commands itself. It makes itself non-dumpable and refuses to start when it cannot, so the PIN dialog fails; this protects only the wrapper, not gpg-agent or the real pinentry.
 
 On a copy of the stream, it reads only `OPTION owner=<pid>/<uid>`, the `GETPIN` and `CONFIRM` verbs, and the reply class `OK` or `ERR`. Descriptions, prompts, PINs and data lines are forwarded but never interpreted, retained by the observer or logged. A gpg-agent line longer than 1002 bytes including its terminator stops observation; forwarding continues. Reports contain only the owner pid and uid, a sequence number and the dialog outcome. Without a running daemon, the wrapper only forwards.
 
